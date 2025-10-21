@@ -1,0 +1,30 @@
+{
+    "name": "server-mysql",
+    "version": "0.1.0",
+    "type": "commonjs",
+    "main": "src/server.js",
+    "scripts": {
+        "start": "node src/server.js",
+        "dev": "cross-env NODE_ENV=development nodemon server.js"
+    },
+    "dependencies": {
+        "bcryptjs": "3.0.2",
+        "cors": "^2.8.5",
+        "dotenv": "^16.4.5",
+        "express": "^4.19.2",
+        "iconv-lite": "0.7.0",
+        "install": "0.13.0",
+        "jq": "1.7.2",
+        "jsonwebtoken": "9.0.2",
+        "mysql2": "^3.10.0",
+        "pngjs": "7.0.0",
+        "socket.io": "^4.7.5",
+        "winston": "^3.13.0",
+        "winston-daily-rotate-file": "^4.7.1"
+    },
+    "devDependencies": {
+        "cross-env": "^10.1.0",
+        "nodemon": "^3.1.0",
+        "tree-cli": "0.6.7"
+    }
+}
