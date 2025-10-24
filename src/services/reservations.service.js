@@ -1,6 +1,7 @@
-// src/services/reservations.service.js
 // Service “Reservations” — query DB per prenotazioni
 // Stile: commenti lunghi, log con emoji, diagnostica chiara.
+
+'use strict';
 
 const { query } = require('../db');
 const logger = require('../logger');
@@ -240,8 +241,16 @@ async function update(id, dto = {}) {
 
   const sql = `UPDATE reservations SET ${set.join(', ')} WHERE id = ? LIMIT 1`;
   params.push(id);
-  await query(sql, params);
-  logger.info('✏️ RESV update', { id, set: set.length });
+  const res = await query(sql, params);
+  const affected = res.affectedRows || res[0]?.affectedRows || 0;
+
+  // MySQL spesso risponde affectedRows=0 se i valori sono identici (NO-OP).
+  if (!affected) {
+    logger.warn('ℹ️ RESV update NO-OP (stessi valori)', { id, set: set.length });
+    return await getById(id);
+  }
+
+  logger.info('✏️ RESV update', { id, set: set.length, affected });
   return await getById(id);
 }
 

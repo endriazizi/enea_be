@@ -7,20 +7,18 @@ const router = express.Router();
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 
-const env = require('../env');         // ✅ unica fonte di verità (contiene JWT)
-const logger = require('../logger');   // ✅ winston instance
+const env = require('../env');         // ✅ unica fonte di verità
+const logger = require('../logger');   // ✅ winston
 const { query } = require('../db');    // ✅ mysql2/promise pool
 const requireAuth = require('../middleware/auth'); // Bearer verifier
 
 // Helper robusto: crea JWT HS256
 function signToken(user) {
-  // Payload minimal: sub (user id), email e (opz.) roles
   const payload = {
     sub: user.id,
     email: user.email,
-    roles: user.roles ? String(user.roles).split(',') : [] // se hai colonna roles (csv)
+    roles: user.roles ? String(user.roles).split(',') : []
   };
-
   return jwt.sign(payload, env.JWT.secret, {
     algorithm: 'HS256',
     expiresIn: env.JWT.ttlSeconds
@@ -30,16 +28,15 @@ function signToken(user) {
 // POST /api/auth/login
 router.post('/login', async (req, res) => {
   const { email, password } = req.body || {};
-  logger.info('🔐 [AUTH] login ▶️', { email });
+  logger.info('🔐 [AUTH] login ▶️', { email, hasPwd: !!password });
 
-  // Validazione minima input
   if (!email || !password) {
     logger.warn('🔐 [AUTH] login ⚠️ missing fields', { email: !!email, password: !!password });
     return res.status(400).json({ error: 'missing_credentials' });
   }
 
   try {
-    // 1) Cerca utente
+    // 1) utente
     const rows = await query('SELECT * FROM users WHERE email=? LIMIT 1', [email]);
     const user = rows?.[0];
 
@@ -48,23 +45,21 @@ router.post('/login', async (req, res) => {
       return res.status(401).json({ error: 'invalid_credentials' });
     }
 
-    // 2) Verifica password (bcrypt)
+    // 2) password (hash in colonna password_hash)
     const ok = await bcrypt.compare(password, user.password_hash || '');
     if (!ok) {
       logger.warn('🔐 [AUTH] login ❌ bad_password', { userId: user.id });
       return res.status(401).json({ error: 'invalid_credentials' });
     }
 
-    // 3) Firma token
+    // 3) JWT ready?
     if (!env.JWT || !env.JWT.secret) {
-      // 👇 Questo era il tuo errore: env.JWT undefined
-      logger.error('🔐 [AUTH] login 💥 misconfigured JWT', { jwt: env.JWT });
+      logger.error('🔐 [AUTH] login 💥 misconfigured JWT', { jwtConfigured: !!env.JWT, hasSecret: !!(env.JWT && env.JWT.secret) });
       return res.status(500).json({ error: 'jwt_misconfigured' });
     }
 
+    // 4) token + risposta "safe"
     const token = signToken(user);
-
-    // 4) Response “safe” (no campi sensibili)
     const safeUser = {
       id: user.id,
       email: user.email,
@@ -80,11 +75,10 @@ router.post('/login', async (req, res) => {
   }
 });
 
-// GET /api/auth/me  (protetta da Bearer)
-// Usa middleware che decodifica JWT e attacca req.user (id/email/roles).
+// GET /api/auth/me (protetta)
 router.get('/me', requireAuth, async (req, res) => {
   try {
-    const userId = req.user?.sub;
+    const userId = req.user?.sub || req.user?.id;
     const rows = await query('SELECT id, email, name, roles FROM users WHERE id=? LIMIT 1', [userId]);
     const user = rows?.[0] || null;
     if (!user) return res.status(404).json({ error: 'not_found' });

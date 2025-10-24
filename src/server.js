@@ -102,6 +102,7 @@ if (ensureExists('db/migrator', 'DB migrator')) {
     .catch((e) => logger.error('❌ Startup failed (migrations)', { error: String(e) }));
 }
 
-server.listen(env.port, () => {
-  logger.info(`🚀 HTTP listening on :${env.port}`);
+
+server.listen(env.PORT, () => {
+  logger.info(`🚀 HTTP listening on :${env.PORT}`);
 });
