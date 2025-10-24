@@ -1,6 +1,6 @@
-# 📁 Project tree
+# 📁 Project tree (.)
 
-_Generato: Mon, Oct 20, 2025 11:32:39 PM_
+_Generato: Fri, Oct 24, 2025  2:02:52 AM_
 
 ```text
 .
@@ -9,18 +9,13 @@ _Generato: Mon, Oct 20, 2025 11:32:39 PM_
 .env copy 2
 .git
 .gitignore
-.vscode
 assets
-comandi_note.md
-export-project-lite.sh
 exports
 logs
 node_modules
-note.md
-noteeee.md
 npm
 package.json
-print.js
+readme.md
 src
 src/api
 src/api/auth.js
@@ -48,6 +43,7 @@ src/middleware/auth.js
 src/middleware/reqres-logger.js
 src/server.js
 src/services
+src/services/mailer.service.js
 src/services/product.service.js
 src/services/reservations-status.service.js
 src/services/reservations.service.js
@@ -57,6 +53,4 @@ src/sockets/index.js
 src/sockets/orders.js
 src/sockets/reservations.js
 src/utils
-src/utils/print.js
-tree copy.sh
 ```

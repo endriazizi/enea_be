@@ -1,81 +1,8 @@
-# 🧩 Project code (file ammessi)
+# 🧩 Project code (file ammessi in .)
 
-_Generato: Mon, Oct 20, 2025 11:32:40 PM_
+_Generato: Fri, Oct 24, 2025  2:02:53 AM_
 
-### comandi_note.md
-```
-# Porta HTTP
-PORT=3000
-
-
-# MySQL
-# DB_HOST=localhost
-# DB_USER=root
-# DB_PASSWORD=yourpassword
-# DB_NAME=pizzeria
-
-DB_HOST=185.114.108.108
-DB_USER=admintest
-DB_PASSWORD=Q396@zqs6
-DB_NAME=pizzeria_1
-PORT=3000
-JWT_SECRET=supersecretkey
-
-# CORS whitelist (separate da virgola)
-CORS_WHITELIST=http://localhost:8100,http://localhost:8101
-
-
-# Stampante ESC/POS (IP in LAN)
-PRINTER_IP=192.168.1.50
-
-
-# Log rotation
-LOG_DIR=./logs
-LOG_LEVEL=info
-LOG_MAX_FILES=14d
-LOG_MAX_SIZE=10m```
-
-### note.md
-```
-# Porta HTTP
-PORT=3000
-
-
-# MySQL
-# DB_HOST=localhost
-# DB_USER=root
-# DB_PASSWORD=yourpassword
-# DB_NAME=pizzeria
-
-DB_HOST=185.114.108.108
-DB_USER=admintest
-DB_PASSWORD=Q396@zqs6
-DB_NAME=pizzeria_1
-PORT=3000
-JWT_SECRET=supersecretkey
-
-# CORS whitelist (separate da virgola)
-CORS_WHITELIST=http://localhost:8100,http://localhost:8101
-
-
-# Stampante ESC/POS (IP in LAN)
-PRINTER_IP=192.168.1.50
-
-
-# Log rotation
-LOG_DIR=./logs
-LOG_LEVEL=info
-LOG_MAX_FILES=14d
-LOG_MAX_SIZE=10m```
-
-### noteeee.md
-```
-MODE=split ROOT="C:/Users/Endri Azizi/progetti-dev/DEMO_v1/ordini_v1/" OUT="./exports/admin-snap.md" \
-ALLOWED_EXT="ts,js,html,scss,css,json,md,xml,sql" \
-EXCLUDE_DIRS="node_modules,.git,dist,.angular,.vscode,coverage" \
-bash export-project-lite.sh```
-
-### package.json
+### ./package.json
 ```
 {
     "name": "server-mysql",
@@ -96,6 +23,7 @@ bash export-project-lite.sh```
         "jq": "1.7.2",
         "jsonwebtoken": "9.0.2",
         "mysql2": "^3.10.0",
+        "nodemailer": "7.0.10",
         "pngjs": "7.0.0",
         "socket.io": "^4.7.5",
         "winston": "^3.13.0",
@@ -105,69 +33,50 @@ bash export-project-lite.sh```
         "cross-env": "^10.1.0",
         "nodemon": "^3.1.0",
         "tree-cli": "0.6.7"
-    }
+    },
+    "overrides": {}
 }
 ```
 
-### print.js
+### ./readme.md
 ```
-const escpos = require('escpos');
-escpos.Network = require('escpos-network');
-const logger = require('./logger');
+Eliminare node_modules (progetto corrente)
+rmdir /s /q node_modules
+
+Windows (CMD/PowerShell)
+rmdir /s /q .git
+git init -b main
+git add -A
+git commit -m "feat: fresh start"
+
+git checkout -b develop
 
 
-async function printOrder(order, printerIp) {
-logger.info({ msg: 'PRINT start', printerIp, orderId: order.id });
-return new Promise((resolve, reject) => {
-const device = new escpos.Network(printerIp);
-const printer = new escpos.Printer(device);
+Se il tuo git init non supporta -b main:
 
+git init
+git checkout -b main
 
-device.open(() => {
-try {
-printer
-.align('CT')
-.style('B')
-.text('NUOVO ORDINE')
-.style('NORMAL')
-.align('LT')
-.text(`Cliente: ${order.customer_first} ${order.customer_last}`)
-.text(`Telefono: ${order.phone || ''}`)
-.text(order.delivery_address ? `Indirizzo: ${order.delivery_address}` : '')
-.text('------------------------------');
+-- git remote add origin https://github.com/endriazizi/enea_be.git
+Collegare il nuovo remoto (facoltativo)
+git remote add origin https://github.com/endriazizi/enea_be.git
+git push -u origin main
+git push -u origin develop
 
+Consigli finali (best practice)
 
-(order.items || []).forEach((i) => {
-printer.text(`${i.qty}x ${i.product_name} €${Number(i.price).toFixed(2)}`);
-if (i.notes) printer.text(` Note: ${i.notes}`);
-if (i.ingredients) printer.text(` + ${i.ingredients}`);
-});
+Branch protection sul remoto:
 
+Proteggi main (niente push diretti, solo PR).
 
-printer
-.text('------------------------------')
-.style('B')
-.text(`TOTALE: €${Number(order.total).toFixed(2)}`)
-.style('NORMAL')
-.cut()
-.close();
+develop come branch di lavoro (puoi proteggerlo se vuoi PR anche lì).
 
+Alias utili:
 
-logger.info({ msg: 'PRINT done', orderId: order.id });
-resolve();
-} catch (err) {
-logger.error({ msg: 'PRINT error', error: String(err) });
-try { printer.close(); } catch {}
-reject(err);
-}
-});
-});
-}
+git config alias.lg "log --oneline --graph --decorate --all"
+git lg```
 
-
-module.exports = { printOrder };```
-
-### src/api/auth.js
+### ./src/api/auth.js
 ```
 // /api/auth — Login + Me (JWT HS256)
 // Stile: log chiari, errori espliciti, dipendenze standard.
@@ -274,7 +183,7 @@ router.get('/me', requireAuth, async (req, res) => {
 module.exports = router;
 ```
 
-### src/api/health.js
+### ./src/api/health.js
 ```
 // src/api/health.js
 // Endpoints di diagnostica. /api/health/time mostra orari server+DB.
@@ -311,7 +220,7 @@ router.get('/time', async (_req, res) => {
 module.exports = router;
 ```
 
-### src/api/orders.js
+### ./src/api/orders.js
 ```
 // src/api/orders.js
 const express = require('express');
@@ -433,7 +342,7 @@ router.patch('/:id/status', async (req, res) => {
 module.exports = router;
 ```
 
-### src/api/printer.js
+### ./src/api/printer.js
 ```
 // server/src/api/printer.js
 const express = require('express');
@@ -478,7 +387,7 @@ router.post('/printer/test', async (req, res) => {
 module.exports = router;
 ```
 
-### src/api/products.js
+### ./src/api/products.js
 ```
 // 🌐 REST: lista prodotti attivi
 const router = require('express').Router();                 // istanzia router
@@ -496,35 +405,32 @@ router.get('/', async (req, res, next) => {                 // GET /api/products
 module.exports = router;                                    // esporta router
 ```
 
-### src/api/reservations.js
+### ./src/api/reservations.js
 ```
-// src/api/reservations.js
 'use strict';
 
 const express = require('express');
 const router = express.Router();
 
 const logger = require('../logger');
-const svc = require('../services/reservations.service');
+const svc = require('../services/reservations.service');           // CRUD/base
+const resvActions = require('../services/reservations-status.service'); // status + audit
+const printerSvc = require('../services/thermal-printer.service'); // stampa
+const env = require('../env');
 
-// === requireAuth con fallback DEV ============================================
+// === auth con fallback DEV ===================================================
 let requireAuth;
 try {
   ({ requireAuth } = require('./auth'));
   if (typeof requireAuth !== 'function') throw new Error('requireAuth non è una funzione');
   logger.info('🔐 requireAuth caricato da ./auth');
-} catch (e) {
+} catch {
   logger.warn('⚠️ requireAuth non disponibile. Uso FALLBACK DEV (solo locale).');
-  requireAuth = (req, _res, next) => {
-    req.user = { id: 0, email: 'dev@local' };
-    next();
-  };
+  requireAuth = (req, _res, next) => { req.user = { id: 0, email: 'dev@local' }; next(); };
 }
 
-// Azioni di stato + audit
-const resvActions = require('../services/reservations-status.service');
+// ============================ LIST/GET/POST/PATCH/DELETE =====================
 
-// GET /api/reservations?status=&from=&to=&q=
 router.get('/', async (req, res) => {
   try {
     const filter = {
@@ -542,42 +448,81 @@ router.get('/', async (req, res) => {
   }
 });
 
-// ---------- Supporto UI (prima di /:id per evitare ambiguità) ---------------
-
-// Sale
+// Supporto UI
 router.get('/rooms', async (_req, res) => {
-  try {
-    const rows = await svc.listRooms();
-    res.json(rows);
-  } catch (err) {
+  try { res.json(await svc.listRooms()); }
+  catch (err) {
     logger.error('❌ /rooms', { error: String(err) });
     res.status(500).json({ error: 'internal_error' });
   }
 });
 
-// Tavoli per sala
 router.get('/support/tables/by-room/:roomId(\\d+)', async (req, res) => {
-  try {
-    const rows = await svc.listTablesByRoom(Number(req.params.roomId));
-    res.json(rows);
-  } catch (err) {
+  try { res.json(await svc.listTablesByRoom(Number(req.params.roomId))); }
+  catch (err) {
     logger.error('❌ /support/tables/by-room', { error: String(err) });
     res.status(500).json({ error: 'internal_error' });
   }
 });
 
-// Conteggi per status nel range
 router.get('/support/count-by-status', async (req, res) => {
-  try {
-    const out = await svc.countByStatus({ from: req.query.from, to: req.query.to });
-    res.json(out);
-  } catch (err) {
+  try { res.json(await svc.countByStatus({ from: req.query.from, to: req.query.to })); }
+  catch (err) {
     logger.error('❌ /support/count-by-status', { error: String(err) });
     res.status(500).json({ error: 'internal_error' });
   }
 });
 
-// ============================ AZIONI DI STATO ================================
+// Dettaglio
+router.get('/:id(\\d+)', async (req, res) => {
+  const id = Number(req.params.id);
+  if (!Number.isFinite(id)) return res.status(400).json({ error: 'invalid_id' });
+  try {
+    const r = await svc.getById(id);
+    if (!r) return res.status(404).json({ error: 'not_found' });
+    res.json(r);
+  } catch (err) {
+    logger.error('❌ [GET] /:id', { id, error: String(err) });
+    res.status(500).json({ error: 'internal_error' });
+  }
+});
+
+// Crea
+router.post('/', async (req, res) => {
+  try {
+    const created = await svc.create(req.body || {});
+    res.status(201).json(created);
+  } catch (err) {
+    logger.error('❌ [POST] /', { error: String(err) });
+    res.status(500).json({ error: 'internal_error' });
+  }
+});
+
+// Aggiorna parziale
+router.patch('/:id(\\d+)', requireAuth, async (req, res) => {
+  try {
+    const updated = await svc.update(Number(req.params.id), req.body || {});
+    res.json(updated);
+  } catch (err) {
+    const code = err.statusCode || 500;
+    logger.error('❌ [PATCH] /:id', { error: String(err) });
+    res.status(code).json({ error: err.message || 'internal_error' });
+  }
+});
+
+// Elimina
+router.delete('/:id(\\d+)', requireAuth, async (req, res) => {
+  try {
+    await svc.remove(Number(req.params.id));
+    res.json({ ok: true });
+  } catch (err) {
+    const code = err.statusCode || 500;
+    logger.error('❌ [DELETE] /:id', { error: String(err) });
+    res.status(code).json({ error: err.message || 'internal_error' });
+  }
+});
+
+// ============================ CAMBIO STATO + MAIL ============================
 
 router.put('/:id(\\d+)/status', requireAuth, async (req, res) => {
   try {
@@ -600,70 +545,7 @@ router.put('/:id(\\d+)/status', requireAuth, async (req, res) => {
   }
 });
 
-// GET /:id/audit
-router.get('/:id(\\d+)/audit', requireAuth, async (req, res) => {
-  try {
-    const rows = await resvActions.getAudit({
-      reservationId: Number(req.params.id),
-      limit: Number(req.query.limit || 50)
-    });
-    return res.json({ ok: true, rows });
-  } catch (err) {
-    const code = err.statusCode || 500;
-    return res.status(code).json({ error: err.message });
-  }
-});
-
-// ================================ CRUD ======================================
-
-router.get('/:id(\\d+)', async (req, res) => {
-  const id = Number(req.params.id);
-  if (!Number.isFinite(id)) return res.status(400).json({ error: 'invalid_id' });
-  try {
-    const r = await svc.getById(id);
-    if (!r) return res.status(404).json({ error: 'not_found' });
-    res.json(r);
-  } catch (err) {
-    logger.error('❌ [GET] /:id', { id, error: String(err) });
-    res.status(500).json({ error: 'internal_error' });
-  }
-});
-
-router.post('/', async (req, res) => {
-  try {
-    const created = await svc.create(req.body || {});
-    res.status(201).json(created);
-  } catch (err) {
-    logger.error('❌ [POST] /', { error: String(err) });
-    res.status(500).json({ error: 'internal_error' });
-  }
-});
-
-router.patch('/:id(\\d+)', requireAuth, async (req, res) => {
-  try {
-    const updated = await svc.update(Number(req.params.id), req.body || {});
-    res.json(updated);
-  } catch (err) {
-    const code = err.statusCode || 500;
-    logger.error('❌ [PATCH] /:id', { error: String(err) });
-    res.status(code).json({ error: err.message || 'internal_error' });
-  }
-});
-
-router.delete('/:id(\\d+)', requireAuth, async (req, res) => {
-  try {
-    await svc.remove(Number(req.params.id));
-    res.json({ ok: true });
-  } catch (err) {
-    const code = err.statusCode || 500;
-    logger.error('❌ [DELETE] /:id', { error: String(err) });
-    res.status(code).json({ error: err.message || 'internal_error' });
-  }
-});
-
-// =============================== STAMPA =====================================
-
-const printerSvc = require('../services/thermal-printer.service');
+// ================================ STAMPA =====================================
 
 router.post('/print/daily', requireAuth, async (req, res) => {
   try {
@@ -683,12 +565,12 @@ router.post('/print/placecards', requireAuth, async (req, res) => {
   try {
     const date = (req.body?.date || new Date().toISOString().slice(0,10));
     const status = req.body?.status || 'accepted';
-    const qrBaseUrl = req.body?.qr_base_url || process.env.QR_BASE_URL || '';
+    const qrBaseUrl = req.body?.qr_base_url || env.QR_BASE_URL || '';
     const rows = await svc.list({ from: date, to: date, status });
     logger.info('🧾 print/placecards', { date, status, rows: rows.length });
     const out = await printerSvc.printPlaceCards({
       date, rows, user: req.user,
-      logoText: process.env.BIZ_NAME || 'LA MIA ATTIVITÀ',
+      logoText: env.BIZ_NAME,
       qrBaseUrl
     });
     return res.json({ ok: true, job_id: out.jobId, printed_count: out.printedCount });
@@ -698,8 +580,7 @@ router.post('/print/placecards', requireAuth, async (req, res) => {
   }
 });
 
-// === INIZIO MODIFICA: stampa segnaposto singolo =============================
-// POST /api/reservations/:id/print/placecard
+// Segnaposto singolo
 router.post('/:id(\\d+)/print/placecard', requireAuth, async (req, res) => {
   try {
     const id = Number(req.params.id);
@@ -708,13 +589,13 @@ router.post('/:id(\\d+)/print/placecard', requireAuth, async (req, res) => {
     const r = await svc.getById(id);
     if (!r) return res.status(404).json({ error: 'not_found' });
 
-    const qrBaseUrl = req.body?.qr_base_url || process.env.QR_BASE_URL || '';
+    const qrBaseUrl = req.body?.qr_base_url || env.QR_BASE_URL || '';
 
     const out = await printerSvc.printPlaceCards({
       date: (r.start_at || '').toString().slice(0, 10),
-      rows: [r],                        // 👈 una sola prenotazione
+      rows: [r],
       user: req.user,
-      logoText: process.env.BIZ_NAME || 'LA MIA ATTIVITÀ',
+      logoText: env.BIZ_NAME,
       qrBaseUrl,
     });
 
@@ -724,12 +605,11 @@ router.post('/:id(\\d+)/print/placecard', requireAuth, async (req, res) => {
     return res.status(500).json({ error: err.message || String(err) });
   }
 });
-// === FINE MODIFICA ===========================================================
 
 module.exports = router;
 ```
 
-### src/api/rooms.js
+### ./src/api/rooms.js
 ```
 // src/api/rooms.js
 const express = require('express');
@@ -759,7 +639,7 @@ router.get('/', async (req, res) => {
 module.exports = router;
 ```
 
-### src/api/tables.js
+### ./src/api/tables.js
 ```
 // src/api/tables.js
 // Router TAVOLI
@@ -875,7 +755,7 @@ router.patch('/:id/status', async (req, res) => {
 module.exports = router;
 ```
 
-### src/config.js
+### ./src/config.js
 ```
 // Carica variabili ambiente e fornisce valori default
 require('dotenv').config();
@@ -902,7 +782,7 @@ maxSize: process.env.LOG_MAX_SIZE || '10m'
 }
 };```
 
-### src/controllers/productsContreller.js
+### ./src/controllers/productsContreller.js
 ```
 const productService = require('../services/product.service');
 
@@ -957,7 +837,7 @@ module.exports = {
 };
 ```
 
-### src/cors.js
+### ./src/cors.js
 ```
 const mysql = require('mysql2/promise');
 const cfg = require('./config');
@@ -995,7 +875,7 @@ return rows;
 
 module.exports = { getPool, query };```
 
-### src/db/index.js
+### ./src/db/index.js
 ```
 // src/db/index.js
 // Pool MySQL + query() con log. Sessione forzata in UTC, dateStrings per evitare shift.
@@ -1053,7 +933,7 @@ function shorten(s, max = 320) {
 module.exports = { pool, query, ensureUtcSession };
 ```
 
-### src/db/migrator.js
+### ./src/db/migrator.js
 ```
 // 🧰 Migrator: esegue tutti i file .sql in /migrations in ordine e li registra.
 // Idempotente: salta le già applicate. Sanifica BOM e alcune direttive SET iniziali.
@@ -1122,7 +1002,7 @@ async function runMigrations() {
 module.exports = { runMigrations };
 ```
 
-### src/db/schema-check.js
+### ./src/db/schema-check.js
 ```
 // src/db/schema-check.js
 // 🔎 Verifica schema DB all'avvio: stampa colonne reali e confronta con "atteso".
@@ -1306,76 +1186,121 @@ async function runSchemaCheck() {
 module.exports = { runSchemaCheck };
 ```
 
-### src/env.js
+### ./src/env.js
 ```
-// src/env.js
-// Carica .env e costruisce la config centrale dell'app.
-// Qui definiamo anche le regole di prenotazione (RESV) e JWT.
-// ATTENZIONE: evitiamo di importare logger qui per non creare cicli.
+'use strict';
 
+/**
+ * Loader centralizzato env + piccoli helper.
+ * Mantieni questo file dove sta (src/env.js).
+ */
+
+const fs = require('fs');
 const path = require('path');
-require('dotenv').config({ path: path.resolve(process.cwd(), '.env') });
 
-function toInt(v, def) {
-  const n = parseInt(String(v ?? ''), 10);
+// Carico .env se presente (non fallire se manca)
+try {
+  const dotenvPath = path.join(process.cwd(), '.env');
+  if (fs.existsSync(dotenvPath)) {
+    require('dotenv').config({ path: dotenvPath });
+  }
+} catch (_) {}
+
+/* === Helpers === */
+function toBool(v, def = false) {
+  if (v === undefined || v === null || String(v).trim() === '') return def;
+  const s = String(v).toLowerCase();
+  return ['1', 'true', 'yes', 'y', 'on'].includes(s);
+}
+function toInt(v, def = 0) {
+  const n = parseInt(v, 10);
   return Number.isFinite(n) ? n : def;
 }
+function mask(value, front = 2, back = 2) {
+  if (!value) return '';
+  const s = String(value);
+  if (s.length <= front + back) return '*'.repeat(s.length);
+  return s.slice(0, front) + '*'.repeat(s.length - front - back) + s.slice(-back);
+}
 
-const cfg = {
-  env: process.env.NODE_ENV || 'development',
-  isDev: (process.env.NODE_ENV || 'development') !== 'production',
-  port: toInt(process.env.PORT, 3000),
+/* === Config === */
+const env = {
+  NODE_ENV: process.env.NODE_ENV || 'development',
+  isProd: (process.env.NODE_ENV || 'development') === 'production',
 
-  // Origini CORS (lista separata da virgole)
-  corsWhitelist: (process.env.CORS_WHITELIST || 'http://localhost:8100,http://localhost:4200')
+  PORT: toInt(process.env.PORT, 3000),
+
+  // CORS (lista separata da virgola)
+  CORS_WHITELIST: (process.env.CORS_WHITELIST || '')
     .split(',')
     .map(s => s.trim())
     .filter(Boolean),
 
-  // DB
   DB: {
     host: process.env.DB_HOST || '127.0.0.1',
     port: toInt(process.env.DB_PORT, 3306),
     user: process.env.DB_USER || 'root',
     password: process.env.DB_PASSWORD || '',
-    database: process.env.DB_NAME || 'pizzeria_1',
-    waitForConnections: true,
-    connectionLimit: 10,
-    queueLimit: 0
+    database: process.env.DB_NAME || 'app',
   },
 
-  // 🔐 JWT (usato in /api/auth/*)
-  JWT: {
-    secret: process.env.JWT_SECRET || 'dev-secret-change-me',
-    ttlSeconds: toInt(process.env.JWT_TTL_SECONDS, 8 * 60 * 60) // default: 8h
+  LOG: {
+    dir: process.env.LOG_DIR || './logs',
+    retentionDays: toInt(process.env.LOG_RETENTION_DAYS, 14),
+    level: process.env.LOG_LEVEL || 'info',
   },
 
-  // 🍽️ Regole prenotazioni (durata slot)
   RESV: {
-    // default pranzo/cena, sovrascrivibili via .env
-    defaultLunchMinutes: toInt(process.env.RESV_LUNCH_MINUTES, 60),
+    // Durate “di default” se le usi per end_at
+    defaultLunchMinutes : toInt(process.env.RESV_LUNCH_MINUTES, 60),
     defaultDinnerMinutes: toInt(process.env.RESV_DINNER_MINUTES, 90),
-    // in futuro: durata per sala/party_size/fasce orarie…
-  }
+
+    // Override già presente in passato
+    allowAcceptOverride : toBool(process.env.RESV_ALLOW_ACCEPT_OVERRIDE, false),
+
+    // ✅ Nuovi flag
+    allowBacktrack      : toBool(process.env.RESV_ALLOW_BACKTRACK, true),
+    allowAnyTransition  : toBool(process.env.RESV_ALLOW_ANY_TRANSITION, true),
+    forceTransitions    : toBool(process.env.RESV_FORCE_TRANSITIONS, false),
+
+    // Email: invia sempre notifica su cambio stato?
+    notifyAlways        : toBool(process.env.RESV_NOTIFY_ALWAYS, true),
+  },
+
+  // Email / SMTP
+  MAIL: {
+    enabled: toBool(process.env.MAIL_ENABLED, true),
+    host   : process.env.SMTP_HOST || 'smtp.gmail.com',
+    port   : toInt(process.env.SMTP_PORT, 587),
+    secure : toBool(process.env.SMTP_SECURE, false),
+    user   : process.env.SMTP_USER || '',
+    pass   : process.env.SMTP_PASS || '',
+    from   : process.env.MAIL_FROM || 'Prenotazioni <no-reply@example.com>',
+    replyTo: process.env.MAIL_REPLY_TO || '',
+    bizName: process.env.BIZ_NAME || 'La Mia Attività',
+  },
+
+  // Util per debugging a runtime delle variabili
+  _debugMailConfig() {
+    const m = env.MAIL;
+    return {
+      enabled: m.enabled,
+      host: m.host,
+      port: m.port,
+      secure: m.secure,
+      user: mask(m.user, 3, 2),
+      from: m.from,
+      replyTo: m.replyTo,
+      bizName: m.bizName,
+      resvNotifyAlways: env.RESV.notifyAlways,
+    };
+  },
 };
 
-// Dump sintetico in dev (senza password/secret)
-if (cfg.isDev) {
-  const safe = {
-    env: cfg.env,
-    port: cfg.port,
-    corsWhitelist: cfg.corsWhitelist,
-    DB: { ...cfg.DB, password: cfg.DB.password ? '***' : '(vuota)' },
-    JWT: { ttlSeconds: cfg.JWT.ttlSeconds, secret: cfg.JWT.secret ? '***' : '(manca!)' },
-    RESV: cfg.RESV
-  };
-  console.log('🧾 ENV DUMP ▶️', safe);
-}
-
-module.exports = cfg;
+module.exports = env;
 ```
 
-### src/logger.js
+### ./src/logger.js
 ```
 // Logger Winston con console + (opzionale) rotate su file.
 // Exportiamo direttamente l'istanza (non { logger }) per evitare "info is not a function".
@@ -1417,7 +1342,7 @@ const logger = createLogger({
 module.exports = logger;
 ```
 
-### src/log-http.js
+### ./src/log-http.js
 ```
 const logger = require('./logger');
 
@@ -1456,33 +1381,76 @@ respBody: limitedResp
 next();
 };```
 
-### src/middleware/auth.js
+### ./src/middleware/auth.js
 ```
+'use strict';
+
+// src/middleware/auth.js
+// JWT guard con bypass DEV opzionale. Mantiene il tuo stile di log.
+
 const jwt = require('jsonwebtoken');
 const env = require('../env');
+const logger = require('../logger');
 
-/**
- * 🔐 Middleware JWT: richiede Authorization: Bearer <token>
- * - Valida il token
- * - Espone req.auth con i claim (sub, roles, iat, exp)
- * - 401 se assente/invalidato/scaduto
- */
-module.exports = function requireAuth(req, res, next) {
-  const h = req.headers.authorization || '';
-  const [scheme, token] = h.split(' ');
-  if (scheme !== 'Bearer' || !token) {
-    return res.status(401).json({ error: 'NO_TOKEN', message: 'Missing bearer token' });
+/** Estrae il token da Authorization / header custom / cookie */
+function extractToken(req) {
+  const h = req.headers['authorization'] || req.headers['Authorization'];
+  if (h && typeof h === 'string') {
+    const [type, token] = h.split(' ');
+    if (/^Bearer$/i.test(type) && token) return token.trim();
   }
+  const x = req.headers['x-access-token'];
+  if (typeof x === 'string' && x.trim()) return x.trim();
+  if (req.cookies && req.cookies.token) return req.cookies.token;
+  return null;
+}
+
+/** Middleware principale */
+function requireAuth(req, res, next) {
+  const token = extractToken(req);
+
+  // Nessun token → bypass DEV (se abilitato), altrimenti 401
+  if (!token) {
+    if (env.AUTH.devBypass) {
+      logger.warn('🔓 AUTH DEV BYPASS (no token)', { path: req.path });
+      req.user = { id: env.AUTH.devUserId, email: env.AUTH.devUserEmail };
+      return next();
+    }
+    logger.warn('🔒 AUTH missing token', { path: req.path });
+    return res.status(401).json({ error: 'INVALID_TOKEN', message: 'Missing token' });
+  }
+
+  // Verifica JWT
   try {
-    req.auth = jwt.verify(token, env.JWT.secret); // { sub, roles, iat, exp }
+    const payload = jwt.verify(token, env.JWT.secret);
+    req.user = {
+      id: payload.sub || payload.id || payload.userId || 0,
+      email: payload.email || 'user@unknown',
+    };
     return next();
-  } catch (e) {
+  } catch (err) {
+    if (env.AUTH.devBypass) {
+      logger.warn('🔓 AUTH DEV BYPASS (invalid token)', { path: req.path, error: String(err) });
+      req.user = { id: env.AUTH.devUserId, email: env.AUTH.devUserEmail };
+      return next();
+    }
+    logger.warn('🔒 AUTH invalid/expired token', { path: req.path, error: String(err) });
     return res.status(401).json({ error: 'INVALID_TOKEN', message: 'Invalid or expired token' });
   }
-};
+}
+
+/** Utility opzionale per emettere un token (se ti serve nel login) */
+function issueToken(user) {
+  const payload = { sub: user.id, email: user.email };
+  return jwt.sign(payload, env.JWT.secret, { expiresIn: env.JWT.ttlSeconds + 's' });
+}
+
+module.exports = requireAuth;
+module.exports.requireAuth = requireAuth;
+module.exports.issueToken = issueToken;
 ```
 
-### src/middleware/reqres-logger.js
+### ./src/middleware/reqres-logger.js
 ```
 // 🌐 Middleware logging: stampa request e response body (⚠️ attenzione in prod)
 const logger = require('../logger');   // ✅ istanza diretta
@@ -1512,7 +1480,7 @@ module.exports = function reqResLogger(req, res, next) {
 }
 ```
 
-### src/server.js
+### ./src/server.js
 ```
 // src/server.js
 const path = require('path');
@@ -1618,12 +1586,150 @@ if (ensureExists('db/migrator', 'DB migrator')) {
     .catch((e) => logger.error('❌ Startup failed (migrations)', { error: String(e) }));
 }
 
-server.listen(env.port, () => {
-  logger.info(`🚀 HTTP listening on :${env.port}`);
+
+server.listen(env.PORT, () => {
+  logger.info(`🚀 HTTP listening on :${env.PORT}`);
 });
 ```
 
-### src/services/product.service.js
+### ./src/services/mailer.service.js
+```
+'use strict';
+
+/**
+ * Mailer centralizzato: invia email per cambio stato prenotazione.
+ * - Unifica i template per pending/accepted/rejected/cancelled
+ * - Logga SEMPRE la configurazione rilevante (mascherata)
+ */
+
+const nodemailer = require('nodemailer');
+const env = require('../env');
+const logger = require('../logger');
+
+// cache singleton transporter
+let _transporter = null;
+
+function getTransporter() {
+  if (!env.MAIL.enabled) return null;
+  if (_transporter) return _transporter;
+
+  _transporter = nodemailer.createTransport({
+    host: env.MAIL.host,
+    port: env.MAIL.port,
+    secure: env.MAIL.secure,
+    auth: (env.MAIL.user && env.MAIL.pass) ? {
+      user: env.MAIL.user,
+      pass: env.MAIL.pass,
+    } : undefined,
+  });
+
+  logger.info('📧 SMTP configured', env._debugMailConfig());
+  return _transporter;
+}
+
+function subjectFor(status, bizName) {
+  switch (status) {
+    case 'accepted':  return `✅ ${bizName}: prenotazione confermata`;
+    case 'rejected':  return `❌ ${bizName}: prenotazione rifiutata`;
+    case 'cancelled': return `⚠️ ${bizName}: prenotazione annullata`;
+    case 'pending':
+    default:          return `🕘 ${bizName}: prenotazione in attesa`;
+  }
+}
+
+function htmlFor({ reservation, prevStatus, nextStatus, reason, bizName }) {
+  const r = reservation || {};
+  const name = [r.customer_first, r.customer_last].filter(Boolean).join(' ').trim() || 'Cliente';
+  const dt = r.start_at
+    ? new Date(r.start_at).toLocaleString('it-IT')
+    : 'data/ora non disponibile';
+
+  return `
+    <div style="font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;line-height:1.5;color:#111">
+      <h2 style="margin:0 0 8px">${bizName}</h2>
+      <p>Ciao <b>${name}</b>,</p>
+      <p>ti informiamo che lo stato della tua prenotazione è ora: <b>${nextStatus}</b>.</p>
+      <ul>
+        <li><b>Quando:</b> ${dt}</li>
+        <li><b>Coperti:</b> ${r.party_size || '-'}</li>
+        ${r.table_name ? `<li><b>Tavolo:</b> ${r.table_name}</li>` : ''}
+        ${r.notes ? `<li><b>Note:</b> ${r.notes}</li>` : ''}
+      </ul>
+      ${reason ? `<p><b>Nota:</b> ${escapeHtml(reason)}</p>` : ''}
+      <p style="margin-top:20px">Grazie,<br/>${bizName}</p>
+    </div>
+  `;
+}
+
+function escapeHtml(s) {
+  return String(s || '')
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+}
+
+/**
+ * Invia mail generica di cambio stato.
+ * @param {Object} p
+ *   - to: destinatario (string)
+ *   - reservation: oggetto prenotazione
+ *   - prevStatus: string
+ *   - nextStatus: string
+ *   - reason?: string
+ *   - replyTo?: string
+ * @returns {Promise<{accepted: string[], rejected: string[], messageId: string}>}
+ */
+async function sendReservationStatusEmail(p = {}) {
+  const cfg = env._debugMailConfig();
+  logger.info('📧 sendReservationStatusEmail called', {
+    to: p?.to,
+    prevStatus: p?.prevStatus,
+    nextStatus: p?.nextStatus,
+    reason: (p?.reason || '').toString().slice(0, 200),
+    cfg,
+  });
+
+  if (!env.MAIL.enabled) {
+    logger.warn('📧 MAIL_ENABLED=false → non invio. (noop)');
+    return { accepted: [], rejected: [p?.to].filter(Boolean), messageId: 'noop' };
+  }
+  const tx = getTransporter();
+  if (!tx) {
+    logger.error('📧 transporter non disponibile');
+    throw new Error('mailer_not_configured');
+  }
+
+  const from = env.MAIL.from;
+  const replyTo = p.replyTo || env.MAIL.replyTo || undefined;
+  const subject = subjectFor(p.nextStatus, env.MAIL.bizName);
+  const html = htmlFor({
+    reservation: p.reservation,
+    prevStatus: p.prevStatus,
+    nextStatus: p.nextStatus,
+    reason: p.reason,
+    bizName: env.MAIL.bizName,
+  });
+
+  const info = await tx.sendMail({
+    from, to: p.to, subject, html, replyTo,
+  });
+
+  logger.info('📧 sent', {
+    to: p.to,
+    subject,
+    messageId: info.messageId,
+    accepted: info.accepted,
+    rejected: info.rejected,
+  });
+
+  return { accepted: info.accepted, rejected: info.rejected, messageId: info.messageId };
+}
+
+module.exports = {
+  sendReservationStatusEmail,
+};
+```
+
+### ./src/services/product.service.js
 ```
 const { query } = require('../db'); // ✅ usa wrapper unico
 
@@ -1663,290 +1769,289 @@ module.exports = {
 };
 ```
 
-### src/services/reservations.service.js
+### ./src/services/reservations.service.js
 ```
-// src/services/reservations.service.js
-// Service “Reservations” — query DB per prenotazioni
-// Stile: commenti lunghi, log con emoji, diagnostica chiara.
+'use strict';
 
-const { query } = require('../db');
+/**
+ * Service unico per le PRENOTAZIONI (CRUD + supporto UI).
+ * - Stile: commenti esplicativi, log SQL con durata, niente sorprese.
+ * - NB: Non cambiare i percorsi: usa ../db, ../env, ../logger come nel resto del progetto.
+ */
+
+const db     = require('../db');
+const env    = require('../env');
 const logger = require('../logger');
-const env = require('../env');
 
-// --- Helpers -----------------------------------------------------------------
-function trimOrNull(s) {
-  const v = (s ?? '').toString().trim();
-  return v ? v : null;
-}
-function toDayRange(fromYmd, toYmd) {
-  const out = { from: null, to: null };
-  if (fromYmd) out.from = `${fromYmd} 00:00:00`;
-  if (toYmd)   out.to   = `${toYmd} 23:59:59`;
-  return out;
-}
-function computeEndAtFromStart(startAtIso) {
-  const start = new Date(startAtIso);
-  const addMin = (start.getHours() < 16
-    ? env.RESV.defaultLunchMinutes
-    : env.RESV.defaultDinnerMinutes
-  );
-  const end = new Date(start.getTime() + addMin * 60 * 1000);
+// ------------------------------- Helpers ------------------------------------
 
-  const pad = (n) => String(n).padStart(2, '0');
-  const mysqlStart = `${start.getFullYear()}-${pad(start.getMonth()+1)}-${pad(start.getDate())} ${pad(start.getHours())}:${pad(start.getMinutes())}:00`;
-  const mysqlEnd   = `${end.getFullYear()}-${pad(end.getMonth()+1)}-${pad(end.getDate())} ${pad(end.getHours())}:${pad(end.getMinutes())}:00`;
-  return { startMysql: mysqlStart, endMysql: mysqlEnd };
-}
-
-// ensureUser: trova/crea utente e ritorna id (unique su email/phone)
-async function ensureUser({ first, last, email, phone }) {
-  const e = trimOrNull(email);
-  const p = trimOrNull(phone);
-
-  if (e) {
-    const r = await query('SELECT id FROM users WHERE email = ? LIMIT 1', [e]);
-    if (r.length) return r[0].id;
+/** Logga una query con durata; in caso di errore logga e rilancia. */
+async function q(sql, params = []) {
+  const t0 = Date.now();
+  try {
+    const [rows] = await db.query(sql, params);
+    const ms = Date.now() - t0;
+    logger.info('SQL ✅', { service: 'server', duration_ms: String(ms), sql, params });
+    return rows || [];
+  } catch (err) {
+    const ms = Date.now() - t0;
+    logger.error('SQL ❌', { service: 'server', duration_ms: String(ms), sql, params, error: String(err) });
+    throw err;
   }
-  if (p) {
-    const r = await query('SELECT id FROM users WHERE phone = ? LIMIT 1', [p]);
-    if (r.length) return r[0].id;
-  }
-
-  const res = await query(`
-    INSERT INTO users (first_name, last_name, email, phone)
-    VALUES (?, ?, ?, ?)
-    ON DUPLICATE KEY UPDATE
-      first_name = COALESCE(VALUES(first_name), first_name),
-      last_name  = COALESCE(VALUES(last_name),  last_name),
-      id = LAST_INSERT_ID(id)
-  `, [trimOrNull(first), trimOrNull(last), e, p]);
-
-  return res.insertId || res[0]?.insertId;
 }
 
-// --- LIST --------------------------------------------------------------------
+/** Pad 2 cifre. */
+function pad2(n) { return String(n).padStart(2, '0'); }
+
+/** Aggiunge minuti ad una data ISO (string) e ritorna ISO MySQL compatibile (YYYY-MM-DD HH:mm:ss). */
+function addMinutesISO(isoLike, minutes) {
+  if (!isoLike) return null;
+  const d = new Date(isoLike);
+  if (Number.isNaN(+d)) return null;
+  d.setMinutes(d.getMinutes() + Number(minutes || 0));
+  // formato MySQL (local time compatibile)
+  return `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())} ${pad2(d.getHours())}:${pad2(d.getMinutes())}:00`;
+}
+
+/** Converte ISO (con o senza 'T') in datetime string MySQL. */
+function toMySqlDateTime(isoLike) {
+  if (!isoLike) return null;
+  const d = new Date(isoLike);
+  if (Number.isNaN(+d)) return null;
+  return `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())} ${pad2(d.getHours())}:${pad2(d.getMinutes())}:00`;
+}
+
+/**
+ * Calcola end_at:
+ *  - Se non fornito, usa soglia oraria: <16:00 → lunchMinutes, altrimenti dinnerMinutes.
+ *  - Le durate arrivano da env.RESV.defaultLunchMinutes / defaultDinnerMinutes.
+ */
+function computeEndAt(startAtIso) {
+  if (!startAtIso) return null;
+  const d = new Date(startAtIso);
+  if (Number.isNaN(+d)) return null;
+
+  const hh = d.getHours();
+  const isLunch = hh < 16;
+  const mins = isLunch ? env.RESV.defaultLunchMinutes : env.RESV.defaultDinnerMinutes;
+  return addMinutesISO(startAtIso, mins);
+}
+
+/** Pulisce un valore testuale (stringa o null) */
+function s(v) {
+  const t = (v ?? '').toString().trim();
+  return t === '' ? null : t;
+}
+
+// ------------------------------- API ----------------------------------------
+
+/**
+ * Lista prenotazioni con filtri opzionali:
+ *  - from/to: YYYY-MM-DD (filtra su DATE(r.start_at))
+ *  - status: 'pending' | 'accepted' | 'rejected' | 'cancelled' | 'all'
+ *  - q: ricerca su nome/cognome/telefono/email
+ */
 async function list(filter = {}) {
-  const where = ['1=1'];
+  const where = [];
   const params = [];
 
-  const { from, to } = toDayRange(filter.from, filter.to);
-  if (from) { where.push('r.start_at >= ?'); params.push(from); }
-  if (to)   { where.push('r.start_at <= ?'); params.push(to); }
+  if (filter.from) { where.push('DATE(r.start_at) >= ?'); params.push(filter.from); }
+  if (filter.to)   { where.push('DATE(r.start_at) <= ?'); params.push(filter.to); }
 
   if (filter.status && filter.status !== 'all') {
-    where.push('r.status = ?'); params.push(String(filter.status));
+    where.push('r.status = ?');
+    params.push(filter.status);
   }
+
   if (filter.q) {
-    const q = `%${String(filter.q).trim()}%`;
     where.push(`(
-      u.first_name  LIKE ? OR u.last_name LIKE ? OR u.email LIKE ? OR u.phone LIKE ?
-      OR r.customer_first LIKE ? OR r.customer_last LIKE ? OR r.email LIKE ? OR r.phone LIKE ?
+      r.customer_first LIKE ? OR
+      r.customer_last  LIKE ? OR
+      r.phone          LIKE ? OR
+      r.email          LIKE ?
     )`);
-    params.push(q, q, q, q, q, q, q, q);
+    const w = `%${filter.q}%`;
+    params.push(w, w, w, w);
   }
 
   const sql = `
     SELECT
-      r.*,
-      t.table_number AS table_number,
-      t.room_id      AS room_id,
-      CONCAT('Tavolo ', IFNULL(CAST(t.table_number AS CHAR), CHAR(63))) AS table_name,
-      u.id          AS u_id,
-      u.first_name  AS u_first_name,
-      u.last_name   AS u_last_name,
-      u.email       AS u_email,
-      u.phone       AS u_phone,
-      TRIM(CONCAT_WS(' ',
-        COALESCE(NULLIF(u.first_name,''), NULLIF(r.customer_first,'')),
-        COALESCE(NULLIF(u.last_name,''),  NULLIF(r.customer_last,''))
-      )) AS display_name,
-      COALESCE(NULLIF(u.phone,''),  NULLIF(r.phone,''))  AS contact_phone,
-      COALESCE(NULLIF(u.email,''),  NULLIF(r.email,''))  AS contact_email
+      r.id, r.customer_first, r.customer_last, r.phone, r.email,
+      r.party_size, r.start_at, r.end_at, r.status,
+      r.table_id, r.notes, r.created_at, r.updated_at,
+      t.room_id,
+      /* Etichetta tavolo comoda per UI */
+      CONCAT('Tavolo ', COALESCE(t.table_number, t.id)) AS table_name,
+      t.table_number
     FROM reservations r
-    LEFT JOIN users  u ON u.id = r.user_id
     LEFT JOIN tables t ON t.id = r.table_id
-    WHERE ${where.join(' AND ')}
-    ORDER BY r.start_at DESC, r.id DESC
+    ${where.length ? 'WHERE ' + where.join(' AND ') : ''}
+    ORDER BY r.start_at ASC, r.id ASC
   `;
 
-  logger.info('📥 RESV list ▶️', { where, params, service: 'server' });
-  return await query(sql, params);
+  return await q(sql, params);
 }
 
-// --- GET BY ID ---------------------------------------------------------------
+/** Dettaglio singola prenotazione. */
 async function getById(id) {
-  const sql = `
-    SELECT
-      r.*,
-      t.table_number AS table_number,
-      t.room_id      AS room_id,
-      CONCAT('Tavolo ', IFNULL(CAST(t.table_number AS CHAR), CHAR(63))) AS table_name,
-      u.id          AS u_id,
-      u.first_name  AS u_first_name,
-      u.last_name   AS u_last_name,
-      u.email       AS u_email,
-      u.phone       AS u_phone,
-      TRIM(CONCAT_WS(' ',
-        COALESCE(NULLIF(u.first_name,''), NULLIF(r.customer_first,'')),
-        COALESCE(NULLIF(u.last_name,''),  NULLIF(r.customer_last,''))
-      )) AS display_name,
-      COALESCE(NULLIF(u.phone,''),  NULLIF(r.phone,''))  AS contact_phone,
-      COALESCE(NULLIF(u.email,''),  NULLIF(r.email,''))  AS contact_email
-    FROM reservations r
-    LEFT JOIN users  u ON u.id = r.user_id
-    LEFT JOIN tables t ON t.id = r.table_id
-    WHERE r.id = ?
-    LIMIT 1
-  `;
-  const rows = await query(sql, [id]);
+  const rows = await q(
+    `SELECT
+        r.id, r.customer_first, r.customer_last, r.phone, r.email,
+        r.party_size, r.start_at, r.end_at, r.status,
+        r.table_id, r.notes, r.created_at, r.updated_at,
+        t.room_id,
+        CONCAT('Tavolo ', COALESCE(t.table_number, t.id)) AS table_name,
+        t.table_number
+     FROM reservations r
+     LEFT JOIN tables t ON t.id = r.table_id
+     WHERE r.id = ?
+     LIMIT 1`,
+    [id]
+  );
   return rows[0] || null;
 }
 
-// --- CREATE ------------------------------------------------------------------
-async function create(dto) {
-  const {
-    customer_first = null,
-    customer_last  = null,
-    phone          = null,
-    email          = null,
-    party_size,
-    start_at,
-    end_at   = null,
-    notes    = null,
-    table_id = null,
-    client_token = null,
-  } = dto || {};
+/** Crea prenotazione (end_at autocalcolato se mancante). */
+async function create(dto = {}) {
+  const customer_first = s(dto.customer_first);
+  const customer_last  = s(dto.customer_last);
+  const phone          = s(dto.phone);
+  const email          = s(dto.email);
+  const notes          = s(dto.notes);
+  const table_id       = dto.table_id ?? null;
 
-  if (!party_size || !start_at) throw new Error('party_size e start_at sono obbligatori');
-
-  const userId = await ensureUser({ first: customer_first, last: customer_last, email, phone });
-
-  const { startMysql, endMysql } = computeEndAtFromStart(start_at);
-  const insertEnd = end_at ? end_at : endMysql;
-
-  const sql = `
-    INSERT INTO reservations
-      (user_id, customer_first, customer_last, phone, email, party_size,
-       start_at, end_at, notes, status, client_token, table_id)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)
-  `;
-  const params = [
-    userId,
-    trimOrNull(customer_first),
-    trimOrNull(customer_last),
-    trimOrNull(phone),
-    trimOrNull(email),
-    Number(party_size) || 1,
-    startMysql,
-    insertEnd,
-    trimOrNull(notes),
-    client_token,
-    table_id || null
-  ];
-
-  const res = await query(sql, params);
-  const id = res.insertId || res[0]?.insertId;
-
-  const created = await getById(id);
-  logger.info('✅ RESV create', { id, user_id: userId, service: 'server' });
-  return created;
-}
-
-// --- UPDATE (PATCH) ----------------------------------------------------------
-async function update(id, dto = {}) {
-  const existing = await getById(id);
-  if (!existing) { const e = new Error('not_found'); e.statusCode = 404; throw e; }
-
-  // Se cambiano dati anagrafici, ricalcolo user_id coerente
-  let newUserId = null;
-  const anagChanged =
-    dto.customer_first !== undefined ||
-    dto.customer_last  !== undefined ||
-    dto.email          !== undefined ||
-    dto.phone          !== undefined;
-
-  if (anagChanged) {
-    newUserId = await ensureUser({
-      first: dto.customer_first ?? existing.customer_first,
-      last : dto.customer_last  ?? existing.customer_last,
-      email: dto.email          ?? existing.email,
-      phone: dto.phone          ?? existing.phone,
-    });
+  // start_at: accetta ISO; normalizza in datetime MySQL.
+  const start_at = toMySqlDateTime(dto.start_at);
+  if (!start_at) {
+    const e = new Error('start_at richiesto o non valido');
+    e.statusCode = 400;
+    throw e;
   }
 
-  // Ricalcolo start/end se arriva un nuovo start_at
-  let startMysql = null, endMysql = null;
-  if (dto.start_at) {
-    const t = computeEndAtFromStart(dto.start_at);
-    startMysql = t.startMysql;
-    endMysql   = dto.end_at ? dto.end_at : t.endMysql;
-  } else if (dto.end_at) {
-    endMysql = dto.end_at;
-  }
+  // end_at: se non fornito → compute
+  const end_at = dto.end_at ? toMySqlDateTime(dto.end_at) : computeEndAt(dto.start_at);
 
-  const set = [];
-  const params = [];
-  const push = (expr, val) => { set.push(expr); params.push(val); };
+  const party_size = Number(dto.party_size || 1);
+  const status = 'pending'; // default: pending
 
-  if (newUserId !== null)               push('user_id = ?', newUserId);
-  if (dto.customer_first !== undefined) push('customer_first = ?', trimOrNull(dto.customer_first));
-  if (dto.customer_last  !== undefined) push('customer_last  = ?', trimOrNull(dto.customer_last));
-  if (dto.phone          !== undefined) push('phone          = ?', trimOrNull(dto.phone));
-  if (dto.email          !== undefined) push('email          = ?', trimOrNull(dto.email));
-  if (dto.party_size     !== undefined) push('party_size     = ?', Number(dto.party_size) || 1);
-  if (startMysql         !== null)      push('start_at       = ?', startMysql);
-  if (endMysql           !== null)      push('end_at         = ?', endMysql);
-  if (dto.notes          !== undefined) push('notes          = ?', trimOrNull(dto.notes));
-  if (dto.table_id       !== undefined) push('table_id       = ?', dto.table_id || null);
-  // NB: status NON qui → usare svc azioni stato
+  const result = await q(
+    `INSERT INTO reservations
+      (customer_first, customer_last, phone, email,
+       party_size, start_at, end_at, status,
+       table_id, notes, created_at, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(), NOW())`,
+    [customer_first, customer_last, phone, email,
+     party_size, start_at, end_at, status,
+     table_id, notes]
+  );
 
-  if (!set.length) {
-    logger.info('ℹ️ RESV update: nessun campo cambiato', { id });
-    return existing;
-  }
-
-  const sql = `UPDATE reservations SET ${set.join(', ')} WHERE id = ? LIMIT 1`;
-  params.push(id);
-  await query(sql, params);
-  logger.info('✏️ RESV update', { id, set: set.length });
+  const id = result.insertId;
   return await getById(id);
 }
 
-// --- DELETE ------------------------------------------------------------------
+/** Patch parziale. Se cambia start_at e non passi end_at → ricalcolo end_at. */
+async function update(id, dto = {}) {
+  const fields = [];
+  const params = [];
+
+  // Campi ammessi
+  if (dto.customer_first !== undefined) { fields.push('customer_first = ?'); params.push(s(dto.customer_first)); }
+  if (dto.customer_last  !== undefined) { fields.push('customer_last  = ?'); params.push(s(dto.customer_last)); }
+  if (dto.phone          !== undefined) { fields.push('phone          = ?'); params.push(s(dto.phone)); }
+  if (dto.email          !== undefined) { fields.push('email          = ?'); params.push(s(dto.email)); }
+  if (dto.party_size     !== undefined) { fields.push('party_size     = ?'); params.push(Number(dto.party_size || 1)); }
+  if (dto.table_id       !== undefined) { fields.push('table_id       = ?'); params.push(dto.table_id ?? null); }
+  if (dto.notes          !== undefined) { fields.push('notes          = ?'); params.push(s(dto.notes)); }
+
+  // gestione data/ora
+  let startWasChanged = false;
+  if (dto.start_at !== undefined) {
+    fields.push('start_at       = ?');
+    params.push(toMySqlDateTime(dto.start_at));
+    startWasChanged = true;
+  }
+
+  if (dto.end_at !== undefined) {
+    fields.push('end_at         = ?');
+    params.push(dto.end_at ? toMySqlDateTime(dto.end_at) : null);
+  } else if (startWasChanged) {
+    // se non specifichi end_at ma cambi start_at → ricalcolo comodo
+    const recalculated = computeEndAt(dto.start_at);
+    fields.push('end_at         = ?');
+    params.push(recalculated);
+  }
+
+  if (!fields.length) {
+    // niente da fare → ritorno il record attuale
+    return await getById(id);
+  }
+
+  fields.push('updated_at = NOW()');
+
+  await q(
+    `UPDATE reservations SET ${fields.join(', ')} WHERE id = ? LIMIT 1`,
+    [...params, id]
+  );
+
+  return await getById(id);
+}
+
+/** Hard delete (coerente con FE). */
 async function remove(id) {
-  const res = await query('DELETE FROM reservations WHERE id = ? LIMIT 1', [id]);
-  logger.warn('🗑️ RESV delete', { id, affected: res.affectedRows || res[0]?.affectedRows || 0 });
+  await q(`DELETE FROM reservations WHERE id = ? LIMIT 1`, [id]);
   return { ok: true };
 }
 
-// --- ROOMS/TABLES/COUNT ------------------------------------------------------
+// ----------------------------- Supporto UI ----------------------------------
+
 async function listRooms() {
-  return await query(
-    'SELECT id, name, is_active, sort_order FROM rooms ORDER BY sort_order ASC, id ASC', []
+  return await q(
+    `SELECT id, name, is_active, sort_order
+     FROM rooms
+     ORDER BY COALESCE(sort_order, 9999), name ASC`,
+    []
   );
 }
+
 async function listTablesByRoom(roomId) {
-  return await query(
-    'SELECT id, room_id, table_number, seats AS capacity, status FROM tables WHERE room_id = ? ORDER BY table_number ASC, id ASC',
+  return await q(
+    `SELECT id, room_id, table_number, capacity, label, status, updated_at
+     FROM tables
+     WHERE room_id = ?
+     ORDER BY COALESCE(table_number, 9999), id ASC`,
     [roomId]
   );
 }
-async function countByStatus(filter = {}) {
-  const where = ['1=1']; const params = [];
-  const { from, to } = toDayRange(filter.from, filter.to);
-  if (from) { where.push('r.start_at >= ?'); params.push(from); }
-  if (to)   { where.push('r.start_at <= ?'); params.push(to); }
-  const sql = `
-    SELECT r.status, COUNT(*) AS n
-    FROM reservations r
-    WHERE ${where.join(' AND ')}
-    GROUP BY r.status
-  `;
-  const rows = await query(sql, params);
+
+// ---------------------------- Conteggio per status ---------------------------
+
+/**
+ * Ritorna { pending, accepted, rejected, cancelled, total }
+ * Filtrando opzionalmente per range data (DATE(start_at) tra from e to).
+ */
+async function countByStatus({ from, to } = {}) {
+  const where = [];
+  const params = [];
+  if (from) { where.push('DATE(start_at) >= ?'); params.push(from); }
+  if (to)   { where.push('DATE(start_at) <= ?'); params.push(to); }
+
+  const rows = await q(
+    `SELECT status, COUNT(*) AS c
+     FROM reservations
+     ${where.length ? 'WHERE ' + where.join(' AND ') : ''}
+     GROUP BY status`,
+    params
+  );
+
   const out = { pending: 0, accepted: 0, rejected: 0, cancelled: 0, total: 0 };
-  for (const r of rows) { const s = String(r.status), n = Number(r.n||0); if (s in out) out[s]=n; out.total += n; }
+  for (const r of rows) {
+    if (out[r.status] !== undefined) out[r.status] = Number(r.c || 0);
+    out.total += Number(r.c || 0);
+  }
   return out;
 }
+
+// ---------------------------------------------------------------------------
 
 module.exports = {
   list,
@@ -1956,156 +2061,203 @@ module.exports = {
   remove,
   listRooms,
   listTablesByRoom,
-  countByStatus,
+  countByStatus
 };
 ```
 
-### src/services/reservations-status.service.js
+### ./src/services/reservations-status.service.js
 ```
-// src/services/reservations-status.service.js
-// === Servizio azioni stato (accept/reject/cancel) con audit ==================
-// Patch NON distruttiva: file completo pronto da incollare.
-// - Usa transazione DB (db.tx) con fallback auto a pool.getConnection()
-// - Valida transizioni consentite
-// - Aggiorna reservations (status, status_note, status_changed_at)
-// - Inserisce riga in reservation_audit (storico)
-// - Ritorna lo snapshot aggiornato della prenotazione
-
 'use strict';
 
-const db = require('../db');
-const logger = require('../logger');
-
 /**
- * Esegue una callback in transazione.
- * Priorità: db.tx → pool.getConnection() → (fallback estremo) db.query(callback)
+ * Stato prenotazioni: transizioni + audit + (NEW) mail automatica.
+ * Mantiene lo stile: commenti esplicativi e log dettagliati.
  */
-async function runTx(callback) {
-    if (typeof db.tx === 'function') {
-        return db.tx(callback);
-    }
-    if (db.pool && typeof db.pool.getConnection === 'function') {
-        const conn = await db.pool.getConnection();
-        try {
-            await conn.beginTransaction();
-            const result = await callback(conn);
-            await conn.commit();
-            return result;
-        } catch (err) {
-            try { await conn.rollback(); } catch { /* ignore */ }
-            throw err;
-        } finally {
-            conn.release();
-        }
-    }
-    if (typeof db.query === 'function') {
-        // Se hai implementato l’overload db.query(callback), funziona anche così.
-        return db.query(callback);
-    }
-    throw new Error('Transazione non disponibile: aggiungi db.tx o esporta pool.getConnection()');
+
+const env = require('../env');
+const logger = require('../logger');
+const db = require('../db'); // assumo export { query } o compatibile
+const mailer = require('./mailer.service');
+
+// Mapping action → status
+function actionToStatus(action) {
+  switch (String(action || '').trim()) {
+    case 'accept': return 'accepted';
+    case 'reject': return 'rejected';
+    case 'cancel': return 'cancelled';
+    default: return null;
+  }
 }
 
-// Mappa transizioni consentite.
-const ALLOWED_TRANSITIONS = {
-    pending: new Set(['accepted', 'rejected', 'cancelled']),
-    accepted: new Set(['cancelled']),
-    rejected: new Set([]),
-    cancelled: new Set([]),
+// State machine “di base”
+const ALLOWED = {
+  pending : ['accepted', 'rejected', 'cancelled'],
+  accepted: ['cancelled'],
+  rejected: [],
+  cancelled: [],
 };
 
-function resolveNewStatus(action) {
-    switch (action) {
-        case 'accept': return 'accepted';
-        case 'reject': return 'rejected';
-        case 'cancel': return 'cancelled';
-        default: return null;
-    }
+// Decide se ammettere current → next
+function canTransition(current, next) {
+  if (!current || !next) return false;
+  if (current === next) return true;
+
+  // Richiesta: consentire rientri e qualunque cambio se indicato da .env
+  if (env.RESV.forceTransitions) {
+    logger.warn('⚠️ forceTransitions ON: consento %s → %s', current, next);
+    return true;
+  }
+  if (env.RESV.allowAnyTransition) {
+    logger.warn('↩️ allowAnyTransition ON: consento %s → %s', current, next);
+    return true;
+  }
+
+  // Altrimenti regole base + override puntuali
+  const base = ALLOWED[current] || [];
+  if (base.includes(next)) return true;
+
+  if (current === 'rejected' && next === 'accepted' && env.RESV.allowAcceptOverride) {
+    logger.warn('↩️ override: consento %s → %s (allowAcceptOverride)', current, next);
+    return true;
+  }
+  if (current === 'cancelled' && env.RESV.allowBacktrack &&
+      (next === 'rejected' || next === 'accepted' || next === 'pending')) {
+    logger.warn('↩️ backtrack: consento %s → %s (allowBacktrack)', current, next);
+    return true;
+  }
+  return false;
 }
 
-/**
- * Esegue la transizione di stato in transazione:
- * - Legge stato attuale (FOR UPDATE)
- * - Valida transizione
- * - Aggiorna reservations (status, status_note, status_changed_at)
- * - Inserisce riga in reservation_audit
- * - Ritorna lo snapshot aggiornato della prenotazione
- */
+function denyTransition(current, next) {
+  const msg = `Transizione non consentita: ${current} → ${next}`;
+  const err = new Error(msg);
+  err.statusCode = 409;
+  return err;
+}
+
+// Carica prenotazione
+async function getById(id) {
+  const [rows] = await db.query(
+    'SELECT id, customer_first, customer_last, email, phone, party_size, start_at, end_at, status, table_id, notes FROM reservations WHERE id=? LIMIT 1',
+    [id]
+  );
+  return rows && rows[0] ? rows[0] : null;
+}
+
+// Scrive audit (tabella semplice; adatta i nomi se i tuoi sono diversi)
+async function insertAudit({ reservationId, prevStatus, nextStatus, reason, user }) {
+  await db.query(
+    `INSERT INTO reservations_status_audit 
+     (reservation_id, prev_status, next_status, reason, user_id, user_email, created_at)
+     VALUES (?, ?, ?, ?, ?, ?, NOW())`,
+    [reservationId, prevStatus, nextStatus, reason || null, user?.id || null, user?.email || null]
+  );
+}
+
+// Aggiorna stato in tabella
+async function updateStatusInDb(id, nextStatus) {
+  await db.query(
+    'UPDATE reservations SET status=?, updated_at=NOW() WHERE id=? LIMIT 1',
+    [nextStatus, id]
+  );
+}
+
 async function updateStatus({ reservationId, action, reason, user }) {
-    const newStatus = resolveNewStatus(action);
-    if (!newStatus) {
-        const err = new Error('Azione non valida. Usa: accept | reject | cancel');
-        err.statusCode = 400; throw err;
+  // 1) Carico attuale
+  const r = await getById(reservationId);
+  if (!r) {
+    const e = new Error('not_found');
+    e.statusCode = 404;
+    throw e;
+  }
+
+  const current = r.status;
+  const next = actionToStatus(action);
+  if (!next) {
+    const e = new Error('invalid_action');
+    e.statusCode = 400;
+    throw e;
+  }
+
+  // 2) Regole transizione
+  if (!canTransition(current, next)) {
+    throw denyTransition(current, next);
+  }
+
+  logger.info('🔁 RESV status change', {
+    id: reservationId, prev: current, next,
+    reason: reason || null,
+    notify: env.RESV.notifyOnStatusChange
+  });
+
+  // 3) Update + audit (transaction semplice)
+  await updateStatusInDb(reservationId, next);
+  await insertAudit({ reservationId, prevStatus: current, nextStatus: next, reason, user });
+
+  // 4) Ricarico la riga aggiornata
+  const updated = await getById(reservationId);
+
+  // 5) Email (sempre, se abilitata e c'è destinazione)
+  if (env.RESV.notifyOnStatusChange) {
+    const to = (updated?.email || '').trim();
+    if (to) {
+      try {
+        // Log env mail *rilevante* per diagnosi (mascherato in mailer)
+        logger.info('📧 notify status change', {
+          id: reservationId,
+          to,
+          prevStatus: current,
+          nextStatus: next,
+          mailEnabled: env.MAIL.enabled,
+          smtpHost: env.MAIL.host,
+          smtpPort: env.MAIL.port,
+          smtpSecure: env.MAIL.secure,
+          mailFrom: env.MAIL.from || null,
+          mailReplyTo: env.MAIL.replyTo || null
+        });
+
+        const info = await mailer.sendStatusUpdateEmail({
+          to,
+          reservation: updated,
+          prevStatus: current,
+          nextStatus: next,
+          reason,
+          replyTo: env.MAIL.replyTo
+        });
+        updated._mail = { sent: !info?.skipped, messageId: info?.messageId || null };
+      } catch (err) {
+        logger.error('📧 notify KO', { id: reservationId, error: String(err) });
+        updated._mail = { sent: false, error: String(err) };
+      }
+    } else {
+      logger.warn('📧 notify SKIP (no email)', { id: reservationId });
+      updated._mail = { sent: false, reason: 'no_email' };
     }
+  }
 
-    const trimmedReason = (typeof reason === 'string' ? reason.trim() : '') || null;
-
-    return runTx(async (conn) => {
-        // 1) Stato attuale
-        const [rows] = await conn.execute(
-            'SELECT id, status FROM `reservations` WHERE id = ? FOR UPDATE',
-            [reservationId]
-        );
-        if (!rows.length) {
-            const err = new Error('Prenotazione non trovata');
-            err.statusCode = 404; throw err;
-        }
-        const current = rows[0];
-
-        // 2) Validazione transizione
-        const allowed = ALLOWED_TRANSITIONS[current.status] || new Set();
-        if (!allowed.has(newStatus)) {
-            const err = new Error(`Transizione non consentita: ${current.status} → ${newStatus}`);
-            err.statusCode = 409; throw err; // 409 Conflict
-        }
-
-        // 3) Aggiorna record principale
-        const nowSql = { toSqlString: () => 'CURRENT_TIMESTAMP' };
-
-
-        await conn.execute(
-            'UPDATE `reservations` SET status = ?, status_note = ?, status_changed_at = CURRENT_TIMESTAMP WHERE id = ?',
-            [newStatus, trimmedReason, reservationId]
-        );
-
-        // 4) Audit
-        const userId = (user && user.id) ? user.id : null;
-        const userEmail = (user && user.email) ? user.email : null;
-        await conn.execute(
-            'INSERT INTO `reservation_audit`\n' +
-            ' (reservation_id, old_status, new_status, reason, user_id, user_email)\n' +
-            ' VALUES (?,?,?,?,?,?)',
-            [reservationId, current.status, newStatus, trimmedReason, userId, userEmail]
-        );
-
-        logger.info(`📝 [RESV] audit  #${reservationId}: ${current.status} → ${newStatus}  👤 ${userEmail || 'unknown'}  🗒️ ${trimmedReason || '-'}`);
-
-        // 5) Ritorna lo snapshot aggiornato
-        const [out] = await conn.execute(
-            'SELECT * FROM `reservations` WHERE id = ?',
-            [reservationId]
-        );
-        return out[0];
-    });
+  return updated;
 }
 
-/** Restituisce l'audit (ultime N righe, default 50) */
 async function getAudit({ reservationId, limit = 50 }) {
-    const n = Number(limit) || 50;
-    const [rows] = await db.query(
-        'SELECT id, reservation_id, old_status, new_status, reason, user_email, created_at\n' +
-        '  FROM `reservation_audit` WHERE reservation_id = ?\n' +
-        '  ORDER BY created_at DESC LIMIT ?',
-        [reservationId, n]
-    );
-    return rows;
+  const [rows] = await db.query(
+    `SELECT id, reservation_id, prev_status, next_status, reason, user_email, created_at
+     FROM reservations_status_audit
+     WHERE reservation_id = ?
+     ORDER BY id DESC
+     LIMIT ?`,
+    [reservationId, limit]
+  );
+  return rows || [];
 }
 
 module.exports = {
-    updateStatus,
-    getAudit,
-};```
+  updateStatus,
+  getAudit,
+  canTransition
+};
+```
 
-### src/services/thermal-printer.service.js
+### ./src/services/thermal-printer.service.js
 ```
 'use strict';
 
@@ -2505,7 +2657,7 @@ module.exports = {
 };
 ```
 
-### src/sockets/index.js
+### ./src/sockets/index.js
 ```
 const logger = require('../logger');
 
@@ -2525,7 +2677,7 @@ module.exports = function(io) {
 };
 ```
 
-### src/sockets/orders.js
+### ./src/sockets/orders.js
 ```
 // 📡 Socket.IO: gestione ordini (lista/nuovo/update)
 const { query } = require('../db');                         // query wrapper
@@ -2594,7 +2746,7 @@ module.exports = (io) => {
 };
 ```
 
-### src/sockets/reservations.js
+### ./src/sockets/reservations.js
 ```
 // 📡 Socket.IO — Prenotazioni tavolo (realtime) + creazione anche da Admin
 const logger = require('../logger'); // ✅ istanza diretta
@@ -2653,147 +2805,4 @@ module.exports = (io) => {
     });
   });
 };
-```
-
-### src/utils/print.js
-```
-// server/src/utils/print.js
-// 🖨️ Stampa ESC/POS su TCP 9100 con fallback su file .txt in /receipts
-// Include: log dettagliati, init ESC/POS, cut opzionale, timeout chiaro
-
-const net = require('net');
-const fs = require('fs');
-const path = require('path');
-const logger = require('../logger'); // ✅ tua istanza
-
-// === INIZIO MODIFICA (helper config + log) ===
-// ✅ Converte process.env in config pulita e logga all'avvio della stampa
-function loadPrinterCfg() {
-  const header = (process.env.PRINTER_HEADER || '').split('|').filter(Boolean);
-  return {
-    enabled: String(process.env.PRINTER_ENABLED).toLowerCase() === 'true',
-    ip: process.env.PRINTER_IP || process.env.PRINTER_HOST || '127.0.0.1',
-    port: Number(process.env.PRINTER_PORT || 9100),
-    cut: String(process.env.PRINTER_CUT || 'true').toLowerCase() === 'true',
-    header,
-    footer: process.env.PRINTER_FOOTER || '',
-    codepage: process.env.PRINTER_CODEPAGE || 'cp858',
-  };
-}
-// === FINE MODIFICA ===
-
-function format(order, cfg) {
-  const L = [];
-  const pad = (l, r, w = 42) => {
-    l = String(l);
-    r = String(r);
-    const s = Math.max(1, w - (l.length + r.length));
-    return l + ' '.repeat(s) + r;
-  };
-
-  (cfg.header || []).forEach(h => L.push(h));
-  L.push('-'.repeat(42));
-  if (order.id) L.push(pad('Ordine #', order.id));
-  if (order.created_at) L.push(pad('Data', String(order.created_at)));
-  L.push('-'.repeat(42));
-
-  (order.items || []).forEach(it => {
-    const left = `${it.qty || 1}x ${it.product_name || it.name || 'Item'}`;
-    const right = `€ ${(Number(it.price || 0) * (it.qty || 1)).toFixed(2)}`;
-    L.push(pad(left, right));
-    if (it.notes) L.push('  Note: ' + it.notes);
-  });
-
-  L.push('-'.repeat(42));
-  L.push(pad('TOTALE', `€ ${Number(order.total || 0).toFixed(2)}`));
-  if (cfg.footer) { L.push(''); L.push(cfg.footer); }
-  L.push(''); L.push('');
-
-  return L.join('\n');
-}
-
-function fallback(order, text, err) {
-  const dir = path.join(process.cwd(), 'receipts');
-  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-  const file = path.join(dir, `receipt-${order.id || 'na'}-${Date.now()}.txt`);
-  fs.writeFileSync(file, text);
-  logger.error('🖨️ PRINT fallback', { file, error: String(err && err.message || err) });
-}
-
-// === INIZIO MODIFICA (ESC/POS init + log estesi) ===
-function buildPayload(text, cut = true) {
-  // ESC @ (init) + testo + taglio opzionale
-  const ESC = '\x1B';
-  const GS  = '\x1D';
-  let payload = ESC + '@' + text + '\n\n';
-  if (cut) payload += GS + 'V' + '\x00';
-  return Buffer.from(payload, 'binary'); // inviamo come binario
-}
-
-async function printOrder(order, cfgInput) {
-  const cfg = cfgInput || loadPrinterCfg();
-  const text = format(order, cfg);
-
-  logger.info('🖨️ PRINT begin', {
-    enabled: cfg.enabled, ip: cfg.ip, port: cfg.port, cut: cfg.cut,
-    headerLines: (cfg.header || []).length, footerLen: (cfg.footer || '').length,
-    textLen: text.length
-  });
-
-  if (!cfg.enabled) {
-    logger.warn('🖨️ PRINT disabled → fallback su file');
-    fallback(order, text, 'disabled');
-    return;
-  }
-
-  const payload = buildPayload(text, cfg.cut);
-
-  return new Promise((resolve, reject) => {
-    const sock = new net.Socket();
-    let settled = false;
-
-    const doneOk = () => {
-      if (settled) return;
-      settled = true;
-      logger.info('✅ PRINT ok', { ip: cfg.ip, port: cfg.port, bytes: payload.length });
-      resolve();
-    };
-    const doneErr = (e) => {
-      if (settled) return;
-      settled = true;
-      fallback(order, text, e);
-      logger.error('❌ PRINT error', { ip: cfg.ip, port: cfg.port, code: e && e.code, msg: String(e && e.message || e) });
-      reject(e);
-    };
-
-    sock.setTimeout(5000); // ⏱️ un filo più alto
-    logger.info('🔌 PRINT connect...', { ip: cfg.ip, port: cfg.port });
-
-    sock.once('connect', () => {
-      logger.info('🔐 PRINT connected, sending...');
-      sock.write(payload, (err) => {
-        if (err) return doneErr(err);
-        logger.info('📤 PRINT payload sent, ending socket...');
-        sock.end(); // chiudiamo subito (raw)
-      });
-    });
-
-    sock.once('close', (hadErr) => {
-      logger.info('🔚 PRINT socket closed', { hadErr });
-      if (!hadErr) doneOk();
-    });
-
-    sock.once('timeout', () => doneErr(new Error('timeout')));
-    sock.once('error', doneErr);
-
-    try {
-      sock.connect(cfg.port, cfg.ip);
-    } catch (e) {
-      doneErr(e);
-    }
-  });
-}
-// === FINE MODIFICA ===
-
-module.exports = { printOrder, loadPrinterCfg };
 ```

@@ -1,10 +1,10 @@
-// src/api/reservations.js
 'use strict';
 
 const express = require('express');
 const router = express.Router();
 
 const logger = require('../logger');
+const env = require('../env');
 const svc = require('../services/reservations.service');
 
 // === requireAuth con fallback DEV ============================================
@@ -16,13 +16,17 @@ try {
 } catch (e) {
   logger.warn('⚠️ requireAuth non disponibile. Uso FALLBACK DEV (solo locale).');
   requireAuth = (req, _res, next) => {
-    req.user = { id: 0, email: 'dev@local' };
+    req.user = { id: Number(process.env.AUTH_DEV_ID || 0), email: process.env.AUTH_DEV_USER || 'dev@local' };
     next();
   };
 }
 
 // Azioni di stato + audit
 const resvActions = require('../services/reservations-status.service');
+// Mailer
+const mailer = require('../services/mailer.service');
+// WhatsApp
+const wa = require('../services/whatsapp.service');
 
 // GET /api/reservations?status=&from=&to=&q=
 router.get('/', async (req, res) => {
@@ -33,11 +37,11 @@ router.get('/', async (req, res) => {
       to    : req.query.to     || undefined,
       q     : req.query.q      || undefined
     };
-    logger.info('📥 [GET] /api/reservations', { filter });
+    logger.info('📥 [GET] /api/reservations', { service: 'server', filter });
     const rows = await svc.list(filter);
     res.json(rows);
   } catch (err) {
-    logger.error('❌ [GET] /api/reservations', { error: String(err) });
+    logger.error('❌ [GET] /api/reservations', { service: 'server', error: String(err) });
     res.status(500).json({ error: 'internal_error' });
   }
 });
@@ -50,7 +54,7 @@ router.get('/rooms', async (_req, res) => {
     const rows = await svc.listRooms();
     res.json(rows);
   } catch (err) {
-    logger.error('❌ /rooms', { error: String(err) });
+    logger.error('❌ /rooms', { service: 'server', error: String(err) });
     res.status(500).json({ error: 'internal_error' });
   }
 });
@@ -61,7 +65,7 @@ router.get('/support/tables/by-room/:roomId(\\d+)', async (req, res) => {
     const rows = await svc.listTablesByRoom(Number(req.params.roomId));
     res.json(rows);
   } catch (err) {
-    logger.error('❌ /support/tables/by-room', { error: String(err) });
+    logger.error('❌ /support/tables/by-room', { service: 'server', error: String(err) });
     res.status(500).json({ error: 'internal_error' });
   }
 });
@@ -72,7 +76,7 @@ router.get('/support/count-by-status', async (req, res) => {
     const out = await svc.countByStatus({ from: req.query.from, to: req.query.to });
     res.json(out);
   } catch (err) {
-    logger.error('❌ /support/count-by-status', { error: String(err) });
+    logger.error('❌ /support/count-by-status', { service: 'server', error: String(err) });
     res.status(500).json({ error: 'internal_error' });
   }
 });
@@ -80,11 +84,12 @@ router.get('/support/count-by-status', async (req, res) => {
 // ============================ AZIONI DI STATO ================================
 
 router.put('/:id(\\d+)/status', requireAuth, async (req, res) => {
-  try {
-    const id = Number(req.params.id);
-    const { action, reason } = req.body || {};
-    if (!id || !action) return res.status(400).json({ error: 'id e action sono obbligatori' });
+  const id = Number(req.params.id);
+  const { action, reason, notify, email, reply_to } = req.body || {};
+  if (!id || !action) return res.status(400).json({ error: 'id e action sono obbligatori' });
 
+  try {
+    // 1) Transizione stato (con override/backtrack secondo .env)
     const updated = await resvActions.updateStatus({
       reservationId: id,
       action,
@@ -92,10 +97,52 @@ router.put('/:id(\\d+)/status', requireAuth, async (req, res) => {
       user: req.user,
     });
 
+    // 2) Notifiche (mail + WhatsApp)
+    const willNotify = (notify !== false) || env.RESV.notifyAlways === true;
+
+    if (willNotify) {
+      // --- EMAIL ------------------------------------------------------------
+      try {
+        const sent = await mailer.sendStatusChangeEmail({
+          to: email || updated.contact_email || updated.email || null,
+          reservation: updated,
+          status: updated.status,
+          reason,
+          replyTo: reply_to || undefined
+        });
+        if (sent?.messageId) {
+          logger.info('📧 MAIL OK', { service: 'server', id, messageId: sent.messageId });
+        }
+      } catch (err) {
+        logger.error('📧 MAIL ERROR', { service: 'server', id, error: String(err) });
+      }
+
+      // --- WHATSAPP ---------------------------------------------------------
+      try {
+        const waRes = await wa.sendStatusChange({
+          to: updated.contact_phone || updated.phone || null,
+          reservation: updated,
+          status: updated.status,
+          reason,
+        });
+        if (waRes?.ok) {
+          logger.info('📲 WA OK', { service: 'server', id, sid: waRes.sid, template: !!waRes.template });
+        } else {
+          logger.warn('📲 WA SKIPPED', { service: 'server', id, reason: waRes?.reason || 'unknown' });
+        }
+      } catch (err) {
+        logger.error('📲 WA ERROR', { service: 'server', id, error: String(err) });
+      }
+    } else {
+      logger.warn('🔕 Notifiche disabilitate per questa richiesta', {
+        service: 'server', id, notify, notifyAlwaysEnv: env.RESV.notifyAlways
+      });
+    }
+
     return res.json({ ok: true, reservation: updated });
   } catch (err) {
     const code = err.statusCode || 500;
-    logger.error('❌ status change failed', { err: String(err) });
+    logger.error('❌ status change failed', { service: 'server', err: String(err) });
     return res.status(code).json({ error: err.sqlMessage || err.message });
   }
 });
@@ -114,7 +161,75 @@ router.get('/:id(\\d+)/audit', requireAuth, async (req, res) => {
   }
 });
 
-// ================================ CRUD ======================================
+// ================== REJECT + EMAIL + WHATSAPP ================================
+// POST /api/reservations/:id/reject-notify
+router.post('/:id(\\d+)/reject-notify', requireAuth, async (req, res) => {
+  const id = Number(req.params.id);
+  if (!Number.isFinite(id)) return res.status(400).json({ error: 'invalid_id' });
+
+  const reason = (req.body?.reason || '').toString().trim() || null;
+  const forcedEmail = (req.body?.email || '').toString().trim() || null;
+  const replyTo = (req.body?.reply_to || '').toString().trim() || null;
+
+  try {
+    const r = await svc.getById(id);
+    if (!r) return res.status(404).json({ error: 'not_found' });
+
+    const updated = await resvActions.updateStatus({
+      reservationId: id,
+      action: 'reject',
+      reason,
+      user: req.user
+    });
+
+    // email
+    try {
+      const to = forcedEmail || updated.contact_email || updated.email || null;
+      if (to) {
+        const sent = await mailer.sendReservationRejectionEmail({
+          to,
+          reservation: updated,
+          reason,
+          replyTo,
+        });
+        logger.info('📧 reject-notify ✅', { service: 'server', id, to, messageId: sent?.messageId });
+      } else {
+        logger.warn('📧 reject-notify: nessuna email disponibile', { service: 'server', id });
+      }
+    } catch (err) {
+      logger.error('📧 reject-notify ❌', { service: 'server', id, error: String(err) });
+    }
+
+    // whatsapp
+    try {
+      const waRes = await wa.sendStatusChange({
+        to: updated.contact_phone || updated.phone || null,
+        reservation: updated,
+        status: updated.status,
+        reason,
+      });
+      if (waRes?.ok) {
+        logger.info('📲 reject-notify WA ✅', { service: 'server', id, sid: waRes.sid });
+      } else {
+        logger.warn('📲 reject-notify WA skipped', { service: 'server', id, reason: waRes?.reason });
+      }
+    } catch (err) {
+      logger.error('📲 reject-notify WA ❌', { service: 'server', id, error: String(err) });
+    }
+
+    return res.json({
+      ok: true,
+      reservation: updated,
+      email: { attempted: true },
+      wa: { attempted: true }
+    });
+  } catch (err) {
+    logger.error('📧 reject-notify ❌ errore', { service: 'server', id, error: String(err) });
+    return res.status(500).json({ error: err.message || 'internal_error' });
+  }
+});
+
+// ================================ CRUD =======================================
 
 router.get('/:id(\\d+)', async (req, res) => {
   const id = Number(req.params.id);
@@ -124,7 +239,7 @@ router.get('/:id(\\d+)', async (req, res) => {
     if (!r) return res.status(404).json({ error: 'not_found' });
     res.json(r);
   } catch (err) {
-    logger.error('❌ [GET] /:id', { id, error: String(err) });
+    logger.error('❌ [GET] /:id', { service: 'server', id, error: String(err) });
     res.status(500).json({ error: 'internal_error' });
   }
 });
@@ -134,7 +249,7 @@ router.post('/', async (req, res) => {
     const created = await svc.create(req.body || {});
     res.status(201).json(created);
   } catch (err) {
-    logger.error('❌ [POST] /', { error: String(err) });
+    logger.error('❌ [POST] /', { service: 'server', error: String(err) });
     res.status(500).json({ error: 'internal_error' });
   }
 });
@@ -145,7 +260,7 @@ router.patch('/:id(\\d+)', requireAuth, async (req, res) => {
     res.json(updated);
   } catch (err) {
     const code = err.statusCode || 500;
-    logger.error('❌ [PATCH] /:id', { error: String(err) });
+    logger.error('❌ [PATCH] /:id', { service: 'server', error: String(err) });
     res.status(code).json({ error: err.message || 'internal_error' });
   }
 });
@@ -156,12 +271,12 @@ router.delete('/:id(\\d+)', requireAuth, async (req, res) => {
     res.json({ ok: true });
   } catch (err) {
     const code = err.statusCode || 500;
-    logger.error('❌ [DELETE] /:id', { error: String(err) });
+    logger.error('❌ [DELETE] /:id', { service: 'server', error: String(err) });
     res.status(code).json({ error: err.message || 'internal_error' });
   }
 });
 
-// =============================== STAMPA =====================================
+// =============================== STAMPA ======================================
 
 const printerSvc = require('../services/thermal-printer.service');
 
@@ -170,11 +285,11 @@ router.post('/print/daily', requireAuth, async (req, res) => {
     const date = (req.body?.date || new Date().toISOString().slice(0,10));
     const status = req.body?.status || 'all';
     const rows = await svc.list({ from: date, to: date, status });
-    logger.info('🧾 print/daily', { date, status, rows: rows.length });
+    logger.info('🧾 print/daily', { service: 'server', date, status, rows: rows.length });
     const out = await printerSvc.printDailyReservations({ date, rows, user: req.user });
     return res.json({ ok: true, job_id: out.jobId, printed_count: out.printedCount });
   } catch (err) {
-    logger.error('❌ print/daily', { error: String(err) });
+    logger.error('❌ print/daily', { service: 'server', error: String(err) });
     return res.status(500).json({ error: err.message || String(err) });
   }
 });
@@ -185,7 +300,7 @@ router.post('/print/placecards', requireAuth, async (req, res) => {
     const status = req.body?.status || 'accepted';
     const qrBaseUrl = req.body?.qr_base_url || process.env.QR_BASE_URL || '';
     const rows = await svc.list({ from: date, to: date, status });
-    logger.info('🧾 print/placecards', { date, status, rows: rows.length });
+    logger.info('🧾 print/placecards', { service: 'server', date, status, rows: rows.length });
     const out = await printerSvc.printPlaceCards({
       date, rows, user: req.user,
       logoText: process.env.BIZ_NAME || 'LA MIA ATTIVITÀ',
@@ -193,13 +308,12 @@ router.post('/print/placecards', requireAuth, async (req, res) => {
     });
     return res.json({ ok: true, job_id: out.jobId, printed_count: out.printedCount });
   } catch (err) {
-    logger.error('❌ print/placecards', { error: String(err) });
+    logger.error('❌ print/placecards', { service: 'server', error: String(err) });
     return res.status(500).json({ error: err.message || String(err) });
   }
 });
 
-// === INIZIO MODIFICA: stampa segnaposto singolo =============================
-// POST /api/reservations/:id/print/placecard
+// Segnaposto singolo
 router.post('/:id(\\d+)/print/placecard', requireAuth, async (req, res) => {
   try {
     const id = Number(req.params.id);
@@ -212,7 +326,7 @@ router.post('/:id(\\d+)/print/placecard', requireAuth, async (req, res) => {
 
     const out = await printerSvc.printPlaceCards({
       date: (r.start_at || '').toString().slice(0, 10),
-      rows: [r],                        // 👈 una sola prenotazione
+      rows: [r],
       user: req.user,
       logoText: process.env.BIZ_NAME || 'LA MIA ATTIVITÀ',
       qrBaseUrl,
@@ -220,10 +334,9 @@ router.post('/:id(\\d+)/print/placecard', requireAuth, async (req, res) => {
 
     return res.json({ ok: true, job_id: out.jobId, printed_count: out.printedCount });
   } catch (err) {
-    logger.error('❌ print/placecard (single)', { error: String(err) });
+    logger.error('❌ print/placecard (single)', { service: 'server', error: String(err) });
     return res.status(500).json({ error: err.message || String(err) });
   }
 });
-// === FINE MODIFICA ===========================================================
 
 module.exports = router;
