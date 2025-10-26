@@ -5,7 +5,7 @@
 
 const { query } = require('../db');
 const logger = require('../logger');
-const env = require('../env');
+const env    = require('../env');
 
 // --- Helpers -----------------------------------------------------------------
 function trimOrNull(s) {
@@ -18,18 +18,23 @@ function toDayRange(fromYmd, toYmd) {
   if (toYmd)   out.to   = `${toYmd} 23:59:59`;
   return out;
 }
+function isoToMysql(iso) {
+  if (!iso) return null;
+  return iso.replace('T', ' ').slice(0, 19);
+}
 function computeEndAtFromStart(startAtIso) {
   const start = new Date(startAtIso);
   const addMin = (start.getHours() < 16
-    ? env.RESV.defaultLunchMinutes
-    : env.RESV.defaultDinnerMinutes
+    ? (env.RESV?.defaultLunchMinutes || 90)
+    : (env.RESV?.defaultDinnerMinutes || 120)
   );
   const end = new Date(start.getTime() + addMin * 60 * 1000);
 
   const pad = (n) => String(n).padStart(2, '0');
-  const mysqlStart = `${start.getFullYear()}-${pad(start.getMonth()+1)}-${pad(start.getDate())} ${pad(start.getHours())}:${pad(start.getMinutes())}:00`;
-  const mysqlEnd   = `${end.getFullYear()}-${pad(end.getMonth()+1)}-${pad(end.getDate())} ${pad(end.getHours())}:${pad(end.getMinutes())}:00`;
-  return { startMysql: mysqlStart, endMysql: mysqlEnd };
+  const mysql = (d) =>
+    `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}:00`;
+
+  return { startMysql: mysql(start), endMysql: mysql(end) };
 }
 
 // ensureUser: trova/crea utente e ritorna id (unique su email/phone)
@@ -46,86 +51,59 @@ async function ensureUser({ first, last, email, phone }) {
     if (r.length) return r[0].id;
   }
 
-  const res = await query(`
-    INSERT INTO users (first_name, last_name, email, phone)
-    VALUES (?, ?, ?, ?)
-    ON DUPLICATE KEY UPDATE
-      first_name = COALESCE(VALUES(first_name), first_name),
-      last_name  = COALESCE(VALUES(last_name),  last_name),
-      id = LAST_INSERT_ID(id)
-  `, [trimOrNull(first), trimOrNull(last), e, p]);
-
-  return res.insertId || res[0]?.insertId;
+  const res = await query(
+    `INSERT INTO users (first_name, last_name, email, phone) VALUES (?, ?, ?, ?)`,
+    [trimOrNull(first), trimOrNull(last), e, p]
+  );
+  return res.insertId;
 }
 
-// --- LIST --------------------------------------------------------------------
+// --- Core queries -------------------------------------------------------------
 async function list(filter = {}) {
-  const where = ['1=1'];
-  const params = [];
+  const wh = [];
+  const pr = [];
+
+  if (filter.status) { wh.push('r.status = ?'); pr.push(String(filter.status)); }
 
   const { from, to } = toDayRange(filter.from, filter.to);
-  if (from) { where.push('r.start_at >= ?'); params.push(from); }
-  if (to)   { where.push('r.start_at <= ?'); params.push(to); }
+  if (from) { wh.push('r.start_at >= ?'); pr.push(from); }
+  if (to)   { wh.push('r.start_at <= ?'); pr.push(to);   }
 
-  if (filter.status && filter.status !== 'all') {
-    where.push('r.status = ?'); params.push(String(filter.status));
-  }
   if (filter.q) {
     const q = `%${String(filter.q).trim()}%`;
-    where.push(`(
-      u.first_name  LIKE ? OR u.last_name LIKE ? OR u.email LIKE ? OR u.phone LIKE ?
-      OR r.customer_first LIKE ? OR r.customer_last LIKE ? OR r.email LIKE ? OR r.phone LIKE ?
-    )`);
-    params.push(q, q, q, q, q, q, q, q);
+    wh.push('(u.first_name LIKE ? OR u.last_name LIKE ? OR u.email LIKE ? OR u.phone LIKE ? OR r.customer_first LIKE ? OR r.customer_last LIKE ? OR r.email LIKE ? OR r.phone LIKE ?)');
+    pr.push(q, q, q, q, q, q, q, q);
   }
 
+  const where = wh.length ? ('WHERE ' + wh.join(' AND ')) : '';
   const sql = `
     SELECT
       r.*,
-      t.table_number AS table_number,
-      t.room_id      AS room_id,
-      CONCAT('Tavolo ', IFNULL(CAST(t.table_number AS CHAR), CHAR(63))) AS table_name,
-      u.id          AS u_id,
-      u.first_name  AS u_first_name,
-      u.last_name   AS u_last_name,
-      u.email       AS u_email,
-      u.phone       AS u_phone,
-      TRIM(CONCAT_WS(' ',
-        COALESCE(NULLIF(u.first_name,''), NULLIF(r.customer_first,'')),
-        COALESCE(NULLIF(u.last_name,''),  NULLIF(r.customer_last,''))
-      )) AS display_name,
-      COALESCE(NULLIF(u.phone,''),  NULLIF(r.phone,''))  AS contact_phone,
-      COALESCE(NULLIF(u.email,''),  NULLIF(r.email,''))  AS contact_email
+      CONCAT_WS(' ', u.first_name, u.last_name) AS display_name,
+      u.email  AS contact_email,
+      u.phone  AS contact_phone,
+      t.table_number,
+      CONCAT('Tavolo ', t.table_number) AS table_name
     FROM reservations r
     LEFT JOIN users  u ON u.id = r.user_id
     LEFT JOIN tables t ON t.id = r.table_id
-    WHERE ${where.join(' AND ')}
-    ORDER BY r.start_at DESC, r.id DESC
+    ${where}
+    ORDER BY r.start_at ASC, r.id ASC
   `;
 
-  logger.info('📥 RESV list ▶️', { where, params, service: 'server' });
-  return await query(sql, params);
+  const rows = await query(sql, pr);
+  return rows;
 }
 
-// --- GET BY ID ---------------------------------------------------------------
 async function getById(id) {
   const sql = `
     SELECT
       r.*,
-      t.table_number AS table_number,
-      t.room_id      AS room_id,
-      CONCAT('Tavolo ', IFNULL(CAST(t.table_number AS CHAR), CHAR(63))) AS table_name,
-      u.id          AS u_id,
-      u.first_name  AS u_first_name,
-      u.last_name   AS u_last_name,
-      u.email       AS u_email,
-      u.phone       AS u_phone,
-      TRIM(CONCAT_WS(' ',
-        COALESCE(NULLIF(u.first_name,''), NULLIF(r.customer_first,'')),
-        COALESCE(NULLIF(u.last_name,''),  NULLIF(r.customer_last,''))
-      )) AS display_name,
-      COALESCE(NULLIF(u.phone,''),  NULLIF(r.phone,''))  AS contact_phone,
-      COALESCE(NULLIF(u.email,''),  NULLIF(r.email,''))  AS contact_email
+      CONCAT_WS(' ', u.first_name, u.last_name) AS display_name,
+      u.email  AS contact_email,
+      u.phone  AS contact_phone,
+      t.table_number,
+      CONCAT('Tavolo ', t.table_number) AS table_name
     FROM reservations r
     LEFT JOIN users  u ON u.id = r.user_id
     LEFT JOIN tables t ON t.id = r.table_id
@@ -136,158 +114,174 @@ async function getById(id) {
   return rows[0] || null;
 }
 
-// --- CREATE ------------------------------------------------------------------
-async function create(dto) {
-  const {
-    customer_first = null,
-    customer_last  = null,
-    phone          = null,
-    email          = null,
-    party_size,
-    start_at,
-    end_at   = null,
-    notes    = null,
-    table_id = null,
-    client_token = null,
-  } = dto || {};
+async function create(dto, { user } = {}) {
+  const userId = await ensureUser({
+    first: dto.customer_first,
+    last : dto.customer_last,
+    email: dto.email,
+    phone: dto.phone
+  });
 
-  if (!party_size || !start_at) throw new Error('party_size e start_at sono obbligatori');
+  const startIso = dto.start_at;
+  const endIso   = dto.end_at || null;
+  const { startMysql, endMysql } =
+    endIso ? { startMysql: isoToMysql(startIso), endMysql: isoToMysql(endIso) }
+           : computeEndAtFromStart(startIso);
 
-  const userId = await ensureUser({ first: customer_first, last: customer_last, email, phone });
+  // room_id, created_by presenti (strada B)
+  const res = await query(
+    `INSERT INTO reservations
+      (customer_first, customer_last, phone, email,
+       user_id, party_size, start_at, end_at, room_id, table_id,
+       notes, status, created_by)
+     VALUES (?,?,?,?,?,?,?,?,?,?,?, 'pending', ?)`,
+    [
+      trimOrNull(dto.customer_first),
+      trimOrNull(dto.customer_last),
+      trimOrNull(dto.phone),
+      trimOrNull(dto.email),
+      userId,
+      Number(dto.party_size) || 1,
+      startMysql,
+      endMysql,
+      dto.room_id || null,
+      dto.table_id || null,
+      trimOrNull(dto.notes),
+      trimOrNull(user?.email) || null
+    ]
+  );
 
-  const { startMysql, endMysql } = computeEndAtFromStart(start_at);
-  const insertEnd = end_at ? end_at : endMysql;
-
-  const sql = `
-    INSERT INTO reservations
-      (user_id, customer_first, customer_last, phone, email, party_size,
-       start_at, end_at, notes, status, client_token, table_id)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)
-  `;
-  const params = [
-    userId,
-    trimOrNull(customer_first),
-    trimOrNull(customer_last),
-    trimOrNull(phone),
-    trimOrNull(email),
-    Number(party_size) || 1,
-    startMysql,
-    insertEnd,
-    trimOrNull(notes),
-    client_token,
-    table_id || null
-  ];
-
-  const res = await query(sql, params);
-  const id = res.insertId || res[0]?.insertId;
-
-  const created = await getById(id);
-  logger.info('✅ RESV create', { id, user_id: userId, service: 'server' });
+  const created = await getById(res.insertId);
+  logger.info('🆕 reservation created', { id: created.id, by: user?.email || null });
   return created;
 }
 
-// --- UPDATE (PATCH) ----------------------------------------------------------
-async function update(id, dto = {}) {
-  const existing = await getById(id);
-  if (!existing) { const e = new Error('not_found'); e.statusCode = 404; throw e; }
-
-  // Se cambiano dati anagrafici, ricalcolo user_id coerente
-  let newUserId = null;
-  const anagChanged =
-    dto.customer_first !== undefined ||
-    dto.customer_last  !== undefined ||
-    dto.email          !== undefined ||
-    dto.phone          !== undefined;
-
-  if (anagChanged) {
-    newUserId = await ensureUser({
-      first: dto.customer_first ?? existing.customer_first,
-      last : dto.customer_last  ?? existing.customer_last,
-      email: dto.email          ?? existing.email,
-      phone: dto.phone          ?? existing.phone,
+async function update(id, dto, { user } = {}) {
+  let userId = null;
+  if (dto.customer_first !== undefined || dto.customer_last !== undefined || dto.email !== undefined || dto.phone !== undefined) {
+    userId = await ensureUser({
+      first: dto.customer_first,
+      last : dto.customer_last,
+      email: dto.email,
+      phone: dto.phone
     });
   }
 
-  // Ricalcolo start/end se arriva un nuovo start_at
   let startMysql = null, endMysql = null;
   if (dto.start_at) {
-    const t = computeEndAtFromStart(dto.start_at);
-    startMysql = t.startMysql;
-    endMysql   = dto.end_at ? dto.end_at : t.endMysql;
-  } else if (dto.end_at) {
-    endMysql = dto.end_at;
+    const endIso = dto.end_at || null;
+    const c = endIso ? { startMysql: isoToMysql(dto.start_at), endMysql: isoToMysql(endIso) }
+                     : computeEndAtFromStart(dto.start_at);
+    startMysql = c.startMysql;
+    endMysql   = c.endMysql;
   }
 
-  const set = [];
-  const params = [];
-  const push = (expr, val) => { set.push(expr); params.push(val); };
+  const fields = [];
+  const pr = [];
 
-  if (newUserId !== null)               push('user_id = ?', newUserId);
-  if (dto.customer_first !== undefined) push('customer_first = ?', trimOrNull(dto.customer_first));
-  if (dto.customer_last  !== undefined) push('customer_last  = ?', trimOrNull(dto.customer_last));
-  if (dto.phone          !== undefined) push('phone          = ?', trimOrNull(dto.phone));
-  if (dto.email          !== undefined) push('email          = ?', trimOrNull(dto.email));
-  if (dto.party_size     !== undefined) push('party_size     = ?', Number(dto.party_size) || 1);
-  if (startMysql         !== null)      push('start_at       = ?', startMysql);
-  if (endMysql           !== null)      push('end_at         = ?', endMysql);
-  if (dto.notes          !== undefined) push('notes          = ?', trimOrNull(dto.notes));
-  if (dto.table_id       !== undefined) push('table_id       = ?', dto.table_id || null);
-  // NB: status NON qui → usare svc azioni stato
+  if (userId !== null) { fields.push('user_id=?'); pr.push(userId); }
+  if (dto.customer_first !== undefined) { fields.push('customer_first=?'); pr.push(trimOrNull(dto.customer_first)); }
+  if (dto.customer_last  !== undefined) { fields.push('customer_last=?');  pr.push(trimOrNull(dto.customer_last));  }
+  if (dto.phone          !== undefined) { fields.push('phone=?');          pr.push(trimOrNull(dto.phone));          }
+  if (dto.email          !== undefined) { fields.push('email=?');          pr.push(trimOrNull(dto.email));          }
 
-  if (!set.length) {
-    logger.info('ℹ️ RESV update: nessun campo cambiato', { id });
-    return existing;
-  }
+  if (dto.party_size !== undefined) { fields.push('party_size=?'); pr.push(Number(dto.party_size)||1); }
+  if (startMysql) { fields.push('start_at=?'); pr.push(startMysql); }
+  if (endMysql)   { fields.push('end_at=?');   pr.push(endMysql);   }
 
-  const sql = `UPDATE reservations SET ${set.join(', ')} WHERE id = ? LIMIT 1`;
-  params.push(id);
-  const res = await query(sql, params);
-  const affected = res.affectedRows || res[0]?.affectedRows || 0;
+  if (dto.room_id  !== undefined) { fields.push('room_id=?');  pr.push(dto.room_id || null); }
+  if (dto.table_id !== undefined) { fields.push('table_id=?'); pr.push(dto.table_id || null); }
+  if (dto.notes    !== undefined) { fields.push('notes=?');    pr.push(trimOrNull(dto.notes)); }
 
-  // MySQL spesso risponde affectedRows=0 se i valori sono identici (NO-OP).
-  if (!affected) {
-    logger.warn('ℹ️ RESV update NO-OP (stessi valori)', { id, set: set.length });
+  // updated_by
+  fields.push('updated_by=?'); pr.push(trimOrNull(user?.email) || null);
+
+  if (!fields.length) {
+    logger.info('✏️ update: nessun campo da aggiornare', { id });
     return await getById(id);
   }
 
-  logger.info('✏️ RESV update', { id, set: set.length, affected });
-  return await getById(id);
+  pr.push(id);
+  const sql = `UPDATE reservations SET ${fields.join(', ')} WHERE id=?`;
+  await query(sql, pr);
+
+  const updated = await getById(id);
+  logger.info('✏️ reservation updated', { id, by: user?.email || null });
+  return updated;
 }
 
-// --- DELETE ------------------------------------------------------------------
-async function remove(id) {
-  const res = await query('DELETE FROM reservations WHERE id = ? LIMIT 1', [id]);
-  logger.warn('🗑️ RESV delete', { id, affected: res.affectedRows || res[0]?.affectedRows || 0 });
-  return { ok: true };
+// --- Hard delete con policy ---------------------------------------------------
+async function remove(id, { user, reason } = {}) {
+  const existing = await getById(id);
+  if (!existing) return false;
+
+  const allowAnyByEnv =
+    (env.RESV && env.RESV.allowDeleteAnyStatus === true) ||
+    (String(process.env.RESV_ALLOW_DELETE_ANY_STATUS || '').toLowerCase() === 'true');
+
+  const isCancelled = String(existing.status || '').toLowerCase() === 'cancelled';
+
+  if (!allowAnyByEnv && !isCancelled) {
+    logger.warn('🛡️ hard-delete NEGATO (stato non cancellato)', { id, status: existing.status });
+    return false;
+  }
+
+  const res = await query('DELETE FROM reservations WHERE id=? LIMIT 1', [id]);
+  const ok  = res.affectedRows > 0;
+
+  if (ok) {
+    logger.info('🗑️ reservation hard-deleted', { id, by: user?.email || null, reason: reason || null });
+  } else {
+    logger.error('💥 reservation delete KO', { id });
+  }
+  return ok;
 }
 
-// --- ROOMS/TABLES/COUNT ------------------------------------------------------
-async function listRooms() {
-  return await query(
-    'SELECT id, name, is_active, sort_order FROM rooms ORDER BY sort_order ASC, id ASC', []
+// --- Supporto UI --------------------------------------------------------------
+async function countByStatus({ from, to }) {
+  const w = [];
+  const p = [];
+
+  const r = toDayRange(from, to);
+  if (r.from) { w.push('start_at >= ?'); p.push(r.from); }
+  if (r.to)   { w.push('start_at <= ?'); p.push(r.to);   }
+
+  const where = w.length ? ('WHERE ' + w.join(' AND ')) : '';
+
+  const rows = await query(
+    `SELECT status, COUNT(*) AS count FROM reservations ${where} GROUP BY status`,
+    p
   );
-}
-async function listTablesByRoom(roomId) {
-  return await query(
-    'SELECT id, room_id, table_number, seats AS capacity, status FROM tables WHERE room_id = ? ORDER BY table_number ASC, id ASC',
-    [roomId]
-  );
-}
-async function countByStatus(filter = {}) {
-  const where = ['1=1']; const params = [];
-  const { from, to } = toDayRange(filter.from, filter.to);
-  if (from) { where.push('r.start_at >= ?'); params.push(from); }
-  if (to)   { where.push('r.start_at <= ?'); params.push(to); }
-  const sql = `
-    SELECT r.status, COUNT(*) AS n
-    FROM reservations r
-    WHERE ${where.join(' AND ')}
-    GROUP BY r.status
-  `;
-  const rows = await query(sql, params);
-  const out = { pending: 0, accepted: 0, rejected: 0, cancelled: 0, total: 0 };
-  for (const r of rows) { const s = String(r.status), n = Number(r.n||0); if (s in out) out[s]=n; out.total += n; }
+
+  const out = {};
+  for (const r of rows) out[String(r.status)] = Number(r.count);
   return out;
+}
+
+// --- Sale / Tavoli (supporto UI) ---------------------------------------------
+async function listRooms() {
+  const sql = `
+    SELECT id, name
+    FROM rooms
+    WHERE IFNULL(is_active,1)=1
+    ORDER BY (sort_order IS NULL), sort_order, name
+  `;
+  return await query(sql, []);
+}
+
+async function listTablesByRoom(roomId) {
+  const sql = `
+    SELECT
+      t.id,
+      t.room_id,
+      t.table_number,
+      t.seats,
+      CONCAT('Tavolo ', t.table_number) AS name
+    FROM tables t
+    WHERE t.room_id = ?
+    ORDER BY t.table_number ASC, t.id ASC
+  `;
+  return await query(sql, [roomId]);
 }
 
 module.exports = {
@@ -296,7 +290,7 @@ module.exports = {
   create,
   update,
   remove,
+  countByStatus,
   listRooms,
   listTablesByRoom,
-  countByStatus,
 };
