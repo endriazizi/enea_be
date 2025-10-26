@@ -1,6 +1,6 @@
 # 📁 Project tree (.)
 
-_Generato: Fri, Oct 24, 2025  7:08:35 PM_
+_Generato: Sun, Oct 26, 2025  3:46:17 AM_
 
 ```text
 .
@@ -10,11 +10,11 @@ _Generato: Fri, Oct 24, 2025  7:08:35 PM_
 .git
 .gitignore
 assets
+exports
 logs
 node_modules
 npm
-package-lock.json
-print.js
+package.json
 readme.md
 src
 src/api
@@ -44,16 +44,21 @@ src/middleware/reqres-logger.js
 src/server.js
 src/services
 src/services/mailer.service.js
+src/services/notify.service.js
+src/services/orders.service.js
+src/services/orders.sse.js
 src/services/product.service.js
 src/services/reservations-status.service.js
 src/services/reservations.service.js
 src/services/thermal-printer.service.js
 src/services/whatsapp-twilio.service.js
 src/services/whatsapp.service.js
+src/services/whatsapp.twilio.service.jS
+src/services/whatsender.service.js
 src/sockets
 src/sockets/index.js
+src/sockets/orders.channel.js
 src/sockets/orders.js
 src/sockets/reservations.js
 src/utils
-src/utils/print.js
 ```

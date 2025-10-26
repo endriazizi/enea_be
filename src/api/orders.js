@@ -1,24 +1,32 @@
-// src/api/orders.js
+'use strict';
+
+// src/api/orders.js — ORDINI (header + items + stato + notify + socket + SSE)
+
 const express = require('express');
 const router = express.Router();
 
-const logger = require('../logger');      // ✅ winston
-const { query } = require('../db');       // ✅ mysql2/promise pool
+const logger = require('../logger');
+const { query } = require('../db');
+const Orders = require('../services/orders.service');
+const notify = require('../services/notify.service');
+const sse = require('../services/orders.sse');
 
-// 🔧 helper: carica un ordine con items
+// Helper: id numerico
+const toId = (v) => Number.parseInt(v, 10);
+
+// Carica + items
 async function hydrateOrder(orderId) {
   const [order] = await query('SELECT * FROM orders WHERE id=?', [orderId]);
   if (!order) return null;
   const items = await query('SELECT * FROM order_items WHERE order_id=?', [orderId]);
-  return { ...order, items }; // <-- FIX: spread corretto
+  return { ...order, items };
 }
 
-// GET /api/orders  → tutti (solo header, senza items)
-// Per caricare la board rapidamente
-router.get('/', async (req, res) => {
+// ---------------- LISTE ------------------------------------------------------
+router.get('/', async (_req, res) => {
   try {
-    logger.info('📥 [GET] /api/orders (all headers)');
-    const rows = await query('SELECT * FROM orders ORDER BY created_at DESC');
+    logger.info('📥 [GET] /api/orders');
+    const rows = await Orders.listHeaders();
     res.json(rows);
   } catch (err) {
     logger.error('❌ [GET] /api/orders', { error: String(err) });
@@ -26,64 +34,50 @@ router.get('/', async (req, res) => {
   }
 });
 
-// GET /api/orders/all → alias, con hydrate (items inclusi)
-router.get('/all', async (req, res) => {
+router.get('/all', async (_req, res) => {
   try {
-    logger.info('📥 [GET] /api/orders/all (hydrate each)');
-    const heads = await query('SELECT id FROM orders ORDER BY created_at DESC');
-    const full = [];
-    for (const h of heads) {
-      const o = await hydrateOrder(h.id);
-      if (o) full.push(o);
-    }
-    res.json(full);
+    logger.info('📥 [GET] /api/orders/all');
+    const out = await Orders.listFull();
+    res.json(out);
   } catch (err) {
     logger.error('❌ [GET] /api/orders/all', { error: String(err) });
     res.status(500).json({ error: 'internal_error' });
   }
 });
 
-// GET /api/orders/pending
-router.get('/pending', async (req, res) => {
+router.get('/pending', async (_req, res) => {
   try {
     logger.info('📥 [GET] /api/orders/pending');
-    const rows = await query('SELECT * FROM orders WHERE status="pending" ORDER BY created_at DESC');
-    res.json(rows);
+    res.json(await Orders.listByStatus('pending'));
   } catch (err) {
     logger.error('❌ [GET] /api/orders/pending', { error: String(err) });
     res.status(500).json({ error: 'internal_error' });
   }
 });
 
-// GET /api/orders/completed
-router.get('/completed', async (req, res) => {
+router.get('/completed', async (_req, res) => {
   try {
     logger.info('📥 [GET] /api/orders/completed');
-    const rows = await query('SELECT * FROM orders WHERE status="completed" ORDER BY created_at DESC');
-    res.json(rows);
+    res.json(await Orders.listByStatus('completed'));
   } catch (err) {
     logger.error('❌ [GET] /api/orders/completed', { error: String(err) });
     res.status(500).json({ error: 'internal_error' });
   }
 });
 
-// GET /api/orders/today  → ultimi 24h
-router.get('/today', async (req, res) => {
+router.get('/today', async (_req, res) => {
   try {
-    logger.info('📥 [GET] /api/orders/today (last 24h)');
-    const rows = await query(
-      'SELECT * FROM orders WHERE created_at >= NOW() - INTERVAL 1 DAY ORDER BY created_at DESC'
-    );
-    res.json(rows);
+    logger.info('📥 [GET] /api/orders/today');
+    res.json(await Orders.listLastHours(24));
   } catch (err) {
     logger.error('❌ [GET] /api/orders/today', { error: String(err) });
     res.status(500).json({ error: 'internal_error' });
   }
 });
 
-// GET /api/orders/:id  → dettaglio + items
-router.get('/:id', async (req, res) => {
-  const id = Number(req.params.id);
+// ---------------- DETTAGLIO --------------------------------------------------
+router.get('/:id(\\d+)', async (req, res) => {
+  const id = toId(req.params.id);
   try {
     logger.info('📥 [GET] /api/orders/:id', { id });
     const full = await hydrateOrder(id);
@@ -95,24 +89,103 @@ router.get('/:id', async (req, res) => {
   }
 });
 
-// PATCH /api/orders/:id/status  → aggiorna stato (pending|confirmed|preparing|ready|completed)
-router.patch('/:id/status', async (req, res) => {
-  const id = Number(req.params.id);
-  const { status } = req.body || {};
+// ---------------- CREA -------------------------------------------------------
+router.post('/', async (req, res) => {
+  const dto = req.body || {};
   try {
-    logger.info('✏️ [PATCH] /api/orders/:id/status', { id, body: req.body });
+    logger.info('➕ [POST] /api/orders ▶️', {
+      source: dto.source || dto.channel || 'web',
+      items: Array.isArray(dto.items) ? dto.items.length : 0
+    });
 
-    const valid = ['pending', 'confirmed', 'preparing', 'ready', 'completed'];
-    if (!valid.includes(status)) {
-      return res.status(400).json({ error: 'invalid_status', valid });
+    const created = await Orders.create(dto);
+    const full = await hydrateOrder(created.id);
+
+    // Notifiche (best-effort)
+    try { await notify.onOrderCreated(full); }
+    catch (e) { logger.error('🔔 notify NEW ❌', { id: created.id, error: String(e) }); }
+
+    // Socket
+    try {
+      const io = require('../sockets/index').io();
+      io.emit('orders:created', { id: created.id, order: full });
+      logger.info('📡 socket orders:created ✅', { id: created.id });
+    } catch (e) {
+      logger.warn('📡 socket orders:created ⚠️', { id: created.id, error: String(e) });
     }
 
-    await query('UPDATE orders SET status=? WHERE id=?', [status, id]);
+    // SSE
+    try {
+      sse.broadcast('order-created', { id: created.id, order: full });
+    } catch (e) {
+      logger.warn('🧵 SSE broadcast order-created ⚠️', { error: String(e) });
+    }
+
+    res.status(201).json(full);
+  } catch (err) {
+    logger.error('❌ [POST] /api/orders', { error: String(err) });
+    res.status(500).json({ error: err.message || 'internal_error' });
+  }
+});
+
+// ---------------- STATO ------------------------------------------------------
+router.patch('/:id(\\d+)/status', async (req, res) => {
+  const id = toId(req.params.id);
+  const status = String(req.body?.status || '').toLowerCase();
+  try {
+    logger.info('✏️ [PATCH] /api/orders/:id/status ▶️', { id, status });
+
+    const ok = await Orders.setStatus(id, status);
+    if (!ok) return res.status(404).json({ error: 'not_found' });
+
+    const full = await hydrateOrder(id);
+
+    // socket
+    try {
+      const io = require('../sockets/index').io();
+      io.emit('orders:status', { id, status, order: full });
+      logger.info('📡 socket orders:status ✅', { id, status });
+    } catch (e) {
+      logger.warn('📡 socket orders:status ⚠️', { id, error: String(e) });
+    }
+
+    // SSE
+    try {
+      sse.broadcast('order-status', { id, status, order: full });
+    } catch (e) {
+      logger.warn('🧵 SSE broadcast order-status ⚠️', { id, error: String(e) });
+    }
+
+    // notify (cliente)
+    try { await notify.onOrderStatus(full, status); }
+    catch (e) { logger.error('🔔 notify STATUS ❌', { id, status, error: String(e) }); }
+
     res.json({ ok: true, id, status });
   } catch (err) {
     logger.error('❌ [PATCH] /api/orders/:id/status', { id, error: String(err) });
     res.status(500).json({ error: 'internal_error' });
   }
+});
+
+// ---------------- STREAM SSE -------------------------------------------------
+router.get('/stream', (req, res) => {
+  res.setHeader('Content-Type', 'text/event-stream');
+  res.setHeader('Cache-Control', 'no-store');
+  res.setHeader('Connection', 'keep-alive');
+
+  res.write(`event: hello\n`);
+  res.write(`data: ${JSON.stringify({ ok: true, t: Date.now() })}\n\n`);
+
+  sse.add(res);
+
+  const ping = setInterval(() => {
+    try { res.write(`event: ping\ndata: ${Date.now()}\n\n`); } catch (_) {}
+  }, 15000);
+
+  req.on('close', () => {
+    clearInterval(ping);
+    sse.remove(res);
+  });
 });
 
 module.exports = router;
