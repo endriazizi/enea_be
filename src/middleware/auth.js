@@ -4,7 +4,7 @@
 // JWT guard con bypass DEV opzionale. Mantiene il tuo stile di log.
 
 const jwt = require('jsonwebtoken');
-const env = require('../env');
+const env = require('../env');      // <<-- path corretta
 const logger = require('../logger');
 
 /** Estrae il token da Authorization / header custom / cookie */

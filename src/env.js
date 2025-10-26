@@ -60,6 +60,22 @@ const env = {
     level: process.env.LOG_LEVEL || 'info',
   },
 
+  // 🔐 AUTENTICAZIONE (bypass dev opzionale)
+  AUTH: {
+    devBypass   : toBool(process.env.AUTH_DEV_BYPASS, false),
+    devUserEmail: process.env.AUTH_DEV_USER || 'dev@local',
+    devUserId   : toInt(process.env.AUTH_DEV_ID, 0),
+  },
+
+  // 🔑 JWT per /api/auth (HS256)
+  JWT: {
+    secret     : process.env.JWT_SECRET || '',
+    ttlSeconds : toInt(process.env.JWT_TTL_SECONDS, 60 * 60 * 8), // 8h
+    issuer     : process.env.JWT_ISSUER || undefined,             // (facoltativo, non obbligatorio in verify attuale)
+    audience   : process.env.JWT_AUDIENCE || undefined,           // (facoltativo)
+  },
+
+  // Prenotazioni
   RESV: {
     defaultLunchMinutes : toInt(process.env.RESV_LUNCH_MINUTES, 60),
     defaultDinnerMinutes: toInt(process.env.RESV_DINNER_MINUTES, 90),
@@ -72,7 +88,7 @@ const env = {
     allowAnyTransition  : toBool(process.env.RESV_ALLOW_ANY_TRANSITION, true),
     forceTransitions    : toBool(process.env.RESV_FORCE_TRANSITIONS, false),
 
-    // 📧 notifiche
+    // 📧 notifiche (mail) sempre su cambio stato
     notifyAlways        : toBool(process.env.RESV_NOTIFY_ALWAYS, true),
   },
 
@@ -94,10 +110,10 @@ const env = {
     enabled     : toBool(process.env.WA_ENABLED, false),
     accountSid  : process.env.TWILIO_ACCOUNT_SID || '',
     authToken   : process.env.TWILIO_AUTH_TOKEN || '',
-    from        : process.env.WA_FROM || '',           // es. 'whatsapp:+14155238886' o tuo numero approvato
-    defaultCc   : process.env.WA_DEFAULT_CC || '+39',  // normalizzazione rapida numeri italiani
-    mediaLogo   : process.env.WA_MEDIA_LOGO_URL || '', // opzionale: URL logo da allegare come immagine
-    templateSid : process.env.WA_TEMPLATE_STATUS_CHANGE_SID || '', // opzionale: template approvato
+    from        : process.env.WA_FROM || '',           // 'whatsapp:+39....'
+    defaultCc   : process.env.WA_DEFAULT_CC || '+39',
+    mediaLogo   : process.env.WA_MEDIA_LOGO_URL || '',
+    templateSid : process.env.WA_TEMPLATE_STATUS_CHANGE_SID || '',
   },
 
   // Util per debugging a runtime delle variabili
