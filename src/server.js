@@ -61,6 +61,10 @@ if (ensureExists('api/rooms', 'API /api/rooms')) {
   app.use('/api/rooms', require('./api/rooms'));
 }
 
+if (ensureExists('api/notifications', 'API /api/notifications')) {
+  app.use('/api/notifications', require('./api/notifications'));
+}
+
 
 // === INIZIO MODIFICA (mount printer routes) ===
 app.use('/api', require('./api/printer'));

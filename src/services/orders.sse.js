@@ -8,31 +8,28 @@
  * - remove(res): deregistra
  * - broadcast(event, payload): invia a tutti
  */
+'use strict';
 
-const logger = require('../logger');
+/**
+ * services/orders.sse.js
+ * Mantiene i client SSE connessi e spara eventi (created/status).
+ */
 
 const clients = new Set();
 
 function add(res) {
   clients.add(res);
-  logger.info('🧵 SSE client +1', { total: clients.size });
+  res.write(`event: hello\ndata: ${JSON.stringify({ ok: true })}\n\n`);
 }
+
 function remove(res) {
   clients.delete(res);
-  logger.info('🧵 SSE client -1', { total: clients.size });
 }
-function send(res, event, data) {
-  try {
-    res.write(`event: ${event}\n`);
-    res.write(`data: ${JSON.stringify(data)}\n\n`);
-  } catch (e) {
-    // client probabilmente chiuso
-    remove(res);
-  }
-}
-function broadcast(event, data) {
-  for (const res of Array.from(clients)) {
-    send(res, event, data);
+
+function broadcast(type, payload) {
+  const data = `event: ${type}\ndata: ${JSON.stringify(payload)}\n\n`;
+  for (const res of clients) {
+    try { res.write(data); } catch { /* no-op */ }
   }
 }
 

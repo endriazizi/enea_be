@@ -1,6 +1,6 @@
 # 📁 Project tree (.)
 
-_Generato: Sun, Oct 26, 2025  3:46:17 AM_
+_Generato: Mon, Oct 27, 2025  1:59:18 AM_
 
 ```text
 .
@@ -20,6 +20,7 @@ src
 src/api
 src/api/auth.js
 src/api/health.js
+src/api/notifications.js
 src/api/orders.js
 src/api/printer.js
 src/api/products.js
