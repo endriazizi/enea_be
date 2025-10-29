@@ -2,35 +2,77 @@
 
 /**
  * services/orders.sse.js
- * -----------------------------------------------------------------------------
- * Semplice broadcaster SSE in-memory.
- * - add(res): registra un client
- * - remove(res): deregistra
- * - broadcast(event, payload): invia a tutti
+ * Semplice broadcaster SSE per gli ORDINI.
+ *
+ * Export (COMMONJS):
+ *  - mountSse(router)   → GET /stream (event-stream)
+ *  - emitCreated(order) → event: created
+ *  - emitStatus(patch)  → event: status
+ *
+ * NOTE:
+ *  - Mantiene un Set di client { res }.
+ *  - Log minimal a runtime (manteniamo lo stile del progetto).
  */
-'use strict';
 
-/**
- * services/orders.sse.js
- * Mantiene i client SSE connessi e spara eventi (created/status).
- */
+const logger = require('../logger');
 
 const clients = new Set();
 
-function add(res) {
-  clients.add(res);
-  res.write(`event: hello\ndata: ${JSON.stringify({ ok: true })}\n\n`);
+/** Registra l'endpoint /stream sull'istanza router passata. */
+function mountSse(router) {
+  if (!router || typeof router.get !== 'function') {
+    logger.warn('⚠️ [orders.sse] router non valido, SSE non montato');
+    return;
+  }
+
+  router.get('/stream', (req, res) => {
+    // Intestazioni SSE
+    res.set({
+      'Content-Type': 'text/event-stream',
+      'Cache-Control': 'no-store',
+      'Connection': 'keep-alive',
+    });
+    // flush immediato
+    res.flushHeaders?.();
+
+    // Consigliato: retry di default
+    res.write('retry: 2000\n\n');
+
+    const client = { res };
+    clients.add(client);
+    logger.info('🧵 [SSE] client +1', { count: clients.size });
+
+    req.on('close', () => {
+      clients.delete(client);
+      logger.info('🧵 [SSE] client -1', { count: clients.size });
+    });
+  });
+
+  logger.info('🧵 [SSE] mount /stream OK (orders)');
 }
 
-function remove(res) {
-  clients.delete(res);
-}
-
-function broadcast(type, payload) {
-  const data = `event: ${type}\ndata: ${JSON.stringify(payload)}\n\n`;
-  for (const res of clients) {
-    try { res.write(data); } catch { /* no-op */ }
+/** Broadcast generico */
+function _broadcast(event, data) {
+  const payload = `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
+  for (const c of clients) {
+    try { c.res.write(payload); } catch (_) { /* ignoro */ }
   }
 }
 
-module.exports = { add, remove, broadcast };
+/** Evento: ordine creato */
+function emitCreated(order) {
+  _broadcast('created', order);
+}
+
+/** Evento: cambio stato */
+function emitStatus(patch) {
+  _broadcast('status', patch);
+}
+
+module.exports = {
+  mountSse,
+  emitCreated,
+  emitStatus,
+  // opzionale: utile in debug, NON usato in produzione
+  _clients: clients,
+};

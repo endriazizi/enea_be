@@ -1,8 +1,8 @@
 // src/db/index.js
 // Pool MySQL + query() con log. Sessione forzata in UTC, dateStrings per evitare shift.
 
-const mysql = require('mysql2/promise');
-const env = require('../env');
+const mysql  = require('mysql2/promise');
+const env    = require('../env');
 const logger = require('../logger');
 
 const pool = mysql.createPool({
@@ -16,8 +16,8 @@ const pool = mysql.createPool({
   queueLimit: env.DB.queueLimit,
   // 🔑 IMPORTANTI per time:
   dateStrings: true,   // DATETIME come stringa → niente auto-conversione a Date locale
-  timezone: 'Z' ,       // ‘Z’ = UTC per le conversioni lato driver (di fatto con dateStrings non incide, ma è esplicito)
-   multipleStatements: true // <-- AGGIUNGI QUESTO
+  timezone: 'Z',       // ‘Z’ = UTC
+  multipleStatements: true
 });
 
 // Forza la sessione MySQL a UTC
@@ -44,11 +44,19 @@ async function query(sql, params = []) {
   }
 }
 
-// log più leggibile
+// Transazioni vere quando servono
+async function getConnection() {
+  if (pool && typeof pool.getConnection === 'function') {
+    return await pool.getConnection();
+  }
+  throw new Error('pool.getConnection non disponibile');
+}
+
+// log compatti
 function shorten(s, max = 320) {
   if (!s) return s;
   const one = String(s).replace(/\s+/g, ' ').trim();
   return one.length > max ? one.slice(0, max) + '…[truncated]' : one;
 }
 
-module.exports = { pool, query, ensureUtcSession };
+module.exports = { pool, query, ensureUtcSession, getConnection };
