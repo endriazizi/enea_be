@@ -1,179 +1,177 @@
+// src/api/orders.js
+// ============================================================================
+// ORDERS API (root = /api/orders)
+// - GET    /                lista (hours | from/to | status | q)
+// - GET    /:id(\d+)        dettaglio full con items
+// - POST   /                crea ordine (header + items) → 201 + full
+// - PATCH  /:id(\d+)/status cambio stato
+// - POST   /:id(\d+)/print  stampa Pizzeria/Cucina (best-effort)
+// - GET    /stream          SSE (montato qui)
+// Stile: commenti lunghi, log con emoji
+// ============================================================================
 'use strict';
-
-/**
- * api/orders.js
- * Router per gli ORDINI:
- *  - GET /api/orders?status=&hours=&from=&to=&q=
- *  - GET /api/orders/:id
- *  - POST /api/orders
- *  - PATCH /api/orders/:id/status
- *  - GET /api/orders/stream  (SSE)  ← montata da services/orders.sse
- */
 
 const express = require('express');
 const router  = express.Router();
-
 const logger  = require('../logger');
-const env     = require('../env');
-const orders  = require('../services/orders.service');
+const { query } = require('../db');
+const sse     = require('../sse');
+const { printOrderDual } = require('../utils/print-order');
 
-// === requireAuth con fallback DEV (stile reservations) ======================
-let requireAuth;
-try {
-  ({ requireAuth } = require('./auth'));
-  if (typeof requireAuth !== 'function') throw new Error('requireAuth non è una funzione');
-  logger.info('🔐 requireAuth caricato da ./auth');
-} catch (_e) {
-  logger.warn('⚠️ requireAuth non disponibile. Uso FALLBACK DEV (solo locale).');
-  requireAuth = (req, _res, next) => {
-    req.user = {
-      id: Number(process.env.AUTH_DEV_ID || 0),
-      email: process.env.AUTH_DEV_USER || 'dev@local'
-    };
-    next();
-  };
+// Monta subito l’endpoint SSE (/api/orders/stream)
+sse.mount(router);
+
+// Helpers ---------------------------------------------------------------------
+const toNum = (v, def = 0) => {
+  const n = Number(v);
+  return Number.isFinite(n) ? n : def;
+};
+const toDate = (v) => v ? new Date(v) : null;
+
+async function getOrderFullById(id) {
+  const [o] = await query(
+    `SELECT id, customer_name, phone, email, people, scheduled_at, status,
+            total, channel, note, created_at, updated_at
+     FROM orders WHERE id=?`, [id]
+  );
+  if (!o) return null;
+
+  const items = await query(
+    `SELECT i.id, i.order_id, i.product_id, i.name, i.qty, i.price, i.notes, i.created_at,
+            COALESCE(c.name,'Altro') AS category
+     FROM order_items i
+     LEFT JOIN products p ON p.id = i.product_id
+     LEFT JOIN categories c ON c.id = p.category_id
+     WHERE i.order_id=?
+     ORDER BY i.id ASC`, [id] // <-- fix 'p.category' mancante
+  );
+
+  return { ...o, items };
 }
 
-// === SSE (robusto): se esporta mountSse → lo uso; altrimenti non crash ======
-try {
-  const sseBus = require('../services/orders.sse');
-  if (sseBus && typeof sseBus.mountSse === 'function') {
-    sseBus.mountSse(router);                // ← monta /stream
-    router._ordersSse = sseBus;             // salvo riferimento (opzionale)
-  } else {
-    logger.warn('⚠️ orders.sse senza mountSse: SSE non attivo');
-  }
-} catch (err) {
-  logger.warn('⚠️ orders.sse non disponibile o errore di import; continuo senza SSE', { error: String(err) });
-}
+// ROUTES ----------------------------------------------------------------------
 
-// ---------------------------- LIST -----------------------------------------
+// Lista
 router.get('/', async (req, res) => {
   try {
-    const filter = {
-      status: req.query.status || undefined,
-      hours : req.query.hours  || undefined,
-      from  : req.query.from   || undefined,
-      to    : req.query.to     || undefined,
-      q     : req.query.q      || undefined,
-    };
-    logger.info('📥 [GET] /api/orders', { filter });
+    const { hours, from, to, status, q } = req.query;
+    const conds = [];
+    const params = [];
 
-    const rows = await orders.list(filter);
+    if (hours) { conds.push(`created_at >= (UTC_TIMESTAMP() - INTERVAL ? HOUR)`); params.push(toNum(hours)); }
+    if (from)  { conds.push(`created_at >= ?`); params.push(new Date(from)); }
+    if (to)    { conds.push(`created_at <= ?`); params.push(new Date(to)); }
+    if (status && status !== 'all') { conds.push(`status = ?`); params.push(status); }
+    if (q)     { conds.push(`(customer_name LIKE ? OR phone LIKE ?)`); params.push(`%${q}%`, `%${q}%`); }
+
+    const where = conds.length ? `WHERE ${conds.join(' AND ')}` : '';
+    const rows = await query(
+      `SELECT id, customer_name, phone, email, people, scheduled_at, status,
+              total, channel, note, created_at, updated_at
+       FROM orders
+       ${where}
+       ORDER BY id DESC
+       LIMIT 300`, params
+    );
     res.json(rows);
-  } catch (err) {
-    logger.error('❌ [GET] /api/orders', { error: String(err) });
-    res.status(500).json({ error: 'internal_error' });
+  } catch (e) {
+    logger.error('📄 orders list ❌', { error: String(e) });
+    res.status(500).json({ ok: false, error: 'orders_list_error' });
   }
 });
 
-// ---------------------------- GET BY ID ------------------------------------
+// Dettaglio
 router.get('/:id(\\d+)', async (req, res) => {
-  const id = Number(req.params.id);
-  if (!Number.isFinite(id)) return res.status(400).json({ error: 'invalid_id' });
   try {
-    const row = await orders.getById(id);
-    if (!row) return res.status(404).json({ error: 'not_found' });
-    res.json(row);
-  } catch (err) {
-    logger.error('❌ [GET] /api/orders/:id', { id, error: String(err) });
-    res.status(500).json({ error: 'internal_error' });
+    const id = toNum(req.params.id);
+    const full = await getOrderFullById(id);
+    if (!full) return res.status(404).json({ error: 'not_found' });
+    res.json(full);
+  } catch (e) {
+    logger.error('📄 orders get ❌', { error: String(e) });
+    res.status(500).json({ ok: false, error: 'orders_get_error' });
   }
 });
 
-// ---------------------------- CREATE ---------------------------------------
-router.post('/', requireAuth, async (req, res) => {
+// Crea
+router.post('/', async (req, res) => {
+  const dto = req.body || {};
   try {
-    const dto = req.body || {};
-    if (!dto.customer_name) return res.status(400).json({ error: 'missing_customer_name' });
-    if (!Array.isArray(dto.items) || !dto.items.length) return res.status(400).json({ error: 'empty_items' });
+    const scheduled = dto.scheduled_at ? toDate(dto.scheduled_at) : null;
+    const items = Array.isArray(dto.items) ? dto.items : [];
+    const total = items.reduce((acc, it) => acc + toNum(it.price) * toNum(it.qty, 1), 0);
 
-    const created = await orders.create(dto);
-    logger.info('➕ [POST] /api/orders OK', { id: created.id });
+    const r = await query(
+      `INSERT INTO orders (customer_name, phone, email, people, scheduled_at, note, channel, status, total)
+       VALUES (?,?,?,?,?,?,?,?,?)`,
+      [
+        (dto.customer_name || 'Cliente').toString().trim(),
+        dto.phone || null,
+        dto.email || null,
+        dto.people || null,
+        scheduled,
+        dto.note || null,
+        dto.channel || 'admin',
+        'pending',
+        total
+      ]
+    );
+    const orderId = r.insertId;
 
-    // SSE broadcast (se disponibile)
-    try {
-      const sse = router._ordersSse;
-      sse?.emitCreated?.({ id: created.id, status: created.status, total: created.total, customer_name: created.customer_name });
-    } catch (_) {}
-
-    // (Opz) Notifiche lato server se abilitate da ENV
-    try {
-      if (String(process.env.MAIL_ENABLED || '').toLowerCase() === 'true') {
-        const mailer = require('../services/mailer.service');
-        await mailer.sendOrderCreatedEmail({ order: created });
-        logger.info('📧 order-created mail ✅', { id: created.id });
-      }
-    } catch (e) {
-      logger.warn('📧 order-created mail SKIP/ERR', { id: created.id, error: String(e) });
+    for (const it of items) {
+      await query(
+        `INSERT INTO order_items (order_id, product_id, name, qty, price, notes)
+         VALUES (?,?,?,?,?,?)`,
+        [ orderId, (it.product_id ?? null), it.name, toNum(it.qty,1), toNum(it.price), (it.notes ?? null) ]
+      );
     }
 
-    try {
-      if (String(process.env.WA_ENABLED || '').toLowerCase() === 'true') {
-        const provider = (process.env.WA_PROVIDER || 'twilio').toLowerCase();
-        const wa = provider === 'whatsender'
-          ? require('../services/whatsender.service')
-          : require('../services/whatsapp-twilio.service');
-        await wa.sendOrderCreated({ order: created });
-        logger.info('📲 order-created WA ✅', { id: created.id, provider });
-      }
-    } catch (e) {
-      logger.warn('📲 order-created WA SKIP/ERR', { id: created.id, error: String(e) });
-    }
+    const full = await getOrderFullById(orderId);
+    // Notifica SSE best-effort
+    try { sse.emitCreated(full); } catch (e) { logger.warn('🧵 SSE created ⚠️', { e: String(e) }); }
 
-    res.status(201).json(created);
-  } catch (err) {
-    logger.error('❌ [POST] /api/orders', { error: String(err) });
-    res.status(400).json({ error: err.message || 'internal_error' });
+    res.status(201).json(full);
+  } catch (e) {
+    logger.error('🆕 orders create ❌', { reason: String(e) });
+    res.status(500).json({ ok: false, error: 'orders_create_error', reason: String(e) });
   }
 });
 
-// ---------------------------- PATCH STATUS ----------------------------------
-router.patch('/:id(\\d+)/status', requireAuth, async (req, res) => {
-  const id = Number(req.params.id);
-  if (!Number.isFinite(id)) return res.status(400).json({ error: 'invalid_id' });
-
-  const status = (req.body?.status || '').toString().trim();
-  if (!status) return res.status(400).json({ error: 'missing_status' });
-
+// Cambio stato
+router.patch('/:id(\\d+)/status', async (req, res) => {
   try {
-    const updated = await orders.updateStatus(id, status);
-    if (!updated) return res.status(404).json({ error: 'not_found' });
+    const id = toNum(req.params.id);
+    const status = String(req.body?.status || '').toLowerCase();
+    const allowed = new Set(['pending','confirmed','preparing','ready','completed','cancelled']);
+    if (!allowed.has(status)) return res.status(400).json({ error: 'invalid_status' });
 
-    // SSE broadcast (se disponibile)
-    try {
-      const sse = router._ordersSse;
-      sse?.emitStatus?.({ id, status: updated.status });
-    } catch (_) {}
+    await query(`UPDATE orders SET status=?, updated_at=UTC_TIMESTAMP() WHERE id=?`, [status, id]);
+    // Notifica SSE best-effort
+    try { sse.emitStatus({ id, status }); } catch (e) { logger.warn('🧵 SSE status ⚠️', { e: String(e) }); }
+    res.json({ ok: true });
+  } catch (e) {
+    logger.error('✏️ orders status ❌', { error: String(e) });
+    res.status(500).json({ ok: false, error: 'orders_status_error' });
+  }
+});
 
-    // (Opz) Notifiche stato se abilitate
+// Stampa (best-effort, non blocca)
+router.post('/:id(\\d+)/print', async (req, res) => {
+  try {
+    const id = toNum(req.params.id);
+    const full = await getOrderFullById(id);
+    if (!full) return res.status(404).json({ ok: false, error: 'not_found' });
+
     try {
-      if (String(process.env.MAIL_ENABLED || '').toLowerCase() === 'true') {
-        const mailer = require('../services/mailer.service');
-        await mailer.sendOrderStatusEmail({ order: updated });
-        logger.info('📧 order-status mail ✅', { id, status: updated.status });
-      }
+      await printOrderDual(full);
+      return res.json({ ok: true });
     } catch (e) {
-      logger.warn('📧 order-status mail SKIP/ERR', { id, error: String(e) });
+      logger.warn('🖨️ orders print ⚠️', { id, error: String(e) });
+      return res.status(502).json({ ok: false, error: 'printer_error', reason: String(e) });
     }
-
-    try {
-      if (String(process.env.WA_ENABLED || '').toLowerCase() === 'true') {
-        const provider = (process.env.WA_PROVIDER || 'twilio').toLowerCase();
-        const wa = provider === 'whatsender'
-          ? require('../services/whatsender.service')
-          : require('../services/whatsapp-twilio.service');
-        await wa.sendOrderStatus({ order: updated });
-        logger.info('📲 order-status WA ✅', { id, status: updated.status, provider });
-      }
-    } catch (e) {
-      logger.warn('📲 order-status WA SKIP/ERR', { id, error: String(e) });
-    }
-
-    res.json(updated);
-  } catch (err) {
-    logger.error('❌ [PATCH] /api/orders/:id/status', { id, error: String(err) });
-    res.status(400).json({ error: err.message || 'internal_error' });
+  } catch (e) {
+    logger.error('🖨️ orders print ❌', { error: String(e) });
+    res.status(500).json({ ok: false, error: 'orders_print_error' });
   }
 });
 

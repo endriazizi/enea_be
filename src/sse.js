@@ -1,26 +1,20 @@
-// server/src/services/orders.sse.js
+// src/sse.js
 // ============================================================================
-// SSE (Server-Sent Events) per ORDERS
-// - mount(router)    → aggiunge GET /stream (connessione SSE)
-// - emitCreated(o)   → invia evento "created" { order }
-// - emitStatus(p)    → invia evento "status"  { id, status }
-// Stile: commenti lunghi, log con emoji
+// SSE per ORDERS (Server-Sent Events).
+// - mount(router) → GET /stream
+// - emitCreated(order), emitStatus({id,status})
 // ============================================================================
-
 'use strict';
+const logger = require('./logger');
 
-const logger = require('../logger');
-
-// ID progressivo per i client connessi
 let nextClientId = 1;
-// Registry: id → { res }
-const clients = new Map();
+const clients = new Map(); // id -> { res }
 
-function sseHeaders() {
+function headers() {
   return {
     'Content-Type': 'text/event-stream',
     'Cache-Control': 'no-cache, no-transform',
-    'Connection': 'keep-alive',
+    Connection: 'keep-alive',
   };
 }
 
@@ -28,19 +22,14 @@ function write(res, type, data) {
   try {
     res.write(`event: ${type}\n`);
     res.write(`data: ${JSON.stringify(data)}\n\n`);
-  } catch {
-    // se ha chiuso, verrà ripulito su 'close'
-  }
+  } catch { /* client chiuso */ }
 }
 
-/** Attacca la rotta GET /stream al router passato (root: /api/orders) */
 function mount(router) {
   router.get('/stream', (req, res) => {
     const id = nextClientId++;
-    res.writeHead(200, sseHeaders());
-    // comment line (utile in debug)
+    res.writeHead(200, headers());
     res.write(`: connected ${id}\n\n`);
-
     clients.set(id, { res });
     logger.info('🧵 SSE client connected', { id, total: clients.size });
 
@@ -50,8 +39,6 @@ function mount(router) {
     });
   });
 }
-
-// ---- Broadcasters -----------------------------------------------------------
 
 function emitCreated(order) {
   logger.info('🧵 SSE emit created', { id: order?.id });

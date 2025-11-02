@@ -1,62 +1,56 @@
 // src/db/index.js
-// Pool MySQL + query() con log. Sessione forzata in UTC, dateStrings per evitare shift.
+// ============================================================================
+// MySQL pool (mysql2/promise) con:
+// - multipleStatements: true (migrations/file SQL interi)
+// - SET time_zone = '+00:00' (politica UTC a DB)
+// - SET NAMES utf8mb4 (emoji safe)
+// Stile: commenti lunghi, log con emoji
+// ============================================================================
+'use strict';
 
-const mysql  = require('mysql2/promise');
-const env    = require('../env');
+const mysql = require('mysql2/promise');
 const logger = require('../logger');
 
-const pool = mysql.createPool({
-  host: env.DB.host,
-  port: env.DB.port,
-  user: env.DB.user,
-  password: env.DB.password,
-  database: env.DB.database,
-  waitForConnections: env.DB.waitForConnections,
-  connectionLimit: env.DB.connectionLimit,
-  queueLimit: env.DB.queueLimit,
-  // 🔑 IMPORTANTI per time:
-  dateStrings: true,   // DATETIME come stringa → niente auto-conversione a Date locale
-  timezone: 'Z',       // ‘Z’ = UTC
-  multipleStatements: true
-});
+const {
+  DB_HOST, DB_USER, DB_PASSWORD, DB_NAME, DB_PORT = 3306,
+} = process.env;
 
-// Forza la sessione MySQL a UTC
-async function ensureUtcSession() {
-  try {
-    await pool.query(`SET time_zone = '+00:00'`);
-    logger.info('🕒 DB session time_zone set to UTC (+00:00)');
-  } catch (err) {
-    logger.warn('⚠️ DB time_zone SET failed (continuo lo stesso)', { error: String(err) });
+let pool;
+
+function getPool() {
+  if (!pool) {
+    pool = mysql.createPool({
+      host: DB_HOST,
+      user: DB_USER,
+      password: DB_PASSWORD,
+      database: DB_NAME,
+      port: Number(DB_PORT || 3306),
+      waitForConnections: true,
+      connectionLimit: 10,
+      queueLimit: 0,
+      multipleStatements: true,
+      timezone: 'Z', // usa UTC in driver
+    });
+    logger.info('🗄️  DB Pool created', { host: DB_HOST, db: DB_NAME });
   }
+  return pool;
+}
+
+async function prime(conn) {
+  await conn.query(`SET time_zone = '+00:00'`);
+  await conn.query(`SET NAMES utf8mb4 COLLATE utf8mb4_unicode_ci`);
 }
 
 async function query(sql, params = []) {
-  const t0 = Date.now();
+  const p = getPool();
+  const conn = await p.getConnection();
   try {
-    const [rows] = await pool.query(sql, params);
-    const ms = (Date.now() - t0).toFixed(0);
-    logger.info('🐬 SQL ✅', { duration_ms: ms, sql: shorten(sql), params });
+    await prime(conn);
+    const [rows] = await conn.query(sql, params);
     return rows;
-  } catch (err) {
-    const ms = (Date.now() - t0).toFixed(0);
-    logger.error('🐬 SQL ❌', { duration_ms: ms, error: String(err), sql: shorten(sql), params });
-    throw err;
+  } finally {
+    conn.release();
   }
 }
 
-// Transazioni vere quando servono
-async function getConnection() {
-  if (pool && typeof pool.getConnection === 'function') {
-    return await pool.getConnection();
-  }
-  throw new Error('pool.getConnection non disponibile');
-}
-
-// log compatti
-function shorten(s, max = 320) {
-  if (!s) return s;
-  const one = String(s).replace(/\s+/g, ' ').trim();
-  return one.length > max ? one.slice(0, max) + '…[truncated]' : one;
-}
-
-module.exports = { pool, query, ensureUtcSession, getConnection };
+module.exports = { query };

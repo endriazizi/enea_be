@@ -1,258 +1,343 @@
-'use strict';
+// server/src/api/orders.js
+// ============================================================================
+// ORDERS API (REST + SSE) — stile Endri: commenti lunghi, log con emoji
+// Rotte:
+//   GET    /api/orders                         → lista (filtri: status|hours|from|to|q)
+//   GET    /api/orders/:id                     → dettaglio (header + items + categoria)
+//   POST   /api/orders                         → crea ordine + items
+//   PATCH  /api/orders/:id/status              → cambio stato (emette SSE "status")
+//   POST   /api/orders/:id/print               → stampa comande (PIZZERIA/CUCINA)
+//   POST   /api/orders/print                   → compat: body { id }
+//   GET    /api/orders/count-by-status         → counts per status (range)
+//   GET    /api/orders/stream                  → Server-Sent Events (created/status)
+// Note DB: tabelle `orders` e `order_items`; categoria item via JOIN categories
+// ============================================================================
 
-/**
- * services/orders.service.js
- *
- * Service unico per:
- *  - create ordine (testa + righe) con transazione se disponibile
- *  - list con filtri server-side (status/hours/from/to/q) - opzionali
- *  - getById con righe
- *  - updateStatus
- *
- * Obiettivo principale di questa revisione:
- *  - compatibilità schema: colonne {phone|customer_phone}, {email|customer_email}, {channel|source}
- *  - log con emoji e guardie sicure
- *  - SQL con placeholders
- */
+const express = require('express');
+const router = express.Router();
+const { EventEmitter } = require('events');
 
-const db     = require('../db');
-const logger = require('../logger');
+const pool = require('../db');              // ← il tuo pool mysql2/promise
+const log  = require('../logger') || console;
+const { format } = require('date-fns');
+const { it } = require('date-fns/locale');
 
-// Cache in-memory delle colonne della tabella orders/order_items
-let _ordersCols = null;
-let _orderItemsCols = null;
+// --- Event Bus per SSE -------------------------------------------------------
+const bus = new EventEmitter();
+bus.setMaxListeners(200);
 
-async function loadTableCols(table) {
-  const rows = await db.query(`SHOW COLUMNS FROM \`${table}\``);
-  const set = new Set(rows.map(r => String(r.Field)));
-  return set;
+// UTIL -------------------------------------------------------------
+
+/** Normalizza range temporale: accetta ?hours oppure ?from&?to (YYYY-MM-DD HH:mm:ss) */
+function resolveRange(query) {
+  const now = new Date();
+  if (query.from && query.to) return { from: query.from, to: query.to };
+  const h = Number(query.hours ?? 6);
+  const from = new Date(now.getTime() - Math.max(1, h) * 3600 * 1000);
+  return {
+    from: format(from, 'yyyy-MM-dd HH:mm:ss'),
+    to:   format(now,  'yyyy-MM-dd HH:mm:ss'),
+  };
 }
 
-async function getOrdersCols() {
-  if (_ordersCols) return _ordersCols;
+function statusWhere(status) {
+  if (!status || status === 'all') return '1=1';
+  return 'o.status = ?';
+}
+function statusParams(status) {
+  if (!status || status === 'all') return [];
+  return [String(status)];
+}
+
+/** Legge gli items con categoria *via categories*, non p.category (che non c’è nel tuo DB) */
+async function loadItems(orderId, conn) {
+  const sql = `
+    SELECT i.id, i.order_id, i.product_id, i.name, i.qty, i.price, i.notes, i.created_at,
+           COALESCE(c.name, 'Altro') AS category
+    FROM order_items i
+    LEFT JOIN products   p ON p.id = i.product_id
+    LEFT JOIN categories c ON c.id = p.category_id
+    WHERE i.order_id = ?
+    ORDER BY i.id ASC
+  `;
+  const [rows] = await (conn || pool).query(sql, [orderId]);
+  return rows.map(r => ({ ...r, price: Number(r.price) }));
+}
+
+async function loadHeader(orderId, conn) {
+  const sql = `
+    SELECT o.id, o.customer_name, o.phone, o.email, o.people, o.scheduled_at,
+           o.note, o.channel, o.status, o.created_at, o.updated_at,
+           (SELECT SUM(ii.qty * ii.price) FROM order_items ii WHERE ii.order_id=o.id) AS total
+    FROM orders o
+    WHERE o.id = ?
+  `;
+  const [rows] = await (conn || pool).query(sql, [orderId]);
+  if (!rows.length) return null;
+  const h = rows[0];
+  return { ...h, total: h.total != null ? Number(h.total) : null };
+}
+
+/** Stampa tramite TCP 9100 (ESC/POS). Non usa il simbolo € (codepage). */
+async function printComande(order, opts = {}) {
   try {
-    _ordersCols = await loadTableCols('orders');
-    logger.info('🧩 orders columns cache', { cols: Array.from(_ordersCols).join(',') });
-  } catch (e) {
-    logger.error('❌ SHOW COLUMNS orders', { error: String(e) });
-    _ordersCols = new Set();
-  }
-  return _ordersCols;
-}
-
-async function getOrderItemsCols() {
-  if (_orderItemsCols) return _orderItemsCols;
-  try {
-    _orderItemsCols = await loadTableCols('order_items');
-    logger.info('🧩 order_items columns cache', { cols: Array.from(_orderItemsCols).join(',') });
-  } catch (e) {
-    logger.error('❌ SHOW COLUMNS order_items', { error: String(e) });
-    _orderItemsCols = new Set();
-  }
-  return _orderItemsCols;
-}
-
-/** Utility tiny: numero o null */
-function toNumber(n) {
-  const v = Number(n);
-  return Number.isFinite(v) ? v : null;
-}
-
-/** Mappa DTO in base alle colonne disponibili */
-async function mapInsertHead(dto) {
-  const cols = await getOrdersCols();
-
-  // colonne alternative
-  const phoneCol  = cols.has('phone')  ? 'phone'  : (cols.has('customer_phone')  ? 'customer_phone'  : null);
-  const emailCol  = cols.has('email')  ? 'email'  : (cols.has('customer_email')  ? 'customer_email'  : null);
-  const chanCol   = cols.has('channel')? 'channel': (cols.has('source')          ? 'source'          : null);
-  const peopleCol = cols.has('people') ? 'people' : null;
-  const schedCol  = cols.has('scheduled_at') ? 'scheduled_at' : null;
-  const noteCol   = cols.has('note')   ? 'note'   : null;
-  const totalCol  = cols.has('total')  ? 'total'  : null;
-  const nameCol   = cols.has('customer_name') ? 'customer_name' : null;
-  const statusCol = cols.has('status') ? 'status' : null;
-
-  if (!nameCol) throw new Error('orders.customer_name mancante nello schema');
-
-  // prepara colonne/valori effettive
-  const columns = [nameCol];
-  const values  = [String(dto.customer_name || '').trim() || ''];
-
-  if (phoneCol)  { columns.push(phoneCol);   values.push(String(dto.phone || '').trim() || null); }
-  if (emailCol)  { columns.push(emailCol);   values.push(String(dto.email || '').trim() || null); }
-  if (peopleCol) { columns.push(peopleCol);  values.push(toNumber(dto.people) ?? 1); }
-  if (schedCol)  { columns.push(schedCol);   values.push(dto.scheduled_at || null); }
-  if (noteCol)   { columns.push(noteCol);    values.push(dto.note || null); }
-  if (chanCol)   { columns.push(chanCol);    values.push((dto.channel || 'online').toString()); }
-  if (statusCol) { columns.push(statusCol);  values.push((dto.status || 'pending').toString()); }
-  if (totalCol)  { columns.push(totalCol);   values.push(0); } // lo aggiorniamo dopo dalle righe
-
-  return { columns, values, phoneCol, emailCol, chanCol, totalCol, nameCol };
-}
-
-async function create(dto = {}) {
-  // Items validati: [{ name, qty, price, product_id?, notes? }]
-  const items = Array.isArray(dto.items) ? dto.items : [];
-  if (!items.length) throw new Error('empty_items');
-
-  let conn = null;
-  try {
-    // transazione se disponibile
-    if (typeof db.getConnection === 'function') {
-      conn = await db.getConnection();
-      await conn.beginTransaction();
-      logger.info('🔒 TX BEGIN (orders.create)');
+    const enabled = String(process.env.PRINTER_ENABLED || 'false') === 'true';
+    if (!enabled) {
+      log.warn('🖨️  PRINTER_DISABLED — niente stampa', { service: 'server' });
+      return { ok: true, skipped: true };
     }
 
-    const head = await mapInsertHead(dto);
-    const colsSql = head.columns.map(c => `\`${c}\``).join(',');
-    const qm      = head.columns.map(() => '?').join(',');
+    // Stampanti da .env (di default stessa per entrambi i reparti)
+    const pizHost = process.env.PIZZERIA_PRINTER_IP || process.env.PRINTER_IP;
+    const pizPort = Number(process.env.PIZZERIA_PRINTER_PORT || process.env.PRINTER_PORT || 9100);
+    const kitHost = process.env.KITCHEN_PRINTER_IP  || process.env.PRINTER_IP;
+    const kitPort = Number(process.env.KITCHEN_PRINTER_PORT  || process.env.PRINTER_PORT || 9100);
 
-    const sqlIns = `INSERT INTO orders (${colsSql}) VALUES (${qm})`;
-    const exec   = conn ? conn.execute.bind(conn) : db.pool.execute.bind(db.pool);
+    const PIZZERIA_CATEGORIES = (process.env.PIZZERIA_CATEGORIES || 'PIZZE,PIZZE ROSSE,PIZZE BIANCHE')
+      .split(',').map(s => s.trim().toUpperCase());
+    const KITCHEN_CATEGORIES  = (process.env.KITCHEN_CATEGORIES  || 'BEVANDE,ANTIPASTI')
+      .split(',').map(s => s.trim().toUpperCase());
 
-    const [res] = await exec(sqlIns, head.values);
-    const orderId = res.insertId;
+    // Split items per reparto
+    const pizItems = order.items.filter(i => PIZZERIA_CATEGORIES.includes(String(i.category || '').toUpperCase()));
+    const kitItems = order.items.filter(i => KITCHEN_CATEGORIES.includes(String(i.category || '').toUpperCase()));
 
-    // Inserisci le righe
-    const itemCols = await getOrderItemsCols();
-    const hasPid   = itemCols.has('product_id');
-    const hasNotes = itemCols.has('notes');
+    const { createConnection } = require('net');
 
-    const sqlItem = `
-      INSERT INTO order_items (order_id, ${hasPid ? 'product_id,' : ''} name, qty, price ${hasNotes ? ', notes' : ''})
-      VALUES ${items.map(() => `(?${hasPid ? ',?' : ''}, ?, ?, ?${hasNotes ? ', ?' : ''})`).join(',')}
+    function sendRaw(host, port, text) {
+      return new Promise((resolve, reject) => {
+        const sock = createConnection({ host, port }, () => {
+          sock.write(text, () => sock.end());
+        });
+        sock.on('error', reject);
+        sock.on('close', () => resolve(true));
+      });
+    }
+
+    function buildTextCopy(title, items) {
+      const brand = process.env.BRAND_NAME || 'Pizzeria';
+      const now   = format(new Date(), "dd/MM/yyyy HH:mm", { locale: it });
+      let out = '';
+      out += '\x1B!\x38'; // font doppia altezza/larghezza (ESC ! n)
+      out += `${brand}\n`;
+      out += '\x1B!\x00';
+      out += `${title}  #${order.id}\n`;
+      out += `Cliente: ${order.customer_name || '-'}  Tel: ${order.phone || '-'}\n`;
+      out += `Quando: ${order.scheduled_at || now}\n`;
+      out += '------------------------------\n';
+      for (const it of items) {
+        out += ` ${it.qty} x ${it.name}\n`;
+        if (it.notes) out += `  * ${it.notes}\n`;
+      }
+      out += '------------------------------\n';
+      out += '\n\n\n\x1DVA\x00'; // cut parziale
+      return out;
+    }
+
+    if (pizItems.length) {
+      await sendRaw(pizHost, pizPort, buildTextCopy('PIZZERIA', pizItems));
+    }
+    if (kitItems.length) {
+      await sendRaw(kitHost, kitPort, buildTextCopy('CUCINA', kitItems));
+    }
+
+    log.info('🖨️  Comande stampate', { service: 'server', id: order.id });
+    return { ok: true };
+  } catch (err) {
+    log.error('🖨️  orders_print_error ❌', { service: 'server', error: String(err) });
+    return { ok: false, error: 'orders_print_error', reason: String(err) };
+  }
+}
+
+// ROUTES ----------------------------------------------------------------------
+
+// Lista ordini
+router.get('/', async (req, res) => {
+  try {
+    const { from, to } = resolveRange(req.query);
+    const whereStatus = statusWhere(req.query.status);
+    const params = [from, to, ...statusParams(req.query.status)];
+    const sql = `
+      SELECT o.id, o.customer_name, o.phone, o.email, o.people, o.scheduled_at,
+             o.note, o.channel, o.status, o.created_at, o.updated_at,
+             (SELECT SUM(i.qty*i.price) FROM order_items i WHERE i.order_id=o.id) AS total
+      FROM orders o
+      WHERE o.created_at BETWEEN ? AND ?
+        AND ${whereStatus}
+      ORDER BY o.id DESC
+      LIMIT 500
     `;
+    const [rows] = await pool.query(sql, params);
+    const mapped = rows.map(r => ({ ...r, total: r.total != null ? Number(r.total) : null }));
+    res.json(mapped);
+  } catch (err) {
+    log.error('📦 ORDERS.list ❌', { service: 'server', error: String(err) });
+    res.status(500).json({ ok: false, error: 'orders_list_error', reason: String(err) });
+  }
+});
 
-    const params = [];
-    let total = 0;
+// Dati aggregati per badge
+router.get('/count-by-status', async (req, res) => {
+  try {
+    const { from, to } = resolveRange(req.query);
+    const sql = `
+      SELECT o.status, COUNT(*) AS n
+      FROM orders o
+      WHERE o.created_at BETWEEN ? AND ?
+      GROUP BY o.status
+    `;
+    const [rows] = await pool.query(sql, [from, to]);
+    const out = rows.reduce((acc, r) => { acc[r.status] = Number(r.n); return acc; }, {});
+    res.json(out);
+  } catch (err) {
+    log.error('📦 ORDERS.countByStatus ❌', { service: 'server', error: String(err) });
+    res.status(500).json({ ok: false, error: 'orders_count_error', reason: String(err) });
+  }
+});
+
+// Dettaglio
+router.get('/:id(\\d+)', async (req, res) => {
+  try {
+    const id = Number(req.params.id);
+    const header = await loadHeader(id);
+    if (!header) return res.status(404).json({ ok: false, error: 'not_found' });
+    const items = await loadItems(id);
+    res.json({ ...header, items });
+  } catch (err) {
+    log.error('📦 ORDERS.get ❌', { service: 'server', error: String(err) });
+    res.status(500).json({ ok: false, error: 'orders_get_error', reason: String(err) });
+  }
+});
+
+// Crea ordine
+router.post('/', async (req, res) => {
+  const body = req.body || {};
+  const conn = await pool.getConnection();
+  try {
+    await conn.beginTransaction();
+    const [r] = await conn.query(
+      `INSERT INTO orders (customer_name, phone, email, people, scheduled_at, note, channel, status, created_at, updated_at)
+       VALUES (?,?,?,?,?,?,?,?,NOW(),NOW())`,
+      [
+        body.customer_name || null,
+        body.phone ?? null,
+        body.email ?? null,
+        body.people ?? null,
+        body.scheduled_at ?? null,
+        body.note ?? null,
+        body.channel || 'admin',
+        'pending'
+      ]
+    );
+    const orderId = r.insertId;
+    const items = Array.isArray(body.items) ? body.items : [];
     for (const it of items) {
-      const qty = toNumber(it.qty) ?? 1;
-      const price = Number(it.price) || 0;
-      total += qty * price;
-
-      params.push(
-        orderId,
-        ...(hasPid ? [toNumber(it.product_id)] : []),
-        String(it.name || '').trim(),
-        qty,
-        price,
-        ...(hasNotes ? [it.notes || null] : [])
+      await conn.query(
+        `INSERT INTO order_items (order_id, product_id, name, qty, price, notes, created_at)
+         VALUES (?,?,?,?,?,?,NOW())`,
+        [orderId, it.product_id ?? null, it.name, it.qty, it.price, it.notes ?? null]
       );
     }
+    await conn.commit();
 
-    await exec(sqlItem, params);
+    const full = { ...(await loadHeader(orderId, conn)), items: await loadItems(orderId, conn) };
+    // SSE → created
+    bus.emit('created', { id: full.id, status: full.status });
 
-    // aggiorna totale (se colonna esiste)
-    if (head.totalCol) {
-      await exec(`UPDATE orders SET \`${head.totalCol}\`=? WHERE id=?`, [total, orderId]);
-    }
-
-    // Commit/No-TX
-    if (conn) {
-      await conn.commit();
-      logger.info('🔒 TX COMMIT (orders.create)', { id: orderId });
-    }
-
-    // Ritorna l’ordine completo
-    const out = await getById(orderId);
-    return out;
-
+    log.info('🧾 ORDERS.create ✅', { service: 'server', id: orderId, items: items.length });
+    res.status(201).json(full);
   } catch (err) {
-    if (conn) {
-      try { await conn.rollback(); logger.warn('🔒 TX ROLLBACK (orders.create)'); } catch {}
-    }
-    logger.error('❌ Orders.create', { error: String(err) });
-    throw err;
+    await conn.rollback();
+    log.error('🧾 ORDERS.create ❌', { service: 'server', error: String(err) });
+    res.status(500).json({ ok: false, error: 'orders_create_error', reason: String(err) });
   } finally {
-    if (conn) { try { conn.release(); } catch {} }
+    conn.release();
   }
-}
+});
 
-async function getById(id) {
-  const head = await db.query(
-    `SELECT * FROM orders WHERE id = ?`,
-    [id]
-  );
-  const row = head[0];
-  if (!row) return null;
+// Cambio stato
+router.patch('/:id(\\d+)/status', async (req, res) => {
+  try {
+    const id = Number(req.params.id);
+    const next = String(req.body?.status || '').toLowerCase();
+    await pool.query(`UPDATE orders SET status=?, updated_at=NOW() WHERE id=?`, [next, id]);
 
-  const items = await db.query(
-    `SELECT * FROM order_items WHERE order_id = ? ORDER BY id ASC`,
-    [id]
-  );
-  row.items = items;
-  return row;
-}
+    const full = { ...(await loadHeader(id)), items: await loadItems(id) };
 
-function buildFilterSql(cols, f = {}) {
-  // preferenza from/to rispetto a hours
-  const where = [];
-  const args  = [];
+    // SSE → status
+    bus.emit('status', { id, status: next });
 
-  // status
-  if (f.status && f.status !== 'all') {
-    where.push('`status` = ?');
-    args.push(String(f.status));
+    log.info('🔁 ORDERS.status ✅', { service: 'server', id, next });
+    res.json(full);
+  } catch (err) {
+    log.error('🔁 ORDERS.status ❌', { service: 'server', error: String(err) });
+    res.status(500).json({ ok: false, error: 'orders_status_error', reason: String(err) });
   }
+});
 
-  // hours (fallback se non ci sono from/to)
-  if (!f.from && !f.to && f.hours) {
-    where.push('`created_at` >= (NOW() - INTERVAL ? HOUR)');
-    args.push(toNumber(f.hours) ?? 6);
+// Stampa (compat 1): /orders/:id/print
+router.post('/:id(\\d+)/print', async (req, res) => {
+  try {
+    const id = Number(req.params.id);
+    const full = { ...(await loadHeader(id)), items: await loadItems(id) };
+    if (!full) return res.status(404).json({ ok: false, error: 'not_found' });
+    const out = await printComande(full, req.body || {});
+    if (!out.ok) return res.status(502).json(out);
+    res.json({ ok: true });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: 'orders_print_error', reason: String(err) });
   }
+});
 
-  // from/to (usa date intere; to → +1 giorno, semplice)
-  if (f.from) {
-    where.push('`created_at` >= ?');
-    args.push(String(f.from).slice(0, 19)); // YYYY-MM-DD[ HH:mm:ss]
+// Stampa (compat 2): POST /orders/print { id }
+router.post('/print', async (req, res) => {
+  const id = Number(req.body?.id);
+  if (!id) return res.status(400).json({ ok: false, error: 'invalid_id' });
+  try {
+    const full = { ...(await loadHeader(id)), items: await loadItems(id) };
+    if (!full) return res.status(404).json({ ok: false, error: 'not_found' });
+    const out = await printComande(full, req.body || {});
+    if (!out.ok) return res.status(502).json(out);
+    res.json({ ok: true });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: 'orders_print_error', reason: String(err) });
   }
-  if (f.to) {
-    where.push('`created_at` < DATE_ADD(?, INTERVAL 1 DAY)');
-    args.push(String(f.to).slice(0, 10));
-  }
+});
 
-  // q su customer_name | note
-  if (f.q) {
-    where.push('(customer_name LIKE ? OR note LIKE ?)');
-    const like = `%${String(f.q)}%`;
-    args.push(like, like);
-  }
+// SSE stream
+router.get('/stream', (req, res) => {
+  // headers SSE
+  res.setHeader('Content-Type',  'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('Connection',    'keep-alive');
+  res.flushHeaders?.();
 
-  const sqlWhere = where.length ? ('WHERE ' + where.join(' AND ')) : '';
-  return { sqlWhere, args };
-}
+  log.info('🧵 ORDERS.stream ▶️ open', { service: 'server', ip: req.ip });
 
-async function list(filter = {}) {
-  const cols = await getOrdersCols();
-  const { sqlWhere, args } = buildFilterSql(cols, filter);
+  // keep-alive (Heroku/Proxy friendly)
+  const ping = setInterval(() => {
+    res.write(`event: ping\n`);
+    res.write(`data: "ok"\n\n`);
+  }, 25000);
 
-  const rows = await db.query(
-    `
-    SELECT *
-    FROM orders
-    ${sqlWhere}
-    ORDER BY created_at DESC
-    LIMIT 500
-    `,
-    args
-  );
-  return rows;
-}
+  const onCreated = (payload) => {
+    res.write(`event: created\n`);
+    res.write(`data: ${JSON.stringify(payload)}\n\n`);
+  };
+  const onStatus = (payload) => {
+    res.write(`event: status\n`);
+    res.write(`data: ${JSON.stringify(payload)}\n\n`);
+  };
 
-async function updateStatus(id, status) {
-  const s = String(status || '').toLowerCase();
-  if (!s) throw new Error('missing_status');
+  bus.on('created', onCreated);
+  bus.on('status',  onStatus);
 
-  await db.query(`UPDATE orders SET status=? WHERE id=?`, [s, id]);
-  const out = await getById(id);
-  return out;
-}
+  req.on('close', () => {
+    clearInterval(ping);
+    bus.off('created', onCreated);
+    bus.off('status',  onStatus);
+    log.info('🧵 ORDERS.stream ⏹ close', { service: 'server', ip: req.ip });
+  });
+});
 
-module.exports = {
-  create,
-  getById,
-  list,
-  updateStatus
-};
+module.exports = router;
