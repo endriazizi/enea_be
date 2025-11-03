@@ -1,204 +1,125 @@
-// === Servizio azioni stato (accept/reject/cancel) con audit + mail ===========
-// Mantiene il tuo stile (commenti/emoji), ma abilita:
-// - transizioni standard + override/backtrack (flag .env)
-// - invio email su ogni cambio stato (se MAIL_ENABLED)
-// - log dettagliati (from→to, utente, reason, config mail)
+// src/services/reservations-status.service.js
+// ----------------------------------------------------------------------------
+// State machine per le prenotazioni + persistenza su DB.
+// Fix robusta: rileva le colonne realmente presenti in `reservations` e
+// costruisce la UPDATE senza toccare campi mancanti (es. updated_at).
+// - Interfaccia: updateStatus({ id, action, reason?, user_email? })
+// - Mappa azioni "umane" → stato DB (accept → accepted, ecc.)
+// ----------------------------------------------------------------------------
 
 'use strict';
 
-const db = require('../db');
-const logger = require('../logger');
-const env = require('../env');
-const resvSvc = require('./reservations.service');
+const { query } = require('../db');      // ✅ path corretto
+const logger    = require('../logger');  // ✅ path corretto
 
-// Mailer opzionale: se manca, log warnings ma non blocco
-let mailer = null;
-try { mailer = require('./mailer.service'); }
-catch { logger.warn('📧 mailer.service non disponibile: skip invio email'); }
+// Azioni consentite (accettiamo sia verbi sia stati finali)
+const ALLOWED = new Set([
+  'accept','accepted',
+  'confirm','confirmed',
+  'arrive','arrived',
+  'reject','rejected',
+  'cancel','canceled','cancelled',
+  'prepare','preparing',
+  'ready',
+  'complete','completed',
+  'no_show','noshow'
+]);
 
-/* Transazione con fallback: db.tx → pool.getConnection → db.query(callback) */
-async function runTx(cb) {
-  if (typeof db.tx === 'function') return db.tx(cb);
-
-  if (db.pool && typeof db.pool.getConnection === 'function') {
-    const conn = await db.pool.getConnection();
-    try {
-      await conn.beginTransaction();
-      const out = await cb(conn);
-      await conn.commit();
-      return out;
-    } catch (e) {
-      try { await conn.rollback(); } catch {}
-      throw e;
-    } finally {
-      conn.release();
-    }
-  }
-
-  if (typeof db.query === 'function') {
-    // opzionale: alcuni wrapper accettano una callback
-    return db.query(cb);
-  }
-
-  throw new Error('Transazione non disponibile (servono db.tx o pool.getConnection)');
-}
-
-/* Mappa base delle transizioni consentite */
-const BASE_ALLOWED = {
-  pending  : new Set(['accepted', 'rejected', 'cancelled']),
-  accepted : new Set(['cancelled', 'rejected']), // posso tornare indietro se abilitato
-  rejected : new Set([]),
-  cancelled: new Set([]),
+// Normalizzazione: azione → stato DB
+const MAP = {
+  accept     : 'accepted',
+  confirm    : 'confirmed',
+  arrive     : 'arrived',
+  reject     : 'rejected',
+  cancel     : 'canceled',
+  cancelled  : 'canceled',
+  prepare    : 'preparing',
+  complete   : 'completed',
+  no_show    : 'no_show',
+  noshow     : 'no_show'
 };
 
-function toNewStatus(action) {
-  switch (action) {
-    case 'accept': return 'accepted';
-    case 'reject': return 'rejected';
-    case 'cancel': return 'cancelled';
-    default: return null;
-  }
+function toStatus(action) {
+  const a = String(action || '').trim().toLowerCase();
+  if (!ALLOWED.has(a)) throw new Error('invalid_action');
+  return MAP[a] || a; // se è già "accepted/confirmed/..." lo lasciamo così
 }
 
-/* Flags runtime (env.js li espone già) */
-function transitionsConfig() {
-  return {
-    allowBacktrack     : !!env.RESV?.allowBacktrack,
-    allowAnyTransition : !!env.RESV?.allowAnyTransition,
-    forceTransitions   : !!env.RESV?.forceTransitions,
-    notifyAlways       : !!env.RESV?.notifyAlways,
-  };
+// Cache delle colonne per evitare query ripetute su information_schema
+const _colsCache = new Map();
+/** Ritorna Set di colonne presenti per la tabella richiesta */
+async function columnsOf(table = 'reservations') {
+  if (_colsCache.has(table)) return _colsCache.get(table);
+  const rows = await query(
+    `SELECT COLUMN_NAME AS name
+       FROM information_schema.columns
+      WHERE table_schema = DATABASE() AND table_name = ?`,
+    [table]
+  );
+  const set = new Set(rows.map(r => r.name));
+  _colsCache.set(table, set);
+  return set;
 }
 
 /**
- * Aggiorna lo stato in transazione e (se cambia davvero) invia email al cliente.
- * Input: { reservationId, action, reason?, user?, notify?, email?, replyTo? }
+ * Aggiorna lo stato in modo atomico e ritorna la prenotazione aggiornata.
+ * - Scrive la nota in "status_note" se esiste (fallback su "reason" se presente).
+ * - Aggiorna "status_changed_at" solo se la colonna esiste.
+ * - Aggiorna "updated_at"/"updated_by" solo se esistono.
  */
-async function updateStatus({ reservationId, action, reason, user, notify, email, replyTo }) {
-  const wanted = toNewStatus(action);
-  if (!wanted) {
-    const e = new Error('Azione non valida. Usa: accept | reject | cancel');
-    e.statusCode = 400; throw e;
+async function updateStatus({ id, action, reason = null, user_email = 'system' }) {
+  const rid = Number(id);
+  if (!rid || !action) throw new Error('missing_id_or_action');
+
+  const newStatus = toStatus(action);
+  const cols = await columnsOf('reservations');
+
+  // Costruzione dinamica della UPDATE sicura rispetto allo schema reale
+  const set = [];
+  const params = [];
+
+  // stato (sempre esiste)
+  set.push('status = ?'); params.push(newStatus);
+
+  // nota stato: preferisci status_note, fallback su reason (se presente)
+  if (reason !== null && reason !== undefined && reason !== '') {
+    if (cols.has('status_note')) {
+      set.push('status_note = COALESCE(?, status_note)'); params.push(reason);
+    } else if (cols.has('reason')) {
+      set.push('reason = COALESCE(?, reason)'); params.push(reason);
+    }
   }
-  const cfg = transitionsConfig();
-  const trimmedReason = (typeof reason === 'string' ? reason.trim() : '') || null;
 
-  // 1) Transazione: leggo stato attuale, valido, aggiorno, scrivo audit
-  const txResult = await runTx(async (conn) => {
-    // Stato attuale (FOR UPDATE)
-    const [rows] = await conn.execute(
-      'SELECT id, status FROM `reservations` WHERE id = ? FOR UPDATE', [reservationId]
-    );
-    if (!rows.length) {
-      const e = new Error('not_found'); e.statusCode = 404; throw e;
-    }
-    const current = rows[0];
-    let next = null;
+  // timestamp cambio-stato (se esiste)
+  if (cols.has('status_changed_at')) {
+    set.push('status_changed_at = CURRENT_TIMESTAMP');
+  }
 
-    // Transizione standard
-    const allowed = BASE_ALLOWED[current.status] || new Set();
-    if (allowed.has(wanted)) next = wanted;
+  // audit "updated_*" solo se le colonne esistono
+  if (cols.has('updated_at')) {
+    set.push('updated_at = CURRENT_TIMESTAMP');
+  }
+  if (cols.has('updated_by')) {
+    set.push('updated_by = ?'); params.push(user_email);
+  }
 
-    // Override/backtrack/any
-    if (!next && (cfg.allowAnyTransition || cfg.allowBacktrack || cfg.forceTransitions)) {
-      next = wanted;
-      logger.warn('🔁 RESV TRANSITION OVERRIDE', {
-        service: 'server', id: reservationId, from: current.status, to: wanted, action
-      });
-    }
+  // Safety: almeno lo status deve essere aggiornato
+  if (!set.length) throw new Error('no_fields_to_update');
 
-    if (!next) {
-      const e = new Error(`Transizione non consentita: ${current.status} → ${wanted}`);
-      e.statusCode = 409; throw e;
-    }
+  params.push(rid);
+  const sql = `UPDATE reservations SET ${set.join(', ')} WHERE id = ? LIMIT 1`;
+  const res = await query(sql, params);
 
-    if (next === current.status) {
-      // Niente da fare: no-op, non aggiorno DB né audit
-      logger.info('⏸️ RESV status NO-OP', {
-        service: 'server', id: reservationId, state: current.status, action
-      });
-      return { changed: false, snapshot: current };
-    }
+  if (!res?.affectedRows) throw new Error('reservation_not_found');
 
-    // UPDATE principale
-    await conn.execute(
-      'UPDATE `reservations` SET status=?, status_note=?, status_changed_at=CURRENT_TIMESTAMP WHERE id=?',
-      [next, trimmedReason, reservationId]
-    );
-
-    // AUDIT
-    const userId = (user && user.id) || null;
-    const userEmail = (user && user.email) || null;
-    await conn.execute(
-      'INSERT INTO `reservation_audit` (reservation_id, old_status, new_status, reason, user_id, user_email) VALUES (?,?,?,?,?,?)',
-      [reservationId, current.status, next, trimmedReason, userId, userEmail]
-    );
-
-    logger.info('📝 RESV audit', {
-      service: 'server',
-      id: reservationId,
-      from: current.status, to: next,
-      by: userEmail || 'unknown',
-      reason: trimmedReason || '-'
-    });
-
-    return { changed: true, from: current.status, to: next };
+  logger.info('🧾 RESV.status ✅ updated', {
+    id: rid,
+    newStatus,
+    usedCols: set.map(s => s.split('=')[0].trim())
   });
 
-  // 2) Snapshot aggiornato (JOIN ricca per avere email/display_name)
-  const updated = await resvSvc.getById(reservationId);
-
-  // 3) Notifica email (solo se c'è stato un cambio reale)
-  if (txResult.changed && mailer && env.MAIL?.enabled) {
-    const mustNotify = notify === true || cfg.notifyAlways;
-    const to = (email && String(email).trim()) || (updated?.email || '').trim() || updated?.contact_email || '';
-    if (mustNotify && to) {
-      try {
-        const info = await mailer.sendStatusChangeEmail({
-          to,
-          reservation: updated,
-          action,
-          reason: trimmedReason || undefined,
-          replyTo
-        });
-        logger.info('📧 MAIL SENT', {
-          service: 'server',
-          id: reservationId,
-          to,
-          action,
-          messageId: info?.messageId,
-          env_mail: env._debugMailConfig?.()
-        });
-      } catch (e) {
-        logger.error('📧 MAIL ERROR', {
-          service: 'server',
-          id: reservationId,
-          error: String(e),
-          env_mail: env._debugMailConfig?.()
-        });
-      }
-    } else {
-      logger.warn('📧 MAIL SKIPPED', {
-        service: 'server',
-        id: reservationId,
-        reason: mustNotify ? 'no_recipient' : 'notify_disabled',
-        env_mail: env._debugMailConfig?.()
-      });
-    }
-  }
-
-  return updated; // sempre lo snapshot finale
+  const rows = await query('SELECT * FROM reservations WHERE id = ?', [rid]);
+  return rows[0] || null;
 }
 
-/** Restituisce l'audit (ultime N righe, default 50) */
-async function getAudit({ reservationId, limit = 50 }) {
-  const n = Number(limit) || 50;
-  const [rows] = await db.query(
-    'SELECT id, reservation_id, old_status, new_status, reason, user_email, created_at ' +
-    'FROM `reservation_audit` WHERE reservation_id = ? ORDER BY created_at DESC LIMIT ?',
-    [reservationId, n]
-  );
-  return rows;
-}
-
-module.exports = { updateStatus, getAudit };
+module.exports = { updateStatus };

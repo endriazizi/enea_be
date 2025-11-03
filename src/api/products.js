@@ -1,12 +1,4 @@
-// src/api/products.js
 'use strict';
-
-/**
- * /api/products
- * --------------
- * Elenco prodotti con JOIN categorie + CRUD.
- * Mantiene lo stile: log chiari, errori espliciti, wrapper service.
- */
 
 const express = require('express');
 const router  = express.Router();
@@ -27,8 +19,8 @@ router.get('/', async (req, res) => {
   }
 });
 
-// Alias "menu"
-router.get('/menu', async (req, res) => {
+// Alias "menu" → solo attivi
+router.get('/menu', async (_req, res) => {
   try {
     const rows = await svc.getAll({ active: true });
     res.json(rows);
@@ -38,7 +30,6 @@ router.get('/menu', async (req, res) => {
   }
 });
 
-// GET /api/products/:id
 router.get('/:id(\\d+)', async (req, res) => {
   try {
     const id = Number(req.params.id);
@@ -51,7 +42,6 @@ router.get('/:id(\\d+)', async (req, res) => {
   }
 });
 
-// POST /api/products
 router.post('/', async (req, res) => {
   try {
     const created = await svc.create(req.body || {});
@@ -62,7 +52,6 @@ router.post('/', async (req, res) => {
   }
 });
 
-// PUT /api/products/:id
 router.put('/:id(\\d+)', async (req, res) => {
   try {
     const id = Number(req.params.id);
@@ -75,7 +64,6 @@ router.put('/:id(\\d+)', async (req, res) => {
   }
 });
 
-// DELETE /api/products/:id
 router.delete('/:id(\\d+)', async (req, res) => {
   try {
     const id = Number(req.params.id);

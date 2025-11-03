@@ -1,149 +1,125 @@
-// src/services/product.service.js
 'use strict';
 
 /**
- * ProductService
- * --------------
- * - Query DB tramite wrapper unico (mysql2/promise) con log.
- * - JOIN categorie per restituire anche category name/icon.
- * - Create/Update: accetta sia category_id (numero) sia category (stringa),
- *   creando la categoria se non esiste (safe) quando passi il nome.
- *
- * Stile: commenti lunghi, log con emoji, niente sorprese.
+ * Product Service
+ * ----------------
+ * - Query centralizzate su `products` (+ join categorie)
+ * - Restituisce SEMPRE array "puliti" (query wrapper torna already rows)
+ * - Log verbosi con emoji, in linea con il tuo stile
  */
 
-const { query } = require('../db');
 const logger = require('../logger');
 
-// Helper: normalizza boolean-like in 0/1
-function toFlag(v) {
-  if (v === undefined || v === null) return null;
-  const s = String(v).toLowerCase();
-  return (s === '1' || s === 'true' || s === 'yes' || s === 'y') ? 1 : 0;
-}
-
-// Helper: crea o trova category_id partendo da { category_id?, category? }
-async function ensureCategoryId(input) {
-  const byId = Number(input?.category_id);
-  if (Number.isFinite(byId) && byId > 0) return byId;
-
-  const name = (input?.category || '').toString().trim();
-  if (!name) return null;
-
-  // prova a trovarla
-  const rows = await query('SELECT id FROM categories WHERE name=? LIMIT 1', [name]);
-  if (rows?.length) return rows[0].id;
-
-  // se non esiste, creala (attiva, sort_order 0)
-  const res = await query('INSERT INTO categories (name, is_active, sort_order) VALUES (?, 1, 0)', [name]);
-  logger.info('📦 category created', { id: res.insertId, name });
-  return res.insertId;
-}
+// ✅ Importa la funzione `query` già "wrapped" dal nostro db/index.js
+//    (evita di usare `const db = require('../db')` → poi `db.query(...)`,
+//     perché se il require fallisce `db` diventa undefined e scoppia)
+const { query } = require('../db');
 
 module.exports = {
-  // ----------------------------------------------------------------------------
-  // LIST (opzione active-only)
-  // ----------------------------------------------------------------------------
-  async getAll({ active } = {}) {
-    const onlyActive = !!active;
-    const sql = `
-      SELECT
-        p.id, p.name, p.description, p.price, p.is_active, p.sort_order, p.category_id,
-        c.name AS category, c.icon
-      FROM products p
-      LEFT JOIN categories c ON c.id = p.category_id
-      ${onlyActive ? 'WHERE p.is_active = 1' : ''}
-      ORDER BY COALESCE(c.sort_order, 9999), c.name,
-               COALESCE(p.sort_order, 9999), p.name
-    `;
-    const rows = await query(sql);
-    logger.info('📤 products list', { count: rows.length, onlyActive });
-    return rows;
-  },
-
-  // ----------------------------------------------------------------------------
-  // GET BY ID
-  // ----------------------------------------------------------------------------
-  async getById(id) {
-    const sql = `
-      SELECT
-        p.id, p.name, p.description, p.price, p.is_active, p.sort_order, p.category_id,
-        c.name AS category, c.icon
-      FROM products p
-      LEFT JOIN categories c ON c.id = p.category_id
-      WHERE p.id = ?
-      LIMIT 1
-    `;
-    const rows = await query(sql, [id]);
-    return rows?.[0] || null;
-  },
-
-  // ----------------------------------------------------------------------------
-  // CREATE
-  // ----------------------------------------------------------------------------
-  async create(data) {
-    const name = (data?.name || '').toString().trim();
-    if (!name) throw new Error('missing_name');
-
-    const price = Number(data?.price ?? 0);
-    if (!Number.isFinite(price)) throw new Error('invalid_price');
-
-    const category_id = await ensureCategoryId(data);
-    const is_active = toFlag(data?.is_active);
-    const sort_order = Number.isFinite(Number(data?.sort_order)) ? Number(data.sort_order) : 0;
-    const description = (data?.description || null) ? String(data.description) : null;
-
-    const sql = `
-      INSERT INTO products (category_id, name, description, price, is_active, sort_order)
-      VALUES (?, ?, ?, ?, COALESCE(?,1), ?)
-    `;
-    const res = await query(sql, [category_id, name, description, price, is_active, sort_order]);
-
-    logger.info('➕ product created', { id: res.insertId, name, price, category_id });
-    return await this.getById(res.insertId);
-  },
-
-  // ----------------------------------------------------------------------------
-  // UPDATE
-  // ----------------------------------------------------------------------------
-  async update(id, data) {
-    const current = await this.getById(id);
-    if (!current) return null;
-
-    const category_id = (data.hasOwnProperty('category') || data.hasOwnProperty('category_id'))
-      ? await ensureCategoryId(data)
-      : current.category_id;
-
-    const name        = (data?.name !== undefined)        ? String(data.name).trim() : current.name;
-    const description = (data?.description !== undefined) ? (data.description ? String(data.description) : null) : current.description;
-    const price       = (data?.price !== undefined)       ? Number(data.price) : current.price;
-    const sort_order  = (data?.sort_order !== undefined)  ? Number(data.sort_order) : current.sort_order;
-    const is_active   = (data?.is_active !== undefined)   ? toFlag(data.is_active) : current.is_active;
-
-    const sql = `
-      UPDATE products
-      SET category_id = ?,
-          name = ?,
-          description = ?,
-          price = ?,
-          is_active = ?,
-          sort_order = ?,
-          updated_at = CURRENT_TIMESTAMP
-      WHERE id = ?
-    `;
-    await query(sql, [category_id, name, description, price, is_active, sort_order, id]);
-
-    logger.info('✏️ product updated', { id, name });
-    return await this.getById(id);
-  },
-
-  // ----------------------------------------------------------------------------
-  // DELETE (hard)
-  // ----------------------------------------------------------------------------
-  async remove(id) {
-    const res = await query('DELETE FROM products WHERE id=?', [id]);
-    const ok = res?.affectedRows > 0;
-    logger.info(ok ? '🗑️ product deleted' : '🗑️ product delete: not found', { id });
-    return ok;
-  }
+  getAll,
+  getById,
+  create,
+  update,
+  remove,
 };
+
+// GET all (opz. solo attivi)
+async function getAll({ active = false } = {}) {
+  logger.debug('🧾 products.getAll', { active });
+
+  const sql = `
+    SELECT
+      p.id, p.name, p.description, p.price, p.is_active, p.sort_order,
+      p.category_id, c.name AS category
+    FROM products p
+    LEFT JOIN categories c ON c.id = p.category_id
+    ${active ? 'WHERE p.is_active = 1' : ''}
+    ORDER BY c.name, p.sort_order, p.id
+  `;
+  // il nostro wrapper ritorna direttamente `rows`
+  const rows = await query(sql, []);
+  return rows || [];
+}
+
+// GET by id
+async function getById(id) {
+  logger.debug('🧾 products.getById', { id });
+  const rows = await query(
+    `SELECT p.id, p.name, p.description, p.price, p.is_active, p.sort_order,
+            p.category_id, c.name AS category
+     FROM products p
+     LEFT JOIN categories c ON c.id = p.category_id
+     WHERE p.id = ?`,
+    [id]
+  );
+  return rows?.[0] || null;
+}
+
+// CREATE (campi minimi)
+async function create(payload) {
+  logger.debug('🧾 products.create', { payload });
+
+  const {
+    name,
+    description = null,
+    price = 0,
+    is_active = 1,
+    sort_order = 100,
+    category_id = null,
+  } = payload || {};
+
+  if (!name) throw new Error('name_required');
+
+  const result = await query(
+    `INSERT INTO products
+       (name, description, price, is_active, sort_order, category_id)
+     VALUES (?,?,?,?,?,?)`,
+    [name, description, price, is_active ? 1 : 0, sort_order, category_id]
+  );
+
+  // mysql2.execute() nel nostro wrapper torna rows, ma per INSERT usiamo affectedRows/insertId
+  // il wrapper già restituisce rows, quindi per coerenza facciamo una GET by id
+  // (così garantiamo stesso shape della read)
+  const rows = await query('SELECT LAST_INSERT_ID() AS id');
+  const id = rows?.[0]?.id;
+  return getById(id);
+}
+
+// UPDATE
+async function update(id, payload) {
+  logger.debug('🧾 products.update', { id, payload });
+
+  const cur = await getById(id);
+  if (!cur) return null;
+
+  const next = {
+    name: payload?.name ?? cur.name,
+    description: payload?.description ?? cur.description,
+    price: payload?.price ?? cur.price,
+    is_active: (payload?.is_active ?? cur.is_active) ? 1 : 0,
+    sort_order: payload?.sort_order ?? cur.sort_order,
+    category_id: payload?.category_id ?? cur.category_id,
+  };
+
+  await query(
+    `UPDATE products
+       SET name=?, description=?, price=?, is_active=?, sort_order=?, category_id=?
+     WHERE id=?`,
+    [
+      next.name, next.description, next.price, next.is_active,
+      next.sort_order, next.category_id, id
+    ]
+  );
+
+  return getById(id);
+}
+
+// DELETE
+async function remove(id) {
+  logger.debug('🧾 products.remove', { id });
+  const rows = await query(`DELETE FROM products WHERE id = ?`, [id]);
+  // Se il wrapper ritorna oggetto "OkPacket", potremmo non avere affectedRows qui;
+  // in ogni caso, una seconda read conferma la rimozione.
+  const check = await getById(id);
+  return !check;
+}

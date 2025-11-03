@@ -1,5 +1,10 @@
+// src/api/reservations.js
+// ============================================================================
 // Service “Reservations” — query DB per prenotazioni
 // Stile: commenti lunghi, log con emoji, diagnostica chiara.
+// NOTA: questo è un *service module* (esporta funzioni). La tua API/Router
+//       /api/reservations importerà da qui (es. const svc = require('./reservations')).
+// ============================================================================
 
 'use strict';
 
@@ -56,6 +61,69 @@ async function ensureUser({ first, last, email, phone }) {
     [trimOrNull(first), trimOrNull(last), e, p]
   );
   return res.insertId;
+}
+
+// ============================================================================
+// ⚙️ Cambio stato: azioni → stato finale
+// - Accettiamo sia verbi (accept/confirm/…) sia stati già finali (accepted/…)
+// - Restituisce la prenotazione aggiornata (per eventuali notify a valle).
+// ============================================================================
+
+const ALLOWED = new Set([
+  'accept','accepted',
+  'confirm','confirmed',
+  'arrive','arrived',
+  'reject','rejected',
+  'cancel','canceled','cancelled',
+  'prepare','preparing',
+  'ready',
+  'complete','completed',
+  'no_show','noshow'
+]);
+const MAP = {
+  accept     : 'accepted',
+  confirm    : 'confirmed',
+  arrive     : 'arrived',
+  reject     : 'rejected',
+  cancel     : 'canceled',
+  cancelled  : 'canceled',
+  prepare    : 'preparing',
+  complete   : 'completed',
+  no_show    : 'no_show',
+  noshow     : 'no_show'
+};
+function toStatus(action) {
+  const a = String(action || '').trim().toLowerCase();
+  if (!ALLOWED.has(a)) throw new Error('invalid_action');
+  return MAP[a] || a;
+}
+
+/**
+ * updateStatus: aggiorna lo stato in DB in modo atomico.
+ * Evita il classico refuso `query(query, ...)` passando **sempre** una STRINGA SQL esplicita.
+ */
+async function updateStatus({ id, action, reason = null, user_email = 'system' }) {
+  const rid = Number(id);
+  if (!rid || !action) throw new Error('missing_id_or_action');
+
+  const newStatus = toStatus(action);
+
+  const SQL_UPDATE = `
+    UPDATE reservations
+       SET status     = ?,
+           reason     = IFNULL(?, reason),
+           updated_at = CURRENT_TIMESTAMP,
+           updated_by = ?
+     WHERE id = ?
+     LIMIT 1
+  `;
+  const res = await query(SQL_UPDATE, [newStatus, reason, user_email, rid]);
+  if (!res?.affectedRows) throw new Error('reservation_not_found');
+
+  logger.info('🧾 RESV.status ✅ updated', { id: rid, newStatus });
+
+  const rows = await query('SELECT * FROM reservations WHERE id = ?', [rid]);
+  return rows[0] || null;
 }
 
 // --- Core queries -------------------------------------------------------------
@@ -219,7 +287,8 @@ async function remove(id, { user, reason } = {}) {
     (env.RESV && env.RESV.allowDeleteAnyStatus === true) ||
     (String(process.env.RESV_ALLOW_DELETE_ANY_STATUS || '').toLowerCase() === 'true');
 
-  const isCancelled = String(existing.status || '').toLowerCase() === 'cancelled';
+  const statusNorm = String(existing.status || '').toLowerCase();
+  const isCancelled = (statusNorm === 'cancelled' || statusNorm === 'canceled');
 
   if (!allowAnyByEnv && !isCancelled) {
     logger.warn('🛡️ hard-delete NEGATO (stato non cancellato)', { id, status: existing.status });
@@ -289,6 +358,7 @@ module.exports = {
   getById,
   create,
   update,
+  updateStatus,     // ⬅️ nuovo export per la rotta PUT /:id/status
   remove,
   countByStatus,
   listRooms,

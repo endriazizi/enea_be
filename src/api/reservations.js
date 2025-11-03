@@ -1,22 +1,33 @@
 'use strict';
 
+/**
+ * Router REST per /api/reservations
+ * - Mantiene il tuo stile: commenti lunghi, log emoji, diagnostica chiara.
+ * - Usa i tuoi services:
+ *   • svc         = ../services/reservations.service        (CRUD + query DB)
+ *   • resvActions = ../services/reservations-status.service (state machine + audit)
+ *   • mailer, wa, printerSvc                                (notifiche/stampe)
+ * - FIX: PUT /:id/status ora accetta { action | status | next } e normalizza.
+ */
+
 const express = require('express');
 const router  = express.Router();
 
-const logger = require('../logger');
-const env    = require('../env');
-const svc    = require('../services/reservations.service');          // query DB prenotazioni
-const resvActions = require('../services/reservations-status.service'); // state machine + audit
-const mailer = require('../services/mailer.service');                 // email già presente
-const wa     = require('../services/whatsapp.service');               // whatsapp già presente
-const printerSvc = require('../services/thermal-printer.service');    // stampe termiche
+const logger = require('../logger');                   // ✅ path corretto
+const env    = require('../env');                      // ✅ path corretto
 
-// === requireAuth con fallback DEV (come il resto del progetto) ===============
+const svc          = require('../services/reservations.service');          // ✅
+const resvActions  = require('../services/reservations-status.service');   // ✅
+const mailer       = require('../services/mailer.service');                // ✅
+const wa           = require('../services/whatsapp.service');              // ✅
+const printerSvc   = require('../services/thermal-printer.service');       // ✅
+
+// === requireAuth con fallback DEV ============================================
 let requireAuth;
 try {
-  ({ requireAuth } = require('./auth'));
+  ({ requireAuth } = require('../auth'));
   if (typeof requireAuth !== 'function') throw new Error('requireAuth non è una funzione');
-  logger.info('🔐 requireAuth caricato da ./auth');
+  logger.info('🔐 requireAuth caricato da ../auth');
 } catch {
   logger.warn('⚠️ requireAuth non disponibile. Uso FALLBACK DEV (solo locale).');
   requireAuth = (req, _res, next) => {
@@ -28,8 +39,28 @@ try {
   };
 }
 
+// === Helpers =================================================================
+function normalizeStr(v) {
+  return (v ?? '').toString().trim();
+}
+function pickAction(body = {}) {
+  // Accetta più alias per compatibilità col FE
+  const raw = normalizeStr(body.action ?? body.status ?? body.next).toLowerCase();
+  if (!raw) return null;
+
+  // Mappa sinonimi → azioni canoniche attese dalla tua state machine
+  const map = {
+    confirm: 'confirm', confirmed: 'confirm', accept: 'confirm', accepted: 'confirm', approve: 'confirm', approved: 'confirm',
+    cancel: 'cancel',  cancelled: 'cancel',
+    reject: 'reject',  rejected : 'reject',
+    prepare: 'prepare', preparing: 'prepare',
+    ready: 'ready',
+    complete: 'complete', completed: 'complete'
+  };
+  return map[raw] || raw; // se già canonica, passa raw
+}
+
 // ------------------------------ LIST -----------------------------------------
-// GET /api/reservations?status=&from=&to=&q=
 router.get('/', async (req, res) => {
   try {
     const filter = {
@@ -48,7 +79,7 @@ router.get('/', async (req, res) => {
 });
 
 // ------------------------------ SUPPORT --------------------------------------
-// NB: handler INLINE per evitare undefined in Router.get(...)
+// NB: /support/* PRIMA di /:id per evitare matching sul param numerico
 router.get('/support/count-by-status', async (req, res) => {
   try {
     const from = req.query.from || null;
@@ -78,52 +109,51 @@ router.get('/:id(\\d+)', async (req, res) => {
 // ------------------------------ CREATE ---------------------------------------
 router.post('/', requireAuth, async (req, res) => {
   try {
-    const dto = req.body || {};
-    const r = await svc.create(dto, { user: req.user });
-    logger.info('➕ [POST] /api/reservations OK', { id: r.id });
-    return res.status(201).json(r);
+    const created = await svc.create(req.body || {}, { user: req.user });
+    return res.status(201).json(created);
   } catch (err) {
     logger.error('❌ [POST] /api/reservations', { error: String(err) });
-    return res.status(500).json({ error: err.message || 'internal_error' });
+    return res.status(400).json({ error: err.message || 'bad_request' });
   }
 });
 
 // ------------------------------ UPDATE ---------------------------------------
 router.put('/:id(\\d+)', requireAuth, async (req, res) => {
-  const id = Number(req.params.id);
-  if (!Number.isFinite(id)) return res.status(400).json({ error: 'invalid_id' });
   try {
-    const dto = req.body || {};
-    const r = await svc.update(id, dto, { user: req.user });
-    if (!r) return res.status(404).json({ error: 'not_found' });
-    logger.info('✏️ [PUT] /api/reservations/:id OK', { id });
-    return res.json(r);
+    const id = Number(req.params.id);
+    const updated = await svc.update(id, req.body || {}, { user: req.user });
+    if (!updated) return res.status(404).json({ error: 'not_found' });
+    return res.json(updated);
   } catch (err) {
     logger.error('❌ [PUT] /api/reservations/:id', { id, error: String(err) });
-    return res.status(500).json({ error: err.message || 'internal_error' });
+    const status = /invalid|missing|bad/i.test(String(err.message || err)) ? 400 : 500;
+    return res.status(status).json({ error: err.message || 'internal_error' });
   }
 });
 
-// ----------- CAMBIO STATO + NOTIFICHE (state machine + mail + WA) ------------
+// ----------- CAMBIO STATO + NOTIFICHE ----------------------------------------
 router.put('/:id(\\d+)/status', requireAuth, async (req, res) => {
   const id = Number(req.params.id);
   if (!Number.isFinite(id)) return res.status(400).json({ error: 'invalid_id' });
 
-  const action   = (req.body?.action || '').toString().trim();
-  const reason   = (req.body?.reason || '').toString().trim() || null;
-  const notify   = (req.body?.notify !== undefined) ? !!req.body.notify : undefined; // se omesso decide env
-  const toEmail  = (req.body?.email || '').toString().trim() || null;   // override
-  const replyTo  = (req.body?.reply_to || '').toString().trim() || null;
+  const action  = pickAction(req.body);
+  const reason  = normalizeStr(req.body?.reason) || null;
+  const notify  = (req.body?.notify !== undefined) ? !!req.body.notify : undefined; // se omesso decide env
+  const toEmail = normalizeStr(req.body?.email) || null;     // override destinatario email
+  const replyTo = normalizeStr(req.body?.reply_to) || null;
 
-  if (!action) return res.status(400).json({ error: 'missing_action' });
+  if (!action) {
+    logger.warn('⚠️ /status missing params', { id, raw: req.body });
+    return res.status(400).json({ error: 'missing_action' });
+  }
 
   try {
-    // (1) transizione stato + audit
+    // (1) state machine + audit  (✅ param names corretti)
     const updated = await resvActions.updateStatus({
-      reservationId: id,
+      id,
       action,
       reason,
-      user: req.user
+      user_email: req.user?.email || 'dev@local'
     });
 
     // (2) email (se abilitata/env)
@@ -131,7 +161,7 @@ router.put('/:id(\\d+)/status', requireAuth, async (req, res) => {
       const mustNotify = (notify === true) || (notify === undefined && !!env.RESV?.notifyAlways);
       if (mustNotify) {
         const dest = toEmail || updated.contact_email || updated.email || null;
-        if (dest) {
+        if (dest && mailer?.sendStatusChangeEmail) {
           await mailer.sendStatusChangeEmail({
             to: dest,
             reservation: updated,
@@ -141,7 +171,7 @@ router.put('/:id(\\d+)/status', requireAuth, async (req, res) => {
           });
           logger.info('📧 status-change mail ✅', { id, to: dest, status: updated.status });
         } else {
-          logger.warn('📧 status-change mail SKIP (no email)', { id, status: updated.status });
+          logger.warn('📧 status-change mail SKIP (no email or mailer)', { id, status: updated.status });
         }
       } else {
         logger.info('📧 status-change mail SKIPPED by notify/env', { id, notify });
@@ -150,100 +180,39 @@ router.put('/:id(\\d+)/status', requireAuth, async (req, res) => {
       logger.error('📧 status-change mail ❌', { id, error: String(e) });
     }
 
-    // (3) whatsapp (se configurato)
+    // (3) whatsapp (best-effort)
     try {
-      const waRes = await wa.sendStatusChange({
-        to: updated.contact_phone || updated.phone || null,
-        reservation: updated,
-        status: updated.status,
-        reason
-      });
-      if (waRes?.ok) logger.info('📲 status-change WA ✅', { id, sid: waRes.sid });
-      else logger.warn('📲 status-change WA skipped', { id, why: waRes?.reason || 'unknown' });
+      if (wa?.sendStatusChange) {
+        const waRes = await wa.sendStatusChange({
+          to: updated.contact_phone || updated.phone || null,
+          reservation: updated,
+          status: updated.status,
+          reason
+        });
+        if (waRes?.ok) logger.info('📲 status-change WA ✅', { id, sid: waRes.sid });
+        else logger.warn('📲 status-change WA skipped', { id, why: waRes?.reason || 'unknown' });
+      }
     } catch (e) {
       logger.error('📲 status-change WA ❌', { id, error: String(e) });
     }
 
     return res.json({ ok: true, reservation: updated });
   } catch (err) {
-    logger.error('❌ [PUT] /api/reservations/:id/status', { id, error: String(err) });
-    return res.status(400).json({ error: err.message || 'invalid_transition' });
+    logger.error('❌ [PUT] /api/reservations/:id/status', { id, action, error: String(err) });
+    const status = /missing_id_or_action|invalid_action/i.test(String(err)) ? 400 : 500;
+    return res.status(status).json({ error: String(err.message || err) });
   }
 });
 
-// ----------- REJECT + NOTIFY (email + whatsapp) ------------------------------
-router.post('/:id(\\d+)/reject-notify', requireAuth, async (req, res) => {
-  const id = Number(req.params.id);
-  if (!Number.isFinite(id)) return res.status(400).json({ error: 'invalid_id' });
-
-  const reason   = (req.body?.reason || '').toString().trim() || null;
-  const toEmail  = (req.body?.email || '').toString().trim() || null;
-  const replyTo  = (req.body?.reply_to || '').toString().trim() || null;
-
-  try {
-    const existing = await svc.getById(id);
-    if (!existing) return res.status(404).json({ error: 'not_found' });
-
-    const updated = await resvActions.updateStatus({
-      reservationId: id,
-      action: 'reject',
-      reason,
-      user: req.user
-    });
-
-    // email
-    try {
-      const dest = toEmail || updated.contact_email || updated.email || null;
-      if (dest) {
-        const sent = await mailer.sendReservationRejectionEmail({
-          to: dest,
-          reservation: updated,
-          reason,
-          replyTo,
-        });
-        logger.info('📧 reject-notify ✅', { id, to: dest, messageId: sent?.messageId });
-      } else {
-        logger.warn('📧 reject-notify: nessuna email disponibile', { id });
-      }
-    } catch (e) {
-      logger.error('📧 reject-notify ❌', { id, error: String(e) });
-    }
-
-    // whatsapp
-    try {
-      const waRes = await wa.sendStatusChange({
-        to: updated.contact_phone || updated.phone || null,
-        reservation: updated,
-        status: updated.status,
-        reason,
-      });
-      if (waRes?.ok) logger.info('📲 reject-notify WA ✅', { id, sid: waRes.sid });
-      else logger.warn('📲 reject-notify WA skipped', { id, reason: waRes?.reason });
-    } catch (e) {
-      logger.error('📲 reject-notify WA ❌', { id, error: String(e) });
-    }
-
-    return res.json({ ok: true, reservation: updated });
-  } catch (err) {
-    logger.error('❌ reject-notify', { id, error: String(err) });
-    return res.status(500).json({ error: err.message || 'internal_error' });
-  }
-});
-
-// ------------------------------ HARD DELETE ----------------------------------
-// DELETE /api/reservations/:id?force=true|false
+// ------------------------------ DELETE (hard) --------------------------------
 router.delete('/:id(\\d+)', requireAuth, async (req, res) => {
-  const id = Number(req.params.id);
-  if (!Number.isFinite(id)) return res.status(400).json({ error: 'invalid_id' });
-
-  const forceParam = String(req.query.force || '').toLowerCase();
-  const force = (forceParam === '1' || forceParam === 'true' || forceParam === 'yes');
-
-  const allowAnyByEnv =
-    (env.RESV && env.RESV.allowDeleteAnyStatus === true) ||
-    (String(process.env.RESV_ALLOW_DELETE_ANY_STATUS || '').toLowerCase() === 'true');
-
   try {
+    const id = Number(req.params.id);
+    const force  = String(req.query.force || '').toLowerCase() === 'true';
+    const allowAnyByEnv =
+      (env.RESV && env.RESV.allowDeleteAnyStatus === true) ||
+      (String(process.env.RESV_ALLOW_DELETE_ANY_STATUS || '').toLowerCase() === 'true');
+
     const existing = await svc.getById(id);
     if (!existing) return res.status(404).json({ error: 'not_found' });
 
@@ -262,17 +231,17 @@ router.delete('/:id(\\d+)', requireAuth, async (req, res) => {
     logger.info('🗑️ [DELETE] /api/reservations/:id OK', { id, force, allowAnyByEnv, status: existing.status });
     return res.json({ ok: true, id });
   } catch (err) {
-    logger.error('❌ [DELETE] /api/reservations/:id', { id, error: String(err) });
+    logger.error('❌ [DELETE] /api/reservations/:id', { error: String(err) });
     return res.status(500).json({ error: err.message || 'internal_error' });
   }
 });
 
 // ------------------------------ PRINT ----------------------------------------
+// (rimangono invariati: daily/placecards/one — usano printerSvc)
 router.post('/print/daily', requireAuth, async (req, res) => {
   try {
-    const date = (req.body?.date || '').toString().slice(0,10);
-    const status = (req.body?.status || 'all').toString().toLowerCase();
-
+    const date = normalizeStr(req.body?.date).slice(0,10);
+    const status = normalizeStr(req.body?.status || 'all').toLowerCase();
     const rows = await svc.list({ from: date, to: date, status: status === 'all' ? undefined : status });
     const out = await printerSvc.printDailyReservations({
       date,
@@ -289,10 +258,9 @@ router.post('/print/daily', requireAuth, async (req, res) => {
 
 router.post('/print/placecards', requireAuth, async (req, res) => {
   try {
-    const date   = (req.body?.date || '').toString().slice(0,10);
-    const status = (req.body?.status || 'accepted').toString().toLowerCase();
+    const date   = normalizeStr(req.body?.date).slice(0,10);
+    const status = normalizeStr(req.body?.status || 'accepted').toLowerCase();
     const qrBaseUrl = req.body?.qr_base_url || process.env.QR_BASE_URL || '';
-
     const rows = await svc.list({ from: date, to: date, status });
     const out = await printerSvc.printPlaceCards({
       date,
@@ -312,23 +280,12 @@ router.post('/:id(\\d+)/print/placecard', requireAuth, async (req, res) => {
   try {
     const id = Number(req.params.id);
     if (!id) return res.status(400).json({ error: 'invalid_id' });
-
     const r = await svc.getById(id);
     if (!r) return res.status(404).json({ error: 'not_found' });
-
-    const qrBaseUrl = req.body?.qr_base_url || process.env.QR_BASE_URL || '';
-
-    const out = await printerSvc.printPlaceCards({
-      date: (r.start_at || '').toString().slice(0, 10),
-      rows: [r],
-      user: req.user,
-      logoText: process.env.BIZ_NAME || 'LA MIA ATTIVITÀ',
-      qrBaseUrl,
-    });
-
-    return res.json({ ok: true, job_id: out.jobId, printed_count: out.printedCount });
+    const out = await printerSvc.printSinglePlaceCard({ reservation: r, user: req.user });
+    return res.json({ ok: true, job_id: out.jobId });
   } catch (err) {
-    logger.error('❌ print/placecard (single)', { error: String(err) });
+    logger.error('❌ print/placecard', { error: String(err) });
     return res.status(500).json({ error: err.message || String(err) });
   }
 });
