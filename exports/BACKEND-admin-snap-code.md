@@ -1,6 +1,6 @@
 # 🧩 Project code (file ammessi in .)
 
-_Generato: Mon, Nov  3, 2025  1:14:57 AM_
+_Generato: Tue, Nov  4, 2025 10:30:09 PM_
 
 ### ./package.json
 ```
@@ -18,6 +18,8 @@ _Generato: Mon, Nov  3, 2025  1:14:57 AM_
         "cors": "^2.8.5",
         "dotenv": "^16.4.5",
         "express": "^4.19.2",
+        "google-auth-library": "10.5.0",
+        "googleapis": "164.1.0",
         "iconv-lite": "0.7.0",
         "install": "0.13.0",
         "jq": "1.7.2",
@@ -178,6 +180,181 @@ router.get('/me', requireAuth, async (req, res) => {
 module.exports = router;
 ```
 
+### ./src/api/google.js
+```
+// server/src/api/google.js
+const express = require('express');
+const router = express.Router();
+const { exchangeCode, searchContacts, getTokenRow, revokeFor } = require('../services/google-oauth.service');
+const auth = require('../middleware/auth'); // tuo JWT middleware: req.user.id
+
+// Tutte le rotte richiedono login app (admin). Mantengo la tua politica.
+router.use(auth);
+
+// Stato collegamento
+router.get('/status', async (req, res) => {
+  const row = await getTokenRow(req.user?.id);
+  res.json({ connected: !!row, email: row?.google_email || null });
+});
+
+// Exchange code → refresh token (una volta)
+router.post('/oauth/exchange', async (req, res, next) => {
+  try {
+    const code = req.body?.code;
+    if (!code) return res.status(400).json({ ok: false, message: 'Missing code' });
+    await exchangeCode(req.user?.id, code);
+    res.json({ ok: true });
+  } catch (err) {
+    const msg = err?.code === 'invalid_grant' ? 'Invalid or expired code' : err.message;
+    res.status(400).json({ ok: false, message: msg });
+  }
+});
+
+// Proxy People search (usa refresh token server-side)
+router.get('/people/search', async (req, res) => {
+  const q = (req.query.q || '').toString().trim();
+  const limit = Math.max(1, Math.min(50, Number(req.query.limit || 10)));
+  if (q.length < 2) return res.json({ items: [] });
+  try {
+    const items = await searchContacts(req.user?.id, q, limit);
+    res.json({ items });
+  } catch (err) {
+    if (err?.code === 'GOOGLE_CONSENT_REQUIRED') {
+      return res.status(401).json({ ok: false, reason: 'google_consent_required' });
+    }
+    res.status(500).json({ ok: false, message: err.message });
+  }
+});
+
+// Disconnessione manuale
+router.post('/logout', async (req, res) => {
+  await revokeFor(req.user?.id);
+  res.json({ ok: true });
+});
+
+module.exports = router;
+```
+
+### ./src/api/google/oauth.js
+```
+// server/src/api/google/oauth.js
+// =============================================================================
+// Endpoints OAuth: FE-first Code Flow (POST /exchange) + (opzionale) /callback.
+// =============================================================================
+'use strict';
+const express = require('express');
+const router = express.Router();
+const { getPoolFromApp, getOAuthClient, exchangeCode, saveTokens } = require('../../services/google.service');
+
+// opzionale: URL di consenso per redirect flow (di solito non lo usiamo in FE-first)
+router.get('/url', async (req, res) => {
+  const log = req.app.get('logger');
+  const { authUrl } = getOAuthClient();
+  log?.info?.('🔐 Google OAuth URL richiesto');
+  res.json({ ok: true, url: authUrl });
+});
+
+// FE-first: scambia "code" ottenuto via GIS.popup → token persistiti
+router.post('/exchange', express.json(), async (req, res) => {
+  const log = req.app.get('logger');
+  const db  = getPoolFromApp(req);
+  const code = req.body?.code;
+  if (!code) return res.status(400).json({ ok: false, reason: 'missing_code' });
+
+  try {
+    const tokens = await exchangeCode(db, code);
+    log?.info?.('🔐 [Google] code exchanged, tokens saved', { has_refresh: !!tokens.refresh_token });
+    return res.json({ ok: true, has_refresh: !!tokens.refresh_token });
+  } catch (e) {
+    log?.error?.('🔐❌ [Google] exchange failed', { error: String(e) });
+    return res.status(500).json({ ok: false, reason: 'exchange_failed', message: String(e?.message || e) });
+  }
+});
+
+// opzionale: callback per redirect flow classico (se volessi usarlo)
+router.get('/callback', async (req, res) => {
+  const log = req.app.get('logger');
+  const code = req.query.code;
+  if (!code) return res.status(400).send('Missing code');
+
+  const db = getPoolFromApp(req);
+  const { oAuth2Client } = getOAuthClient();
+
+  try {
+    const { tokens } = await oAuth2Client.getToken(code);
+    await saveTokens(db, tokens);
+    log?.info?.('🔐 Google OAuth: token salvati (refresh?)', { has_refresh: !!tokens.refresh_token });
+    res.send(`<script>
+      window.opener && window.opener.postMessage({googleConnected:true}, "*");
+      window.close();
+    </script>Connesso. Puoi chiudere questa finestra.`);
+  } catch (e) {
+    log?.error?.('🔐❌ Google callback KO', { error: String(e) });
+    res.status(500).send('OAuth exchange failed');
+  }
+});
+
+module.exports = router;
+```
+
+### ./src/api/google/people.js
+```
+// server/src/api/google/people.js
+// ============================================================================
+// Proxy People API. Se mancano token → 401 { reason: 'google_consent_required' }.
+// ============================================================================
+'use strict';
+const express = require('express');
+const router = express.Router();
+// ⚠️ path corretto al service:
+const { getPoolFromApp, ensureAuth, peopleClient } = require('../../services/google.service');
+
+router.get('/search', async (req, res) => {
+  const log = req.app.get('logger');
+  const db  = getPoolFromApp(req);
+
+  const q     = String(req.query.q || '').trim();
+  const limit = Math.min(50, Math.max(1, parseInt(req.query.limit || '12', 10)));
+  if (!q) return res.json({ ok: true, items: [] });
+
+  try {
+    const { oAuth2Client } = await ensureAuth(db);
+    const people = peopleClient(oAuth2Client);
+
+    const r = await people.people.searchContacts({
+      query: q,
+      pageSize: limit,
+      readMask: 'names,emailAddresses,phoneNumbers',
+    });
+
+    const items = (r.data.results || []).map(it => {
+      const p = it.person || {};
+      const name  = p.names?.[0] || {};
+      const email = p.emailAddresses?.[0]?.value || null;
+      const phone = p.phoneNumbers?.[0]?.value || null;
+      return {
+        displayName: name.displayName || [name.familyName, name.givenName].filter(Boolean).join(' '),
+        familyName : name.familyName || '',
+        givenName  : name.givenName || '',
+        email, phone
+      };
+    });
+
+    log?.info?.('👥 [Google] search OK', { q, count: items.length });
+    res.json({ ok: true, items });
+  } catch (e) {
+    if (e?.code === 'consent_required' || String(e?.message).includes('google_consent_required')) {
+      return res.status(401).json({ ok: false, reason: 'google_consent_required' });
+    }
+    const msg = String(e?.message || e);
+    log?.error?.('👥❌ [Google] search KO', { q, error: msg });
+    res.status(500).json({ ok: false, reason: 'people_api_error', message: msg });
+  }
+});
+
+module.exports = router;
+```
+
 ### ./src/api/health.js
 ```
 // src/api/health.js
@@ -209,6 +386,56 @@ router.get('/time', async (_req, res) => {
     res.json({ ok: true, app, db });
   } catch (err) {
     res.status(500).json({ ok: false, error: String(err) });
+  }
+});
+
+module.exports = router;
+```
+
+### ./src/api/ingredients.js
+```
+// server/src/api/ingredients.js
+// ============================================================================
+// Ritorna tutti gli ingredienti attivi con eventuale price_extra
+// Output FE: [{ id, name, price_extra }]
+// NOTE: 'db' può essere un pool mysql2 (ritorna [rows, fields])
+//       oppure il tuo wrapper (ritorna rows). Usiamo q() per normalizzare.
+// ============================================================================
+
+const express = require('express');
+const router = express.Router();
+
+// Normalizza il risultato di db.query() (pool mysql2 -> [rows], wrapper -> rows)
+async function q(db, sql, params = []) {
+  const res = await db.query(sql, params);
+  // mysql2/promise -> [rows, fields]
+  if (Array.isArray(res) && Array.isArray(res[0])) return res[0];
+  // wrapper -> rows
+  return res;
+}
+
+router.get('/', async (req, res) => {
+  const log = req.app.get('logger');
+  try {
+    const db = req.app.get('db') || require('../db');
+    if (!db?.query) {
+      log?.error?.('🥦❌ ingredients.list — db pool mancante');
+      return res.status(500).json({ error: 'ingredients_db_missing' });
+    }
+
+    const rows = await q(db, `
+      SELECT id, name, price_extra
+      FROM ingredients
+      WHERE IFNULL(is_active, 1) = 1
+      ORDER BY (sort_order IS NULL), sort_order, name
+    `);
+
+    const out = Array.isArray(rows) ? rows : (rows ? [rows] : []);
+    log?.info?.('🥦 /ingredients OK', { count: out.length });
+    return res.json(out);
+  } catch (e) {
+    log?.error?.('🥦❌ ingredients.list KO', { error: String(e) });
+    return res.status(500).json({ error: 'ingredients_list_failed' });
   }
 });
 
@@ -652,6 +879,73 @@ router.post('/printer/test', async (req, res) => {
 module.exports = router;
 ```
 
+### ./src/api/product_ingredients.js
+```
+// server/src/api/product_ingredients.js
+// ============================================================================
+// Ingredienti collegati al prodotto (BASE). Servono per la sezione "Ingredienti base".
+// Output FE (chips-ready):
+// [{ ingredient_id, name, is_default, is_extra:0, price_extra, allergen:0, sort_order }]
+// NOTE: 'db' può essere un pool mysql2 o il tuo wrapper. Usiamo q() per normalizzare.
+// ============================================================================
+
+const express = require('express');
+const router = express.Router();
+
+// Normalizza il risultato di db.query() (pool mysql2 -> [rows], wrapper -> rows)
+async function q(db, sql, params = []) {
+  const res = await db.query(sql, params);
+  if (Array.isArray(res) && Array.isArray(res[0])) return res[0];
+  return res;
+}
+
+/**
+ * GET /api/product-ingredients/by-product/:productId
+ * - JOIN con ingredients per avere name + price_extra
+ * - is_default normalizzato (COALESCE(...,1))
+ * - ritorno SEMPRE array (anche se vuoto)
+ */
+router.get('/by-product/:productId(\\d+)', async (req, res) => {
+  const log = req.app.get('logger');
+  const db  = req.app.get('db') || require('../db');
+
+  if (!db?.query) {
+    log?.error?.('🧩❌ product-ingredients.by-product — db pool mancante');
+    return res.status(500).json({ error: 'product_ingredients_db_missing' });
+  }
+
+  const productId = Number(req.params.productId || 0);
+  if (!productId) return res.status(400).json({ error: 'invalid_product_id' });
+
+  try {
+    const rows = await q(db, `
+      SELECT
+        pi.ingredient_id,
+        i.name,
+        COALESCE(pi.is_default, 1)     AS is_default,
+        0                               AS is_extra,
+        COALESCE(i.price_extra, 0)     AS price_extra,
+        0                               AS allergen,
+        COALESCE(pi.sort_order, 1000)  AS sort_order
+      FROM product_ingredients pi
+      JOIN ingredients i ON i.id = pi.ingredient_id
+      WHERE pi.product_id = ?
+        AND IFNULL(i.is_active, 1) = 1
+      ORDER BY (pi.sort_order IS NULL), pi.sort_order, i.name
+    `, [productId]);
+
+    const out = Array.isArray(rows) ? rows : (rows ? [rows] : []);
+    log?.info?.('🧩 /product-ingredients/by-product OK', { productId, count: out.length });
+    return res.json(out);
+  } catch (e) {
+    log?.error?.('🧩❌ product-ingredients.by-product KO', { productId, error: String(e) });
+    return res.status(500).json({ error: 'product_ingredients_failed' });
+  }
+});
+
+module.exports = router;
+```
+
 ### ./src/api/products.js
 ```
 'use strict';
@@ -1058,6 +1352,35 @@ router.get('/', async (req, res) => {
 // (Opzionali) POST / PATCH  — li tieni per il futuro
 // router.post('/', ...)
 // router.patch('/:id', ...)
+
+module.exports = router;
+```
+
+### ./src/api/support/support/db-debug.js
+```
+const express = require('express');
+const router = express.Router();
+
+router.get('/db-check', async (req, res) => {
+  const log = req.app.get('logger');
+  const db  = req.app.get('db');
+  try {
+    const [info]    = await db.query('SELECT DATABASE() AS db, @@hostname AS host, @@port AS port');
+    const [ings]    = await db.query('SELECT id,name FROM ingredients WHERE IFNULL(is_active,1)=1 ORDER BY id LIMIT 10');
+    const [pi2]     = await db.query(`
+      SELECT i.name
+      FROM product_ingredients pi
+      JOIN ingredients i ON i.id = pi.ingredient_id
+      WHERE pi.product_id = 2
+      ORDER BY COALESCE(pi.sort_order,1000), i.name
+    `);
+    log?.info?.('🧪 /support/db-check', { db: info[0]?.db, host: info[0]?.host, ing10: ings.length, base2: pi2.length });
+    res.json({ db: info[0], ingredients_first10: ings, base_for_product_2: pi2 });
+  } catch (e) {
+    log?.error?.('🧪❌ /support/db-check KO', { error: String(e) });
+    res.status(500).json({ error: 'db_check_failed' });
+  }
+});
 
 module.exports = router;
 ```
@@ -2078,17 +2401,30 @@ module.exports = function reqResLogger(req, res, next) {
 
 ### ./src/server.js
 ```
+// server/src/server.js
+'use strict';
+
 const path = require('path');
-const fs = require('fs');
+const fs   = require('fs');
 const http = require('http');
 const express = require('express');
-const cors = require('cors');
+const cors    = require('cors');
 
-const env = require('./env');
+const env    = require('./env');
 const logger = require('./logger');
+const dbmod  = require('./db');
+
+// === GOOGLE: nuovi router puliti ============================================
+const googleOauth  = require('./api/google/oauth');
+const googlePeople = require('./api/google/people');
 
 const app = express();
 const server = http.createServer(app);
+
+// Metto db e logger sull'app (usati nelle route)
+const pool = dbmod?.pool || dbmod;
+app.set('db', pool);
+app.set('logger', logger);
 
 app.use(express.json());
 app.use(cors({ origin: true, credentials: true }));
@@ -2104,39 +2440,50 @@ function ensureExists(relPath, friendlyName) {
   return ok;
 }
 
-// Ping
+// Ping rapido
 app.get('/api/ping', (_req, res) => {
   res.set('Cache-Control', 'no-store');
   res.json({ ok: true, time: new Date().toISOString() });
 });
 
-// APIs
+// API core (tue)
 if (ensureExists('api/auth', 'API /api/auth')) app.use('/api/auth', require('./api/auth'));
 if (ensureExists('api/reservations', 'API /api/reservations')) app.use('/api/reservations', require('./api/reservations'));
-else app.use('/api/reservations', (_req, res) => res.status(501).json({ error: 'Reservations API not installed yet' }));
-
 if (ensureExists('api/products', 'API /api/products')) app.use('/api/products', require('./api/products'));
 if (ensureExists('api/orders', 'API /api/orders')) app.use('/api/orders', require('./api/orders'));
 if (ensureExists('api/tables', 'API /api/tables')) app.use('/api/tables', require('./api/tables'));
 if (ensureExists('api/rooms', 'API /api/rooms')) app.use('/api/rooms', require('./api/rooms'));
 if (ensureExists('api/notifications', 'API /api/notifications')) app.use('/api/notifications', require('./api/notifications'));
 
-// Printer routes (se presenti)
-if (ensureExists('api/printer', 'API /api/printer')) app.use('/api', require('./api/printer'));
+// ✅ INGREDIENTI (già presenti)
+if (ensureExists('api/ingredients', 'API /api/ingredients')) app.use('/api/ingredients', require('./api/ingredients'));
+if (ensureExists('api/product_ingredients', 'API /api/product-ingredients')) app.use('/api/product-ingredients', require('./api/product_ingredients'));
+
+/**
+ * 🧹 GOOGLE – MOUNT PULITI
+ * - Disabilito il vecchio router /api/google (cercava user_id e ti rompeva).
+ * - Lascio solo /api/google/oauth e /api/google/people.
+ *
+ *  (Prima l’ordine poteva far prendere il router sbagliato → errore user_id)  // ref: tuo snapshot
+ */
+// ❌ legacy: app.use('/api/google', require('./api/google'));  // DISATTIVATO
+app.use('/api/google/oauth', googleOauth);
+app.use('/api/google/people', googlePeople);
 
 // Health
-app.use('/api/health', require('./api/health'));
+if (ensureExists('api/health', 'API /api/health')) app.use('/api/health', require('./api/health'));
 
-// Socket.IO (facoltativo)
+// (Eventuali) Socket.IO
 const { Server } = require('socket.io');
 const io = new Server(server, { path: '/socket.io', cors: { origin: true, credentials: true } });
-if (ensureExists('sockets/index', 'Sockets entry')) require('./sockets/index')(io);
-else {
+if (ensureExists('sockets/index', 'Sockets entry')) {
+  require('./sockets/index')(io);
+} else {
   logger.warn('⚠️ sockets/index non trovato: i socket non saranno gestiti');
   io.on('connection', (s) => logger.info('🔌 socket connected (fallback)', { id: s.id }));
 }
 
-// Schema check / Migrations (se presenti)
+// (Facoltativi) Schema check / Migrations
 if (ensureExists('db/schema-check', 'Schema checker')) {
   const { runSchemaCheck } = require('./db/schema-check');
   runSchemaCheck().catch(err => logger.error('❌ Schema check failed', { error: String(err) }));
@@ -2149,6 +2496,102 @@ if (ensureExists('db/migrator', 'DB migrator')) {
 }
 
 server.listen(env.PORT, () => logger.info(`🚀 HTTP listening on :${env.PORT}`));
+```
+
+### ./src/services/google.service.js
+```
+// server/src/services/google.service.js
+// ============================================================================
+// OAuth2 Google + People API con salvataggio token in MySQL.
+// Modello owner='default' (niente user_id). Supporta 'postmessage' per Code Flow FE.
+// ============================================================================
+
+const { google } = require('googleapis');
+
+function getPoolFromApp(req) {
+  const fromApp = req?.app?.get('db');
+  if (fromApp) return fromApp;
+  const dbmod = require('../db');
+  return dbmod?.pool || dbmod;
+}
+
+function getOAuthClient() {
+  const {
+    GOOGLE_CLIENT_ID,
+    GOOGLE_CLIENT_SECRET,
+    GOOGLE_REDIRECT_URL, // <- deve essere 'postmessage' per FE-first
+  } = process.env;
+
+  const oAuth2Client = new google.auth.OAuth2(
+    GOOGLE_CLIENT_ID,
+    GOOGLE_CLIENT_SECRET,
+    GOOGLE_REDIRECT_URL
+  );
+  return { oAuth2Client };
+}
+
+async function loadTokens(db) {
+  const [rows] = await db.query(
+    `SELECT * FROM google_tokens WHERE owner='default' LIMIT 1`
+  );
+  return rows?.[0] || null;
+}
+
+async function saveTokens(db, tokens) {
+  const payload = {
+    access_token:  tokens.access_token || null,
+    refresh_token: tokens.refresh_token || null,
+    scope:         tokens.scope || null,
+    token_type:    tokens.token_type || null,
+    expiry_date:   tokens.expiry_date || null,
+  };
+  await db.query(
+    `INSERT INTO google_tokens (owner, access_token, refresh_token, scope, token_type, expiry_date)
+     VALUES ('default',?,?,?,?,?)
+     ON DUPLICATE KEY UPDATE
+       access_token=VALUES(access_token),
+       refresh_token=VALUES(refresh_token),
+       scope=VALUES(scope),
+       token_type=VALUES(token_type),
+       expiry_date=VALUES(expiry_date)`,
+    [payload.access_token, payload.refresh_token, payload.scope, payload.token_type, payload.expiry_date]
+  );
+  return true;
+}
+
+async function ensureAuth(db) {
+  const { oAuth2Client } = getOAuthClient();
+  const tokens = await loadTokens(db);
+  if (!tokens || (!tokens.access_token && !tokens.refresh_token)) {
+    const err = new Error('google_consent_required');
+    err.code = 'consent_required';
+    throw err;
+  }
+  oAuth2Client.setCredentials(tokens);
+  return { oAuth2Client };
+}
+
+async function exchangeCode(db, code) {
+  const { oAuth2Client } = getOAuthClient();
+  // Se GOOGLE_REDIRECT_URL != 'postmessage' qui fallisce!
+  const { tokens } = await oAuth2Client.getToken(code);
+  await saveTokens(db, tokens);
+  return tokens;
+}
+
+function peopleClient(auth) {
+  return google.people({ version: 'v1', auth });
+}
+
+module.exports = {
+  getPoolFromApp,
+  getOAuthClient,
+  loadTokens,          // <-- export per debug route
+  saveTokens,
+  ensureAuth,
+  exchangeCode,
+  peopleClient,
+};
 ```
 
 ### ./src/services/mailer.service.js

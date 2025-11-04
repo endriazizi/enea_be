@@ -1,6 +1,6 @@
 # 📁 Project tree (.)
 
-_Generato: Mon, Nov  3, 2025  1:14:56 AM_
+_Generato: Tue, Nov  4, 2025 10:30:08 PM_
 
 ```text
 .
@@ -19,13 +19,22 @@ readme.md
 src
 src/api
 src/api/auth.js
+src/api/google
+src/api/google/oauth.js
+src/api/google/people.js
+src/api/google.js
 src/api/health.js
+src/api/ingredients.js
 src/api/notifications.js
 src/api/orders.js
 src/api/printer.js
 src/api/products.js
+src/api/product_ingredients.js
 src/api/reservations.js
 src/api/rooms.js
+src/api/support
+src/api/support/support
+src/api/support/support/db-debug.js
 src/api/tables.js
 src/config.js
 src/controllers
@@ -45,6 +54,7 @@ src/middleware/auth.js
 src/middleware/reqres-logger.js
 src/server.js
 src/services
+src/services/google.service.js
 src/services/mailer.service.js
 src/services/notify.service.js
 src/services/order-printer.service.js

@@ -1,88 +1,62 @@
 // server/src/api/product_ingredients.js
 // ============================================================================
-// API — Product Ingredients (by product)
-// Restituisce gli ingredienti collegati ad un prodotto in forma "chips-ready":
-//  - GET /api/product-ingredients/by-product/:productId
-//    → [
-//        { ingredient_id, name, is_default:1, is_extra:0, price_extra:null, allergen:0, sort_order:... },
-//        ...
-//      ]
-// NOTE:
-// - Per non "spaccare" lo schema esistente, qui torniamo SOLO gli ingredienti
-//   BASE (quelli presenti in product_ingredients). Gli "extra" sono opzionali
-//   e potranno essere introdotti in un secondo step (con colonne dedicate).
-// - La tua UI gestisce bene anche solo i "base" (rimovibili); gli extra
-//   resteranno semplicemente vuoti.
+// Ingredienti collegati al prodotto (BASE). Servono per la sezione "Ingredienti base".
+// Output FE (chips-ready):
+// [{ ingredient_id, name, is_default, is_extra:0, price_extra, allergen:0, sort_order }]
+// NOTE: 'db' può essere un pool mysql2 o il tuo wrapper. Usiamo q() per normalizzare.
 // ============================================================================
 
 const express = require('express');
 const router = express.Router();
-const logger = require('../logger');
 
-// 🔌 DB compat: il tuo progetto può esportare `pool` oppure direttamente `query`
-let pool, query;
-try {
-  ({ pool, query } = require('../db'));
-} catch (e) {
-  logger.error('❌ Impossibile caricare ../db (pool/query)', { error: String(e) });
+// Normalizza il risultato di db.query() (pool mysql2 -> [rows], wrapper -> rows)
+async function q(db, sql, params = []) {
+  const res = await db.query(sql, params);
+  if (Array.isArray(res) && Array.isArray(res[0])) return res[0];
+  return res;
 }
 
-// Wrapper di compatibilità: usa `query(sql, params)` se presente, altrimenti `pool.query`
-async function runQuery(sql, params = []) {
-  if (typeof query === 'function') {
-    // mysql2/promise → query(sql, params) → rows
-    return await query(sql, params);
-  }
-  if (pool && typeof pool.query === 'function') {
-    // mysql2/promise → pool.query(sql, params) → [rows, fields]
-    const [rows] = await pool.query(sql, params);
-    return rows;
-  }
-  throw new Error('DB not initialized');
-}
+/**
+ * GET /api/product-ingredients/by-product/:productId
+ * - JOIN con ingredients per avere name + price_extra
+ * - is_default normalizzato (COALESCE(...,1))
+ * - ritorno SEMPRE array (anche se vuoto)
+ */
+router.get('/by-product/:productId(\\d+)', async (req, res) => {
+  const log = req.app.get('logger');
+  const db  = req.app.get('db') || require('../db');
 
-// Ping di servizio (facoltativo)
-router.get('/', (_req, res) => {
-  res.json({ ok: true, hint: 'Use /by-product/:productId' });
-});
-
-// GET /api/product-ingredients/by-product/:productId
-router.get('/by-product/:productId', async (req, res) => {
-  res.set('Cache-Control', 'no-store');
-  const id = Number(req.params.productId || 0);
-
-  if (!id || Number.isNaN(id)) {
-    return res.status(400).json({ error: 'productId non valido' });
+  if (!db?.query) {
+    log?.error?.('🧩❌ product-ingredients.by-product — db pool mancante');
+    return res.status(500).json({ error: 'product_ingredients_db_missing' });
   }
-  if (!query && !(pool && pool.query)) {
-    logger.error('❌ DB non disponibile per /product-ingredients', { productId: id });
-    return res.status(500).json({ error: 'DB non inizializzato' });
-  }
+
+  const productId = Number(req.params.productId || 0);
+  if (!productId) return res.status(400).json({ error: 'invalid_product_id' });
 
   try {
-    // Ingredienti BASE collegati al prodotto (tabella di join product_ingredients)
-    // NB: non usiamo colonne che potrebbero non esistere nel tuo schema attuale.
-    const sql = `
+    const rows = await q(db, `
       SELECT
-        i.id  AS ingredient_id,
-        i.name AS name,
-        1       AS is_default,           -- incluso di base
-        0       AS is_extra,             -- nessun extra in questo step
-        NULL    AS price_extra,          -- opzionale in futuro
-        0       AS allergen,             -- opzionale in futuro (fallback)
-        IFNULL(pi.sort_order, 0) AS sort_order
+        pi.ingredient_id,
+        i.name,
+        COALESCE(pi.is_default, 1)     AS is_default,
+        0                               AS is_extra,
+        COALESCE(i.price_extra, 0)     AS price_extra,
+        0                               AS allergen,
+        COALESCE(pi.sort_order, 1000)  AS sort_order
       FROM product_ingredients pi
       JOIN ingredients i ON i.id = pi.ingredient_id
       WHERE pi.product_id = ?
-      ORDER BY pi.sort_order, i.name
-    `;
-    const rows = await runQuery(sql, [id]);
+        AND IFNULL(i.is_active, 1) = 1
+      ORDER BY (pi.sort_order IS NULL), pi.sort_order, i.name
+    `, [productId]);
 
-    logger.info('🧩 [API] by-product ✓', { productId: id, base_count: rows.length });
-    return res.json(rows || []);
-  } catch (err) {
-    logger.error('🧩❌ [API] by-product query KO', { productId: id, error: String(err) });
-    return res.status(500).json({ error: 'Query error' });
+    const out = Array.isArray(rows) ? rows : (rows ? [rows] : []);
+    log?.info?.('🧩 /product-ingredients/by-product OK', { productId, count: out.length });
+    return res.json(out);
+  } catch (e) {
+    log?.error?.('🧩❌ product-ingredients.by-product KO', { productId, error: String(e) });
+    return res.status(500).json({ error: 'product_ingredients_failed' });
   }
 });
 

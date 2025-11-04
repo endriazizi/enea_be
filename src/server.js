@@ -1,30 +1,31 @@
 // server/src/server.js
-// ============================================================================
-// HTTP server + mount API routes (stile Endri: log verbose, ensureExists, CORS)
-// - Aggiunta: /api/product-ingredients (ingredienti per prodotto, formato a righe)
-// ============================================================================
+'use strict';
 
 const path = require('path');
-const fs = require('fs');
+const fs   = require('fs');
 const http = require('http');
 const express = require('express');
-const cors = require('cors');
+const cors    = require('cors');
 
-const env = require('./env');
+const env    = require('./env');
 const logger = require('./logger');
+const dbmod  = require('./db');
+
+// === GOOGLE: nuovi router puliti ============================================
+const googleOauth  = require('./api/google/oauth');
+const googlePeople = require('./api/google/people');
 
 const app = express();
 const server = http.createServer(app);
 
-// ----------------------------------------------------------------------------
-// Middlewares base
-// ----------------------------------------------------------------------------
+// Metto db e logger sull'app (usati nelle route)
+const pool = dbmod?.pool || dbmod;
+app.set('db', pool);
+app.set('logger', logger);
+
 app.use(express.json());
 app.use(cors({ origin: true, credentials: true }));
 
-// ----------------------------------------------------------------------------
-// Helper: verifica esistenza file/modulo prima del require (log chiaro)
-// ----------------------------------------------------------------------------
 function ensureExists(relPath, friendlyName) {
   const abs = path.join(__dirname, relPath);
   const ok =
@@ -36,58 +37,40 @@ function ensureExists(relPath, friendlyName) {
   return ok;
 }
 
-// ----------------------------------------------------------------------------
-// Ping rapido (no cache)
-// ----------------------------------------------------------------------------
+// Ping rapido
 app.get('/api/ping', (_req, res) => {
   res.set('Cache-Control', 'no-store');
   res.json({ ok: true, time: new Date().toISOString() });
 });
 
-// ----------------------------------------------------------------------------
-// API mounts (ognuna protetta da ensureExists per non far crashare il boot)
-// ----------------------------------------------------------------------------
+// API core (tue)
 if (ensureExists('api/auth', 'API /api/auth')) app.use('/api/auth', require('./api/auth'));
-
-if (ensureExists('api/reservations', 'API /api/reservations')) {
-  app.use('/api/reservations', require('./api/reservations'));
-} else {
-  app.use('/api/reservations', (_req, res) =>
-    res.status(501).json({ error: 'Reservations API not installed yet' })
-  );
-}
-
+if (ensureExists('api/reservations', 'API /api/reservations')) app.use('/api/reservations', require('./api/reservations'));
 if (ensureExists('api/products', 'API /api/products')) app.use('/api/products', require('./api/products'));
 if (ensureExists('api/orders', 'API /api/orders')) app.use('/api/orders', require('./api/orders'));
 if (ensureExists('api/tables', 'API /api/tables')) app.use('/api/tables', require('./api/tables'));
 if (ensureExists('api/rooms', 'API /api/rooms')) app.use('/api/rooms', require('./api/rooms'));
 if (ensureExists('api/notifications', 'API /api/notifications')) app.use('/api/notifications', require('./api/notifications'));
 
-// === NOVITÀ: Product Ingredients ============================================
-// Rotta per ottenere gli ingredienti (righe) collegati ad un prodotto,
-// usata nel Builder per mostrare le chips e calcolare gli extra.
-if (ensureExists('api/product_ingredients', 'API /api/product-ingredients')) {
-  app.use('/api/product-ingredients', require('./api/product_ingredients'));
-} else {
-  logger.warn('⚠️ API /api/product-ingredients non trovata: le chips ingredienti non funzioneranno');
-}
+// ✅ INGREDIENTI (già presenti)
+if (ensureExists('api/ingredients', 'API /api/ingredients')) app.use('/api/ingredients', require('./api/ingredients'));
+if (ensureExists('api/product_ingredients', 'API /api/product-ingredients')) app.use('/api/product-ingredients', require('./api/product_ingredients'));
 
-// ----------------------------------------------------------------------------
-// Printer routes (se presenti)
-// ----------------------------------------------------------------------------
-if (ensureExists('api/printer', 'API /api/printer')) {
-  // Nota: dentro api/printer esporti già un router con /printer/*
-  app.use('/api', require('./api/printer'));
-}
+/**
+ * 🧹 GOOGLE – MOUNT PULITI
+ * - Disabilito il vecchio router /api/google (cercava user_id e ti rompeva).
+ * - Lascio solo /api/google/oauth e /api/google/people.
+ *
+ *  (Prima l’ordine poteva far prendere il router sbagliato → errore user_id)  // ref: tuo snapshot
+ */
+// ❌ legacy: app.use('/api/google', require('./api/google'));  // DISATTIVATO
+app.use('/api/google/oauth', googleOauth);
+app.use('/api/google/people', googlePeople);
 
-// ----------------------------------------------------------------------------
-// Health (sempre disponibile)
-// ----------------------------------------------------------------------------
-app.use('/api/health', require('./api/health'));
+// Health
+if (ensureExists('api/health', 'API /api/health')) app.use('/api/health', require('./api/health'));
 
-// ----------------------------------------------------------------------------
-// Socket.IO (facoltativo) — non blocca l'avvio se mancano i file
-// ----------------------------------------------------------------------------
+// (Eventuali) Socket.IO
 const { Server } = require('socket.io');
 const io = new Server(server, { path: '/socket.io', cors: { origin: true, credentials: true } });
 if (ensureExists('sockets/index', 'Sockets entry')) {
@@ -97,9 +80,7 @@ if (ensureExists('sockets/index', 'Sockets entry')) {
   io.on('connection', (s) => logger.info('🔌 socket connected (fallback)', { id: s.id }));
 }
 
-// ----------------------------------------------------------------------------
-// Schema check / migrations (se presenti)
-// ----------------------------------------------------------------------------
+// (Facoltativi) Schema check / Migrations
 if (ensureExists('db/schema-check', 'Schema checker')) {
   const { runSchemaCheck } = require('./db/schema-check');
   runSchemaCheck().catch(err => logger.error('❌ Schema check failed', { error: String(err) }));
@@ -111,7 +92,4 @@ if (ensureExists('db/migrator', 'DB migrator')) {
     .catch((e) => logger.error('❌ Startup failed (migrations)', { error: String(e) }));
 }
 
-// ----------------------------------------------------------------------------
-// Start
-// ----------------------------------------------------------------------------
 server.listen(env.PORT, () => logger.info(`🚀 HTTP listening on :${env.PORT}`));
