@@ -10,100 +10,185 @@
 'use strict';
 
 const { google } = require('googleapis');
+// ✅ FIX path relativi dal folder /services → vai su ../logger e ../db:
 const logger = require('../logger');
 const { query } = require('../db');
 
 const OWNER = 'default';
 
-function env() {
-  return {
-    clientId:     process.env.GOOGLE_CLIENT_ID,
-    clientSecret: process.env.GOOGLE_CLIENT_SECRET,
-    scopes:       (process.env.GOOGLE_SCOPES || 'https://www.googleapis.com/auth/contacts.readonly'),
-    // callback classico (opzionale, manteniamo per compatibilità)
-    redirectUrl:  process.env.GOOGLE_REDIRECT_URL || null,
-  };
+// Legge le variabili d'ambiente (già gestite nel tuo env loader)
+const {
+  GOOGLE_CLIENT_ID,
+  GOOGLE_CLIENT_SECRET,
+  // Se usi il popup GIS, la redirect è sempre 'postmessage'
+  GOOGLE_SCOPES = 'https://www.googleapis.com/auth/contacts.readonly'
+} = process.env;
+
+// ----------------------------------------------------------------------------
+// OAuth2 client (usa redirect 'postmessage' per il popup GIS)
+// ----------------------------------------------------------------------------
+function getOAuthClient() {
+  const oAuth2Client = new google.auth.OAuth2(
+    GOOGLE_CLIENT_ID,
+    GOOGLE_CLIENT_SECRET
+    // niente redirect_url qui: lo passiamo nella getToken come 'postmessage'
+  );
+  return { oAuth2Client };
 }
 
-function newOAuthClient(redirectUri = null) {
-  const e = env();
-  return new google.auth.OAuth2(
-    e.clientId,
-    e.clientSecret,
-    redirectUri || e.redirectUrl || 'http://localhost:3000/api/google/oauth/callback'
+// ----------------------------------------------------------------------------
+// DB helpers – salvataggio e lettura token (owner='default')
+// Schema atteso: google_tokens(owner PK, access_token, refresh_token, scope, expiry_date BIGINT)
+// ----------------------------------------------------------------------------
+async function saveTokens(tokens = {}) {
+  const { access_token, refresh_token, scope, expiry_date } = tokens;
+  await query(
+    `INSERT INTO google_tokens (owner, access_token, refresh_token, scope, expiry_date)
+     VALUES (?, ?, ?, ?, ?)
+     ON DUPLICATE KEY UPDATE
+       access_token = VALUES(access_token),
+       refresh_token = COALESCE(VALUES(refresh_token), refresh_token),
+       scope = VALUES(scope),
+       expiry_date = VALUES(expiry_date)`,
+    [OWNER, access_token || null, refresh_token || null, scope || null, expiry_date || null]
   );
 }
 
-// Salvataggio atomico token (upsert su owner)
-async function saveTokens(owner, tokens) {
-  const { access_token, refresh_token, scope, token_type, expiry_date } = tokens || {};
-  await query(`
-    CREATE TABLE IF NOT EXISTS google_tokens (
-      owner        VARCHAR(64) PRIMARY KEY,
-      access_token TEXT,
-      refresh_token TEXT,
-      scope        TEXT,
-      token_type   VARCHAR(32),
-      expiry_date  BIGINT
-    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
-  `);
-
-  await query(`
-    INSERT INTO google_tokens (owner, access_token, refresh_token, scope, token_type, expiry_date)
-    VALUES (?, ?, ?, ?, ?, ?)
-    ON DUPLICATE KEY UPDATE
-      access_token = VALUES(access_token),
-      refresh_token = IFNULL(VALUES(refresh_token), refresh_token),
-      scope = VALUES(scope),
-      token_type = VALUES(token_type),
-      expiry_date = VALUES(expiry_date)
-  `, [owner, access_token || null, refresh_token || null, scope || null, token_type || null, expiry_date || null]);
-
-  logger.info('🔐 Google tokens salvati/aggiornati', { owner });
+async function loadTokens() {
+  const [row] = await query(`SELECT access_token, refresh_token, scope, expiry_date FROM google_tokens WHERE owner=?`, [OWNER]);
+  return row || null;
 }
 
-async function loadTokens(owner) {
-  const rows = await query(`SELECT * FROM google_tokens WHERE owner = ? LIMIT 1`, [owner]);
-  return rows?.[0] || null;
+async function revokeForOwner() {
+  await query(`DELETE FROM google_tokens WHERE owner=?`, [OWNER]);
+  logger.info('🧹 [Google] tokens revoked/removed for owner', { owner: OWNER });
 }
 
-// Exchange del "code" lato backend: redirect_uri = 'postmessage'
+// ----------------------------------------------------------------------------
+// Exchange 'code' (GIS popup) → tokens
+// ----------------------------------------------------------------------------
 async function exchangeCode(code) {
-  const oauth2 = newOAuthClient('postmessage'); // GIS popup → SEMPRE 'postmessage'
-  const { tokens } = await oauth2.getToken({ code, redirect_uri: 'postmessage' });
-  await saveTokens(OWNER, tokens);
+  const { oAuth2Client } = getOAuthClient();
+  // NB: con GIS popup serve passare redirect_uri='postmessage'
+  const { tokens } = await oAuth2Client.getToken({ code, redirect_uri: 'postmessage' });
+  // Salvo anche expiry_date (numero ms epoch) se presente
+  await saveTokens(tokens);
+  logger.info('🔐 [Google] Code exchanged, tokens saved', { has_refresh: !!tokens.refresh_token });
   return tokens;
 }
 
-// Garantisce client autenticato o segnala consenso mancante
+// ----------------------------------------------------------------------------
+// ensureAuth(): garantisce un OAuth client con access token valido (refresh se scaduto)
+// Se i token non ci sono → errore 'consent_required' (FE deve aprire popup).
+// ----------------------------------------------------------------------------
 async function ensureAuth() {
-  const tokens = await loadTokens(OWNER);
-  if (!tokens || !tokens.access_token) {
-    const e = new Error('consent_required');
-    e.code = 'consent_required';
-    throw e;
+  const tokens = await loadTokens();
+  if (!tokens?.refresh_token) {
+    const err = new Error('Consent required');
+    err.code = 'consent_required';
+    throw err;
   }
-  const oauth2 = newOAuthClient();
-  oauth2.setCredentials(tokens);
 
-  // refresh se scaduto e ho refresh_token
-  const now = Date.now();
-  const exp = Number(tokens.expiry_date || 0);
-  if (tokens.refresh_token && exp && exp - 60000 < now) {
-    logger.info('♻️ Refresh token Google…');
-    const { credentials } = await oauth2.refreshAccessToken();
-    await saveTokens(OWNER, credentials);
-    oauth2.setCredentials(credentials);
+  const { oAuth2Client } = getOAuthClient();
+  oAuth2Client.setCredentials({
+    access_token: tokens.access_token || undefined,
+    refresh_token: tokens.refresh_token || undefined,
+    scope: tokens.scope || undefined,
+    expiry_date: tokens.expiry_date || undefined
+  });
+
+  // se scaduto/assente → refresh
+  const needsRefresh = !tokens.access_token || !tokens.expiry_date || (Date.now() >= Number(tokens.expiry_date) - 30_000);
+  if (needsRefresh) {
+    try {
+      const newTokens = (await oAuth2Client.refreshAccessToken())?.credentials || {};
+      // persisto i nuovi token
+      await saveTokens(newTokens);
+      oAuth2Client.setCredentials(newTokens);
+      logger.info('🔄 [Google] access token refreshed');
+    } catch (e) {
+      logger.error('🔄❌ [Google] token refresh failed', { error: String(e) });
+      // se fallisce il refresh, meglio richiedere nuovamente consenso
+      const err = new Error('Consent required');
+      err.code = 'consent_required';
+      throw err;
+    }
   }
-  return oauth2;
+
+  return oAuth2Client;
 }
 
+// ----------------------------------------------------------------------------
+// People API client
+// ----------------------------------------------------------------------------
 function peopleClient(auth) {
   return google.people({ version: 'v1', auth });
+}
+
+// ----------------------------------------------------------------------------
+// Operazioni People API (read / write)
+// ----------------------------------------------------------------------------
+async function searchContacts(q, limit = 12) {
+  const auth = await ensureAuth();            // può lanciare consent_required
+  const people = peopleClient(auth);
+  const resp = await people.people.searchContacts({
+    query: q,
+    pageSize: Math.min(50, Math.max(1, limit)),
+    readMask: 'names,emailAddresses,phoneNumbers',
+  });
+
+  const items = (resp.data.results || []).map((r) => {
+    const p = r.person || {};
+    const name  = p.names?.[0];
+    const email = p.emailAddresses?.[0];
+    const phone = p.phoneNumbers?.[0];
+
+    return {
+      displayName: name?.displayName || null,
+      givenName:   name?.givenName || null,
+      familyName:  name?.familyName || null,
+      email:       email?.value || null,
+      phone:       phone?.value || null,
+    };
+  });
+
+  return items;
+}
+
+// Crea un contatto (serve scope write: https://www.googleapis.com/auth/contacts)
+async function createContact({ givenName, familyName, displayName, email, phone }) {
+  const auth = await ensureAuth();            // può lanciare consent_required
+  const people = peopleClient(auth);
+
+  try {
+    const requestBody = {
+      names: [{ givenName: givenName || undefined, familyName: familyName || undefined, displayName: displayName || undefined }],
+      emailAddresses: email ? [{ value: email }] : undefined,
+      phoneNumbers:   phone ? [{ value: phone }] : undefined,
+    };
+
+    const resp = await people.people.createContact({ requestBody });
+    const resourceName = resp.data?.resourceName || null;
+    logger.info('👤 [Google] contact created', { resourceName });
+    return { ok: true, resourceName };
+  } catch (e) {
+    const msg = String(e?.message || e);
+    // se i token non includono scope write → 403 insufficient permissions
+    if (msg.includes('insufficient') || msg.includes('permission')) {
+      const err = new Error('write_scope_required');
+      err.code = 'write_scope_required';
+      throw err;
+    }
+    logger.error('👤❌ [Google] createContact failed', { error: msg });
+    throw e;
+  }
 }
 
 module.exports = {
   exchangeCode,
   ensureAuth,
   peopleClient,
+  searchContacts,
+  createContact,
+  revokeForOwner,
 };
