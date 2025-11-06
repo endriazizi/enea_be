@@ -1,9 +1,20 @@
-// src/api/reservations.js
+// src/services/reservations.service.js
 // ============================================================================
 // Service “Reservations” — query DB per prenotazioni
 // Stile: commenti lunghi, log con emoji, diagnostica chiara.
 // NOTA: questo è un *service module* (esporta funzioni). La tua API/Router
-//       /api/reservations importerà da qui (es. const svc = require('./reservations')).
+//       /api/reservations importerà da qui.
+// - Rimasto tutto come prima (list/getById/create/update/updateStatus/...)
+// - 🆕 Aggiunti:
+//      • checkIn(id, when?)   → set checkin_at (idempotente) + se pending -> accepted
+//      • checkOut(id, when?)  → set checkout_at (idempotente) + dwell_sec
+//      • assignReservationTable(id, table_id) → utility usata dai socket
+// - 🧩 Alias per compat con sockets già in uso:
+//      • createReservation            = create
+//      • listReservations             = list
+//      • updateReservationStatus      = updateStatus
+//      • checkInReservation           = checkIn
+//      • checkOutReservation          = checkOut
 // ============================================================================
 
 'use strict';
@@ -68,7 +79,6 @@ async function ensureUser({ first, last, email, phone }) {
 // - Accettiamo sia verbi (accept/confirm/…) sia stati già finali (accepted/…)
 // - Restituisce la prenotazione aggiornata (per eventuali notify a valle).
 // ============================================================================
-
 const ALLOWED = new Set([
   'accept','accepted',
   'confirm','confirmed',
@@ -100,14 +110,12 @@ function toStatus(action) {
 
 /**
  * updateStatus: aggiorna lo stato in DB in modo atomico.
- * Evita il classico refuso `query(query, ...)` passando **sempre** una STRINGA SQL esplicita.
  */
 async function updateStatus({ id, action, reason = null, user_email = 'system' }) {
   const rid = Number(id);
   if (!rid || !action) throw new Error('missing_id_or_action');
 
   const newStatus = toStatus(action);
-
   const SQL_UPDATE = `
     UPDATE reservations
        SET status     = ?,
@@ -196,7 +204,6 @@ async function create(dto, { user } = {}) {
     endIso ? { startMysql: isoToMysql(startIso), endMysql: isoToMysql(endIso) }
            : computeEndAtFromStart(startIso);
 
-  // room_id, created_by presenti (strada B)
   const res = await query(
     `INSERT INTO reservations
       (customer_first, customer_last, phone, email,
@@ -261,7 +268,6 @@ async function update(id, dto, { user } = {}) {
   if (dto.table_id !== undefined) { fields.push('table_id=?'); pr.push(dto.table_id || null); }
   if (dto.notes    !== undefined) { fields.push('notes=?');    pr.push(trimOrNull(dto.notes)); }
 
-  // updated_by
   fields.push('updated_by=?'); pr.push(trimOrNull(user?.email) || null);
 
   if (!fields.length) {
@@ -278,7 +284,7 @@ async function update(id, dto, { user } = {}) {
   return updated;
 }
 
-// --- Hard delete con policy ---------------------------------------------------
+// --- Hard delete --------------------------------------------------------------
 async function remove(id, { user, reason } = {}) {
   const existing = await getById(id);
   if (!existing) return false;
@@ -327,7 +333,7 @@ async function countByStatus({ from, to }) {
   return out;
 }
 
-// --- Sale / Tavoli (supporto UI) ---------------------------------------------
+// --- Sale / Tavoli ------------------------------------------------------------
 async function listRooms() {
   const sql = `
     SELECT id, name
@@ -353,14 +359,106 @@ async function listTablesByRoom(roomId) {
   return await query(sql, [roomId]);
 }
 
+// --- 🆕 Utility: assegna tavolo ----------------------------------------------
+async function assignReservationTable(id, table_id) {
+  await query(
+    `UPDATE reservations
+        SET table_id = ?, updated_at = CURRENT_TIMESTAMP
+      WHERE id = ? LIMIT 1`, [table_id || null, id]
+  );
+  const r = await getById(id);
+  logger.info('🔀 reservation table assigned', { id, table_id: r.table_id });
+  return r;
+}
+
+// --- 🆕 Dwell helpers ---------------------------------------------------------
+function _computeDwellSec(checkinAt, checkoutAt) {
+  try {
+    const ci = new Date(checkinAt).getTime();
+    const co = new Date(checkoutAt).getTime();
+    if (!isFinite(ci) || !isFinite(co)) return null;
+    return Math.max(0, Math.floor((co - ci) / 1000));
+  } catch { return null; }
+}
+
+// --- 🆕 Check-in / Check-out --------------------------------------------------
+async function checkIn(id, when = null, { user } = {}) {
+  const nowExpr = when ? `?` : `CURRENT_TIMESTAMP`;
+  const params  = when ? [when, id] : [id];
+
+  // set checkin_at solo se NULL → idempotente
+  await query(`
+    UPDATE reservations
+       SET checkin_at = COALESCE(checkin_at, ${nowExpr}),
+           updated_at = CURRENT_TIMESTAMP,
+           updated_by = ?
+     WHERE id = ?
+     LIMIT 1
+  `, [trimOrNull(user?.email) || 'system', ...params]);
+
+  // se pending → accepted (manteniamo compat FE)
+  const after1 = await getById(id);
+  if (after1 && String(after1.status).toLowerCase() === 'pending') {
+    await updateStatus({ id, action: 'accept', user_email: trimOrNull(user?.email) || 'system' });
+  }
+
+  const final = await getById(id);
+  logger.info('✅ RESV check-in', { id, checkin_at: final?.checkin_at, status: final?.status });
+  return final;
+}
+
+async function checkOut(id, when = null, { user } = {}) {
+  const nowExpr = when ? `?` : `CURRENT_TIMESTAMP`;
+  const params  = when ? [when, id] : [id];
+
+  // set checkout_at solo se NULL → idempotente
+  await query(`
+    UPDATE reservations
+       SET checkout_at = COALESCE(checkout_at, ${nowExpr}),
+           updated_at  = CURRENT_TIMESTAMP,
+           updated_by  = ?
+     WHERE id = ?
+     LIMIT 1
+  `, [trimOrNull(user?.email) || 'system', ...params]);
+
+  const r = await getById(id);
+  if (r?.checkin_at && r?.checkout_at) {
+    const dwell = _computeDwellSec(r.checkin_at, r.checkout_at);
+    if (dwell != null) {
+      await query(`UPDATE reservations SET dwell_sec = ? WHERE id = ? LIMIT 1`, [dwell, id]);
+      logger.info('🧮 dwell_sec computed', { id, dwell_sec: dwell });
+    }
+  }
+
+  const final = await getById(id);
+  logger.info('🧹 RESV check-out', { id, checkout_at: final?.checkout_at, dwell_sec: final?.dwell_sec });
+  return final;
+}
+
+// --- Exports ------------------------------------------------------------------
 module.exports = {
+  // esistenti
   list,
   getById,
   create,
   update,
-  updateStatus,     // ⬅️ nuovo export per la rotta PUT /:id/status
+  updateStatus,
   remove,
   countByStatus,
   listRooms,
   listTablesByRoom,
+
+  // utility tavolo
+  assignReservationTable,
+
+  // nuovi metodi
+  checkIn,
+  checkOut,
+
+  // alias compat sockets
+  createReservation       : create,
+  listReservations        : list,
+  updateReservationStatus : updateStatus,
+  checkInReservation      : checkIn,
+  checkOutReservation     : checkOut,
 };

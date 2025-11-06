@@ -1,6 +1,6 @@
 # 🧩 Project code (file ammessi in .)
 
-_Generato: Thu, Nov  6, 2025  3:34:36 PM_
+_Generato: Thu, Nov  6, 2025  9:00:49 PM_
 
 ### ./package.json
 ```
@@ -1018,31 +1018,29 @@ module.exports = router;
 /**
  * Router REST per /api/reservations
  * - Mantiene il tuo stile: commenti lunghi, log emoji, diagnostica chiara.
- * - Usa i tuoi services:
- *   • svc         = ../services/reservations.service        (CRUD + query DB)
- *   • resvActions = ../services/reservations-status.service (state machine + audit)
- *   • mailer, wa, printerSvc                                (notifiche/stampe)
- * - FIX: PUT /:id/status ora accetta { action | status | next } e normalizza.
+ * - FIX: PUT /:id/status già normalizzato (action|status|next → action canonica)
+ * - 🆕 POST /:id/checkin  : salva checkin_at (idempotente) + se pending → accepted
+ * - 🆕 POST /:id/checkout : salva checkout_at + dwell_sec (idempotente)
  */
 
 const express = require('express');
 const router  = express.Router();
 
-const logger = require('../logger');                   // ✅ path corretto
-const env    = require('../env');                      // ✅ path corretto
+const logger = require('../logger');
+const env    = require('../env');
 
-const svc          = require('../services/reservations.service');          // ✅
-const resvActions  = require('../services/reservations-status.service');   // ✅
-const mailer       = require('../services/mailer.service');                // ✅
-const wa           = require('../services/whatsapp.service');              // ✅
-const printerSvc   = require('../services/thermal-printer.service');       // ✅
+const svc          = require('../services/reservations.service');
+const resvActions  = require('../services/reservations-status.service');
+const mailer       = require('../services/mailer.service');
+const wa           = require('../services/whatsapp.service');
+const printerSvc   = require('../services/thermal-printer.service');
 
 // === requireAuth con fallback DEV ============================================
 let requireAuth;
 try {
-  ({ requireAuth } = require('../auth'));
+  ({ requireAuth } = require('../middleware/auth')); // <-- path reale del tuo repo
   if (typeof requireAuth !== 'function') throw new Error('requireAuth non è una funzione');
-  logger.info('🔐 requireAuth caricato da ../auth');
+  logger.info('🔐 requireAuth caricato da middleware/auth');
 } catch {
   logger.warn('⚠️ requireAuth non disponibile. Uso FALLBACK DEV (solo locale).');
   requireAuth = (req, _res, next) => {
@@ -1055,15 +1053,10 @@ try {
 }
 
 // === Helpers =================================================================
-function normalizeStr(v) {
-  return (v ?? '').toString().trim();
-}
+function normalizeStr(v) { return (v ?? '').toString().trim(); }
 function pickAction(body = {}) {
-  // Accetta più alias per compatibilità col FE
   const raw = normalizeStr(body.action ?? body.status ?? body.next).toLowerCase();
   if (!raw) return null;
-
-  // Mappa sinonimi → azioni canoniche attese dalla tua state machine
   const map = {
     confirm: 'confirm', confirmed: 'confirm', accept: 'confirm', accepted: 'confirm', approve: 'confirm', approved: 'confirm',
     cancel: 'cancel',  cancelled: 'cancel',
@@ -1072,7 +1065,7 @@ function pickAction(body = {}) {
     ready: 'ready',
     complete: 'complete', completed: 'complete'
   };
-  return map[raw] || raw; // se già canonica, passa raw
+  return map[raw] || raw;
 }
 
 // ------------------------------ LIST -----------------------------------------
@@ -1094,7 +1087,6 @@ router.get('/', async (req, res) => {
 });
 
 // ------------------------------ SUPPORT --------------------------------------
-// NB: /support/* PRIMA di /:id per evitare matching sul param numerico
 router.get('/support/count-by-status', async (req, res) => {
   try {
     const from = req.query.from || null;
@@ -1153,8 +1145,8 @@ router.put('/:id(\\d+)/status', requireAuth, async (req, res) => {
 
   const action  = pickAction(req.body);
   const reason  = normalizeStr(req.body?.reason) || null;
-  const notify  = (req.body?.notify !== undefined) ? !!req.body.notify : undefined; // se omesso decide env
-  const toEmail = normalizeStr(req.body?.email) || null;     // override destinatario email
+  const notify  = (req.body?.notify !== undefined) ? !!req.body.notify : undefined;
+  const toEmail = normalizeStr(req.body?.email) || null;
   const replyTo = normalizeStr(req.body?.reply_to) || null;
 
   if (!action) {
@@ -1163,7 +1155,6 @@ router.put('/:id(\\d+)/status', requireAuth, async (req, res) => {
   }
 
   try {
-    // (1) state machine + audit  (✅ param names corretti)
     const updated = await resvActions.updateStatus({
       id,
       action,
@@ -1171,31 +1162,23 @@ router.put('/:id(\\d+)/status', requireAuth, async (req, res) => {
       user_email: req.user?.email || 'dev@local'
     });
 
-    // (2) email (se abilitata/env)
+    // email best-effort
     try {
       const mustNotify = (notify === true) || (notify === undefined && !!env.RESV?.notifyAlways);
       if (mustNotify) {
         const dest = toEmail || updated.contact_email || updated.email || null;
         if (dest && mailer?.sendStatusChangeEmail) {
           await mailer.sendStatusChangeEmail({
-            to: dest,
-            reservation: updated,
-            newStatus: updated.status,
-            reason,
-            replyTo
+            to: dest, reservation: updated, newStatus: updated.status, reason, replyTo
           });
           logger.info('📧 status-change mail ✅', { id, to: dest, status: updated.status });
         } else {
-          logger.warn('📧 status-change mail SKIP (no email or mailer)', { id, status: updated.status });
+          logger.warn('📧 status-change mail SKIP', { id, status: updated.status });
         }
-      } else {
-        logger.info('📧 status-change mail SKIPPED by notify/env', { id, notify });
       }
-    } catch (e) {
-      logger.error('📧 status-change mail ❌', { id, error: String(e) });
-    }
+    } catch (e) { logger.error('📧 status-change mail ❌', { id, error: String(e) }); }
 
-    // (3) whatsapp (best-effort)
+    // whatsapp best-effort
     try {
       if (wa?.sendStatusChange) {
         const waRes = await wa.sendStatusChange({
@@ -1205,17 +1188,57 @@ router.put('/:id(\\d+)/status', requireAuth, async (req, res) => {
           reason
         });
         if (waRes?.ok) logger.info('📲 status-change WA ✅', { id, sid: waRes.sid });
-        else logger.warn('📲 status-change WA skipped', { id, why: waRes?.reason || 'unknown' });
       }
-    } catch (e) {
-      logger.error('📲 status-change WA ❌', { id, error: String(e) });
-    }
+    } catch (e) { logger.error('📲 status-change WA ❌', { id, error: String(e) }); }
 
     return res.json({ ok: true, reservation: updated });
   } catch (err) {
     logger.error('❌ [PUT] /api/reservations/:id/status', { id, action, error: String(err) });
     const status = /missing_id_or_action|invalid_action/i.test(String(err)) ? 400 : 500;
     return res.status(status).json({ error: String(err.message || err) });
+  }
+});
+
+// ------------------------------ 🆕 CHECK-IN ----------------------------------
+router.post('/:id(\\d+)/checkin', requireAuth, async (req, res) => {
+  try {
+    const id  = Number(req.params.id);
+    const at  = req.body?.at || null; // opzionale ISO
+    const r   = await svc.checkIn(id, at, { user: req.user });
+
+    // realtime (se il server espone io)
+    try {
+      const io = req.app.get('io');
+      io?.to?.('admins')?.emit?.('reservation-checkin', { id: r.id, checkin_at: r.checkin_at });
+      logger.info('📡 socket emit: reservation-checkin', { id: r.id });
+    } catch {}
+
+    return res.json({ ok: true, reservation: r });
+  } catch (err) {
+    logger.error('❌ [POST] /api/reservations/:id/checkin', { error: String(err) });
+    return res.status(500).json({ error: 'internal_error' });
+  }
+});
+
+// ------------------------------ 🆕 CHECK-OUT ---------------------------------
+router.post('/:id(\\d+)/checkout', requireAuth, async (req, res) => {
+  try {
+    const id  = Number(req.params.id);
+    const at  = req.body?.at || null; // opzionale ISO
+    const r   = await svc.checkOut(id, at, { user: req.user });
+
+    try {
+      const io = req.app.get('io');
+      io?.to?.('admins')?.emit?.('reservation-checkout', {
+        id: r.id, checkout_at: r.checkout_at, dwell_sec: r.dwell_sec
+      });
+      logger.info('📡 socket emit: reservation-checkout', { id: r.id, dwell_sec: r.dwell_sec });
+    } catch {}
+
+    return res.json({ ok: true, reservation: r });
+  } catch (err) {
+    logger.error('❌ [POST] /api/reservations/:id/checkout', { error: String(err) });
+    return res.status(500).json({ error: 'internal_error' });
   }
 });
 
@@ -1231,7 +1254,6 @@ router.delete('/:id(\\d+)', requireAuth, async (req, res) => {
     const existing = await svc.getById(id);
     if (!existing) return res.status(404).json({ error: 'not_found' });
 
-    // policy
     const canAny = allowAnyByEnv || force;
     if (!canAny && String(existing.status || '').toLowerCase() !== 'cancelled') {
       return res.status(409).json({
@@ -1251,18 +1273,14 @@ router.delete('/:id(\\d+)', requireAuth, async (req, res) => {
   }
 });
 
-// ------------------------------ PRINT ----------------------------------------
-// (rimangono invariati: daily/placecards/one — usano printerSvc)
+// ------------------------------ PRINT (invariato) ----------------------------
 router.post('/print/daily', requireAuth, async (req, res) => {
   try {
     const date = normalizeStr(req.body?.date).slice(0,10);
     const status = normalizeStr(req.body?.status || 'all').toLowerCase();
     const rows = await svc.list({ from: date, to: date, status: status === 'all' ? undefined : status });
     const out = await printerSvc.printDailyReservations({
-      date,
-      rows,
-      user: req.user,
-      logoText: process.env.BIZ_NAME || 'LA MIA ATTIVITÀ'
+      date, rows, user: req.user, logoText: process.env.BIZ_NAME || 'LA MIA ATTIVITÀ'
     });
     return res.json({ ok: true, job_id: out.jobId, printed_count: out.printedCount });
   } catch (err) {
@@ -1278,11 +1296,7 @@ router.post('/print/placecards', requireAuth, async (req, res) => {
     const qrBaseUrl = req.body?.qr_base_url || process.env.QR_BASE_URL || '';
     const rows = await svc.list({ from: date, to: date, status });
     const out = await printerSvc.printPlaceCards({
-      date,
-      rows,
-      user: req.user,
-      logoText: process.env.BIZ_NAME || 'LA MIA ATTIVITÀ',
-      qrBaseUrl
+      date, rows, user: req.user, logoText: process.env.BIZ_NAME || 'LA MIA ATTIVITÀ', qrBaseUrl
     });
     return res.json({ ok: true, job_id: out.jobId, printed_count: out.printedCount });
   } catch (err) {
@@ -3702,12 +3716,23 @@ async function remove(id) {
 
 ### ./src/services/reservations.service.js
 ```
-// src/api/reservations.js
+// src/services/reservations.service.js
 // ============================================================================
 // Service “Reservations” — query DB per prenotazioni
 // Stile: commenti lunghi, log con emoji, diagnostica chiara.
 // NOTA: questo è un *service module* (esporta funzioni). La tua API/Router
-//       /api/reservations importerà da qui (es. const svc = require('./reservations')).
+//       /api/reservations importerà da qui.
+// - Rimasto tutto come prima (list/getById/create/update/updateStatus/...)
+// - 🆕 Aggiunti:
+//      • checkIn(id, when?)   → set checkin_at (idempotente) + se pending -> accepted
+//      • checkOut(id, when?)  → set checkout_at (idempotente) + dwell_sec
+//      • assignReservationTable(id, table_id) → utility usata dai socket
+// - 🧩 Alias per compat con sockets già in uso:
+//      • createReservation            = create
+//      • listReservations             = list
+//      • updateReservationStatus      = updateStatus
+//      • checkInReservation           = checkIn
+//      • checkOutReservation          = checkOut
 // ============================================================================
 
 'use strict';
@@ -3772,7 +3797,6 @@ async function ensureUser({ first, last, email, phone }) {
 // - Accettiamo sia verbi (accept/confirm/…) sia stati già finali (accepted/…)
 // - Restituisce la prenotazione aggiornata (per eventuali notify a valle).
 // ============================================================================
-
 const ALLOWED = new Set([
   'accept','accepted',
   'confirm','confirmed',
@@ -3804,14 +3828,12 @@ function toStatus(action) {
 
 /**
  * updateStatus: aggiorna lo stato in DB in modo atomico.
- * Evita il classico refuso `query(query, ...)` passando **sempre** una STRINGA SQL esplicita.
  */
 async function updateStatus({ id, action, reason = null, user_email = 'system' }) {
   const rid = Number(id);
   if (!rid || !action) throw new Error('missing_id_or_action');
 
   const newStatus = toStatus(action);
-
   const SQL_UPDATE = `
     UPDATE reservations
        SET status     = ?,
@@ -3900,7 +3922,6 @@ async function create(dto, { user } = {}) {
     endIso ? { startMysql: isoToMysql(startIso), endMysql: isoToMysql(endIso) }
            : computeEndAtFromStart(startIso);
 
-  // room_id, created_by presenti (strada B)
   const res = await query(
     `INSERT INTO reservations
       (customer_first, customer_last, phone, email,
@@ -3965,7 +3986,6 @@ async function update(id, dto, { user } = {}) {
   if (dto.table_id !== undefined) { fields.push('table_id=?'); pr.push(dto.table_id || null); }
   if (dto.notes    !== undefined) { fields.push('notes=?');    pr.push(trimOrNull(dto.notes)); }
 
-  // updated_by
   fields.push('updated_by=?'); pr.push(trimOrNull(user?.email) || null);
 
   if (!fields.length) {
@@ -3982,7 +4002,7 @@ async function update(id, dto, { user } = {}) {
   return updated;
 }
 
-// --- Hard delete con policy ---------------------------------------------------
+// --- Hard delete --------------------------------------------------------------
 async function remove(id, { user, reason } = {}) {
   const existing = await getById(id);
   if (!existing) return false;
@@ -4031,7 +4051,7 @@ async function countByStatus({ from, to }) {
   return out;
 }
 
-// --- Sale / Tavoli (supporto UI) ---------------------------------------------
+// --- Sale / Tavoli ------------------------------------------------------------
 async function listRooms() {
   const sql = `
     SELECT id, name
@@ -4057,146 +4077,194 @@ async function listTablesByRoom(roomId) {
   return await query(sql, [roomId]);
 }
 
+// --- 🆕 Utility: assegna tavolo ----------------------------------------------
+async function assignReservationTable(id, table_id) {
+  await query(
+    `UPDATE reservations
+        SET table_id = ?, updated_at = CURRENT_TIMESTAMP
+      WHERE id = ? LIMIT 1`, [table_id || null, id]
+  );
+  const r = await getById(id);
+  logger.info('🔀 reservation table assigned', { id, table_id: r.table_id });
+  return r;
+}
+
+// --- 🆕 Dwell helpers ---------------------------------------------------------
+function _computeDwellSec(checkinAt, checkoutAt) {
+  try {
+    const ci = new Date(checkinAt).getTime();
+    const co = new Date(checkoutAt).getTime();
+    if (!isFinite(ci) || !isFinite(co)) return null;
+    return Math.max(0, Math.floor((co - ci) / 1000));
+  } catch { return null; }
+}
+
+// --- 🆕 Check-in / Check-out --------------------------------------------------
+async function checkIn(id, when = null, { user } = {}) {
+  const nowExpr = when ? `?` : `CURRENT_TIMESTAMP`;
+  const params  = when ? [when, id] : [id];
+
+  // set checkin_at solo se NULL → idempotente
+  await query(`
+    UPDATE reservations
+       SET checkin_at = COALESCE(checkin_at, ${nowExpr}),
+           updated_at = CURRENT_TIMESTAMP,
+           updated_by = ?
+     WHERE id = ?
+     LIMIT 1
+  `, [trimOrNull(user?.email) || 'system', ...params]);
+
+  // se pending → accepted (manteniamo compat FE)
+  const after1 = await getById(id);
+  if (after1 && String(after1.status).toLowerCase() === 'pending') {
+    await updateStatus({ id, action: 'accept', user_email: trimOrNull(user?.email) || 'system' });
+  }
+
+  const final = await getById(id);
+  logger.info('✅ RESV check-in', { id, checkin_at: final?.checkin_at, status: final?.status });
+  return final;
+}
+
+async function checkOut(id, when = null, { user } = {}) {
+  const nowExpr = when ? `?` : `CURRENT_TIMESTAMP`;
+  const params  = when ? [when, id] : [id];
+
+  // set checkout_at solo se NULL → idempotente
+  await query(`
+    UPDATE reservations
+       SET checkout_at = COALESCE(checkout_at, ${nowExpr}),
+           updated_at  = CURRENT_TIMESTAMP,
+           updated_by  = ?
+     WHERE id = ?
+     LIMIT 1
+  `, [trimOrNull(user?.email) || 'system', ...params]);
+
+  const r = await getById(id);
+  if (r?.checkin_at && r?.checkout_at) {
+    const dwell = _computeDwellSec(r.checkin_at, r.checkout_at);
+    if (dwell != null) {
+      await query(`UPDATE reservations SET dwell_sec = ? WHERE id = ? LIMIT 1`, [dwell, id]);
+      logger.info('🧮 dwell_sec computed', { id, dwell_sec: dwell });
+    }
+  }
+
+  const final = await getById(id);
+  logger.info('🧹 RESV check-out', { id, checkout_at: final?.checkout_at, dwell_sec: final?.dwell_sec });
+  return final;
+}
+
+// --- Exports ------------------------------------------------------------------
 module.exports = {
+  // esistenti
   list,
   getById,
   create,
   update,
-  updateStatus,     // ⬅️ nuovo export per la rotta PUT /:id/status
+  updateStatus,
   remove,
   countByStatus,
   listRooms,
   listTablesByRoom,
+
+  // utility tavolo
+  assignReservationTable,
+
+  // nuovi metodi
+  checkIn,
+  checkOut,
+
+  // alias compat sockets
+  createReservation       : create,
+  listReservations        : list,
+  updateReservationStatus : updateStatus,
+  checkInReservation      : checkIn,
+  checkOutReservation     : checkOut,
 };
 ```
 
 ### ./src/services/reservations-status.service.js
 ```
-// src/services/reservations-status.service.js
-// ----------------------------------------------------------------------------
-// State machine per le prenotazioni + persistenza su DB.
-// Fix robusta: rileva le colonne realmente presenti in `reservations` e
-// costruisce la UPDATE senza toccare campi mancanti (es. updated_at).
-// - Interfaccia: updateStatus({ id, action, reason?, user_email? })
-// - Mappa azioni "umane" → stato DB (accept → accepted, ecc.)
-// ----------------------------------------------------------------------------
+// 📡 Socket.IO — Prenotazioni tavolo (realtime) + creazione anche da Admin
+// - Mantiene i canali esistenti (reservations-get/new/update-status/assign-table)
+// - 🆕 Aggiunge eventi di comodo per check-in / check-out (opzionali dal client)
+//   • 'reservation-checkin'  { id, at? }   → svc.checkIn()
+//   • 'reservation-checkout' { id, at? }   → svc.checkOut()
+const logger = require('../logger'); // ✅ istanza diretta
+const {
+  createReservation,
+  updateReservationStatus,
+  assignReservationTable,
+  listReservations,
+  checkInReservation,   // 🆕 alias nel service
+  checkOutReservation   // 🆕 alias nel service
+} = require('../services/reservations.service');
 
-'use strict';
+module.exports = (io) => {
+  io.on('connection', (socket) => {
+    logger.info('📡 [RES] SOCKET connected', { id: socket.id });
 
-const { query } = require('../db');      // ✅ path corretto
-const logger    = require('../logger');  // ✅ path corretto
+    socket.on('register-admin', () => socket.join('admins'));
+    socket.on('register-customer', (token) => token && socket.join(`c:${token}`));
 
-// Azioni consentite (accettiamo sia verbi sia stati finali)
-const ALLOWED = new Set([
-  'accept','accepted',
-  'confirm','confirmed',
-  'arrive','arrived',
-  'reject','rejected',
-  'cancel','canceled','cancelled',
-  'prepare','preparing',
-  'ready',
-  'complete','completed',
-  'no_show','noshow'
-]);
+    socket.on('reservations-get', async (filter = {}) => {
+      logger.info('📡 [RES] reservations-get ▶️', { from: socket.id, filter });
+      const rows = await listReservations(filter);
+      socket.emit('reservations-list', rows);
+    });
 
-// Normalizzazione: azione → stato DB
-const MAP = {
-  accept     : 'accepted',
-  confirm    : 'confirmed',
-  arrive     : 'arrived',
-  reject     : 'rejected',
-  cancel     : 'canceled',
-  cancelled  : 'canceled',
-  prepare    : 'preparing',
-  complete   : 'completed',
-  no_show    : 'no_show',
-  noshow     : 'no_show'
-};
+    socket.on('reservation-new', async (dto) => {
+      logger.info('📡 [RES] reservation-new ▶️', { origin: 'customer', body: dto });
+      const r = await createReservation(dto);
+      io.to('admins').emit('reservation-created', r);
+      if (r.client_token) io.to(`c:${r.client_token}`).emit('reservation-created', r);
+      logger.info('📡 [RES] reservation-created ✅ broadcast', { id: r.id });
+    });
 
-function toStatus(action) {
-  const a = String(action || '').trim().toLowerCase();
-  if (!ALLOWED.has(a)) throw new Error('invalid_action');
-  return MAP[a] || a; // se è già "accepted/confirmed/..." lo lasciamo così
-}
+    socket.on('reservation-admin-new', async (dto) => {
+      logger.info('📡 [RES] reservation-admin-new ▶️', { origin: 'admin', body: dto });
+      const r = await createReservation(dto);
+      io.to('admins').emit('reservation-created', r);
+      if (r.client_token) io.to(`c:${r.client_token}`).emit('reservation-created', r);
+      logger.info('📡 [RES] reservation-created ✅ (admin)', { id: r.id });
+    });
 
-// Cache delle colonne per evitare query ripetute su information_schema
-const _colsCache = new Map();
-/** Ritorna Set di colonne presenti per la tabella richiesta */
-async function columnsOf(table = 'reservations') {
-  if (_colsCache.has(table)) return _colsCache.get(table);
-  const rows = await query(
-    `SELECT COLUMN_NAME AS name
-       FROM information_schema.columns
-      WHERE table_schema = DATABASE() AND table_name = ?`,
-    [table]
-  );
-  const set = new Set(rows.map(r => r.name));
-  _colsCache.set(table, set);
-  return set;
-}
+    socket.on('reservation-update-status', async ({ id, status }) => {
+      logger.info('📡 [RES] reservation-update-status ▶️', { id, status });
+      const r = await updateReservationStatus({ id, action: status });
+      io.to('admins').emit('reservation-updated', r);
+      if (r.client_token) io.to(`c:${r.client_token}`).emit('reservation-updated', r);
+    });
 
-/**
- * Aggiorna lo stato in modo atomico e ritorna la prenotazione aggiornata.
- * - Scrive la nota in "status_note" se esiste (fallback su "reason" se presente).
- * - Aggiorna "status_changed_at" solo se la colonna esiste.
- * - Aggiorna "updated_at"/"updated_by" solo se esistono.
- */
-async function updateStatus({ id, action, reason = null, user_email = 'system' }) {
-  const rid = Number(id);
-  if (!rid || !action) throw new Error('missing_id_or_action');
+    socket.on('reservation-assign-table', async ({ id, table_id }) => {
+      logger.info('📡 [RES] reservation-assign-table ▶️', { id, table_id });
+      const r = await assignReservationTable(id, table_id);
+      io.to('admins').emit('reservation-updated', r);
+      if (r.client_token) io.to(`c:${r.client_token}`).emit('reservation-updated', r);
+    });
 
-  const newStatus = toStatus(action);
-  const cols = await columnsOf('reservations');
+    // 🆕 CHECK-IN
+    socket.on('reservation-checkin', async ({ id, at = null }) => {
+      logger.info('📡 [RES] reservation-checkin ▶️', { id, at });
+      const r = await checkInReservation(id, at, { user: { email: 'socket@server' } });
+      io.to('admins').emit('reservation-checkin', { id: r.id, checkin_at: r.checkin_at });
+      io.to('admins').emit('reservation-updated', r);
+      if (r.client_token) io.to(`c:${r.client_token}`).emit('reservation-updated', r);
+    });
 
-  // Costruzione dinamica della UPDATE sicura rispetto allo schema reale
-  const set = [];
-  const params = [];
+    // 🆕 CHECK-OUT
+    socket.on('reservation-checkout', async ({ id, at = null }) => {
+      logger.info('📡 [RES] reservation-checkout ▶️', { id, at });
+      const r = await checkOutReservation(id, at, { user: { email: 'socket@server' } });
+      io.to('admins').emit('reservation-checkout', { id: r.id, checkout_at: r.checkout_at, dwell_sec: r.dwell_sec });
+      io.to('admins').emit('reservation-updated', r);
+      if (r.client_token) io.to(`c:${r.client_token}`).emit('reservation-updated', r);
+    });
 
-  // stato (sempre esiste)
-  set.push('status = ?'); params.push(newStatus);
-
-  // nota stato: preferisci status_note, fallback su reason (se presente)
-  if (reason !== null && reason !== undefined && reason !== '') {
-    if (cols.has('status_note')) {
-      set.push('status_note = COALESCE(?, status_note)'); params.push(reason);
-    } else if (cols.has('reason')) {
-      set.push('reason = COALESCE(?, reason)'); params.push(reason);
-    }
-  }
-
-  // timestamp cambio-stato (se esiste)
-  if (cols.has('status_changed_at')) {
-    set.push('status_changed_at = CURRENT_TIMESTAMP');
-  }
-
-  // audit "updated_*" solo se le colonne esistono
-  if (cols.has('updated_at')) {
-    set.push('updated_at = CURRENT_TIMESTAMP');
-  }
-  if (cols.has('updated_by')) {
-    set.push('updated_by = ?'); params.push(user_email);
-  }
-
-  // Safety: almeno lo status deve essere aggiornato
-  if (!set.length) throw new Error('no_fields_to_update');
-
-  params.push(rid);
-  const sql = `UPDATE reservations SET ${set.join(', ')} WHERE id = ? LIMIT 1`;
-  const res = await query(sql, params);
-
-  if (!res?.affectedRows) throw new Error('reservation_not_found');
-
-  logger.info('🧾 RESV.status ✅ updated', {
-    id: rid,
-    newStatus,
-    usedCols: set.map(s => s.split('=')[0].trim())
+    socket.on('disconnect', (reason) => {
+      logger.info('📡 [RES] SOCKET disconnected', { id: socket.id, reason });
+    });
   });
-
-  const rows = await query('SELECT * FROM reservations WHERE id = ?', [rid]);
-  return rows[0] || null;
-}
-
-module.exports = { updateStatus };
+};
 ```
 
 ### ./src/services/thermal-printer.service.js
