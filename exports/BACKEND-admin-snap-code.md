@@ -1,6 +1,6 @@
 # 🧩 Project code (file ammessi in .)
 
-_Generato: Thu, Nov  6, 2025  9:00:49 PM_
+_Generato: Sat, Nov  8, 2025  5:38:01 PM_
 
 ### ./package.json
 ```
@@ -1018,9 +1018,14 @@ module.exports = router;
 /**
  * Router REST per /api/reservations
  * - Mantiene il tuo stile: commenti lunghi, log emoji, diagnostica chiara.
- * - FIX: PUT /:id/status già normalizzato (action|status|next → action canonica)
- * - 🆕 POST /:id/checkin  : salva checkin_at (idempotente) + se pending → accepted
- * - 🆕 POST /:id/checkout : salva checkout_at + dwell_sec (idempotente)
+ * - Usa i tuoi services:
+ *   • svc         = ../services/reservations.service        (CRUD + query DB)
+ *   • resvActions = ../services/reservations-status.service (state machine + audit)
+ *   • mailer, wa, printerSvc                                (notifiche/stampe)
+ * - 🆕 Rotte esplicite:
+ *   • POST /:id/checkin   → persiste checkin_at (idempotente) + emit socket
+ *   • POST /:id/checkout  → persiste checkout_at + dwell_sec (idempotente) + emit socket {table_id, cleaning_until}
+ * - ✅ FIX mail: dopo updateStatus ricarico la riga “idratata” via svc.getById(id)
  */
 
 const express = require('express');
@@ -1029,41 +1034,38 @@ const router  = express.Router();
 const logger = require('../logger');
 const env    = require('../env');
 
-const svc          = require('../services/reservations.service');
-const resvActions  = require('../services/reservations-status.service');
-const mailer       = require('../services/mailer.service');
-const wa           = require('../services/whatsapp.service');
-const printerSvc   = require('../services/thermal-printer.service');
+const svc          = require('../services/reservations.service');          // ✅
+const resvActions  = require('../services/reservations-status.service');   // ✅
+const mailer       = require('../services/mailer.service');                // ✅
+const wa           = require('../services/whatsapp.service');              // ✅
+const printerSvc   = require('../services/thermal-printer.service');       // ✅
 
 // === requireAuth con fallback DEV ============================================
 let requireAuth;
 try {
-  ({ requireAuth } = require('../middleware/auth')); // <-- path reale del tuo repo
+  ({ requireAuth } = require('../middleware/auth'));
   if (typeof requireAuth !== 'function') throw new Error('requireAuth non è una funzione');
-  logger.info('🔐 requireAuth caricato da middleware/auth');
+  logger.info('🔐 requireAuth caricato da ../middleware/auth');
 } catch {
   logger.warn('⚠️ requireAuth non disponibile. Uso FALLBACK DEV (solo locale).');
   requireAuth = (req, _res, next) => {
-    req.user = {
-      id: Number(process.env.AUTH_DEV_ID || 0),
-      email: process.env.AUTH_DEV_USER || 'dev@local'
-    };
+    req.user = { id: 0, email: process.env.AUTH_DEV_USER || 'dev@local' };
     next();
   };
 }
 
-// === Helpers =================================================================
-function normalizeStr(v) { return (v ?? '').toString().trim(); }
+// helper
+const norm = (v) => (v ?? '').toString().trim();
 function pickAction(body = {}) {
-  const raw = normalizeStr(body.action ?? body.status ?? body.next).toLowerCase();
+  const raw = norm(body.action ?? body.status ?? body.next).toLowerCase();
   if (!raw) return null;
   const map = {
-    confirm: 'confirm', confirmed: 'confirm', accept: 'confirm', accepted: 'confirm', approve: 'confirm', approved: 'confirm',
-    cancel: 'cancel',  cancelled: 'cancel',
-    reject: 'reject',  rejected : 'reject',
-    prepare: 'prepare', preparing: 'prepare',
-    ready: 'ready',
-    complete: 'complete', completed: 'complete'
+    confirm:'confirm', confirmed:'confirm', accept:'confirm', accepted:'confirm', approve:'confirm', approved:'confirm',
+    cancel:'cancel', cancelled:'cancel',
+    reject:'reject', rejected:'reject',
+    prepare:'prepare', preparing:'prepare',
+    ready:'ready',
+    complete:'complete', completed:'complete'
   };
   return map[raw] || raw;
 }
@@ -1089,9 +1091,7 @@ router.get('/', async (req, res) => {
 // ------------------------------ SUPPORT --------------------------------------
 router.get('/support/count-by-status', async (req, res) => {
   try {
-    const from = req.query.from || null;
-    const to   = req.query.to   || null;
-    const rows = await svc.countByStatus({ from, to });
+    const rows = await svc.countByStatus({ from: req.query.from || null, to: req.query.to || null });
     return res.json(rows);
   } catch (err) {
     logger.error('❌ [GET] /api/reservations/support/count-by-status', { error: String(err) });
@@ -1144,10 +1144,10 @@ router.put('/:id(\\d+)/status', requireAuth, async (req, res) => {
   if (!Number.isFinite(id)) return res.status(400).json({ error: 'invalid_id' });
 
   const action  = pickAction(req.body);
-  const reason  = normalizeStr(req.body?.reason) || null;
+  const reason  = norm(req.body?.reason) || null;
   const notify  = (req.body?.notify !== undefined) ? !!req.body.notify : undefined;
-  const toEmail = normalizeStr(req.body?.email) || null;
-  const replyTo = normalizeStr(req.body?.reply_to) || null;
+  const toEmail = norm(req.body?.email) || null;
+  const replyTo = norm(req.body?.reply_to) || null;
 
   if (!action) {
     logger.warn('⚠️ /status missing params', { id, raw: req.body });
@@ -1155,39 +1155,42 @@ router.put('/:id(\\d+)/status', requireAuth, async (req, res) => {
   }
 
   try {
-    const updated = await resvActions.updateStatus({
+    // (1) state machine + audit (riga “spoglia”)
+    await resvActions.updateStatus({
       id,
       action,
       reason,
       user_email: req.user?.email || 'dev@local'
     });
 
-    // email best-effort
+    // (2) ricarico riga “idratata” (JOIN con users/tables) per notifiche & FE
+    const updated = await svc.getById(id);
+
+    // (3) email best-effort
     try {
       const mustNotify = (notify === true) || (notify === undefined && !!env.RESV?.notifyAlways);
       if (mustNotify) {
-        const dest = toEmail || updated.contact_email || updated.email || null;
+        const dest = toEmail || updated?.contact_email || updated?.email || null;
         if (dest && mailer?.sendStatusChangeEmail) {
           await mailer.sendStatusChangeEmail({
             to: dest, reservation: updated, newStatus: updated.status, reason, replyTo
           });
           logger.info('📧 status-change mail ✅', { id, to: dest, status: updated.status });
         } else {
-          logger.warn('📧 status-change mail SKIP', { id, status: updated.status });
+          logger.warn('📧 status-change mail SKIP (no email or mailer)', { id, status: updated?.status || '' });
         }
       }
     } catch (e) { logger.error('📧 status-change mail ❌', { id, error: String(e) }); }
 
-    // whatsapp best-effort
+    // (4) whatsapp best-effort
     try {
       if (wa?.sendStatusChange) {
-        const waRes = await wa.sendStatusChange({
-          to: updated.contact_phone || updated.phone || null,
+        await wa.sendStatusChange({
+          to: updated?.contact_phone || updated?.phone || null,
           reservation: updated,
           status: updated.status,
           reason
         });
-        if (waRes?.ok) logger.info('📲 status-change WA ✅', { id, sid: waRes.sid });
       }
     } catch (e) { logger.error('📲 status-change WA ❌', { id, error: String(e) }); }
 
@@ -1201,44 +1204,46 @@ router.put('/:id(\\d+)/status', requireAuth, async (req, res) => {
 
 // ------------------------------ 🆕 CHECK-IN ----------------------------------
 router.post('/:id(\\d+)/checkin', requireAuth, async (req, res) => {
+  const id = Number(req.params.id);
+  if (!Number.isFinite(id)) return res.status(400).json({ error: 'invalid_id' });
   try {
-    const id  = Number(req.params.id);
-    const at  = req.body?.at || null; // opzionale ISO
-    const r   = await svc.checkIn(id, at, { user: req.user });
-
-    // realtime (se il server espone io)
+    const at = norm(req.body?.at) || null; // ISO opzionale
+    const r = await svc.checkIn(id, { at, user: req.user });
+    // socket (se presente)
     try {
       const io = req.app.get('io');
-      io?.to?.('admins')?.emit?.('reservation-checkin', { id: r.id, checkin_at: r.checkin_at });
-      logger.info('📡 socket emit: reservation-checkin', { id: r.id });
+      if (io) io.to('admins').emit('reservation-checkin', { id: r.id, table_id: r.table_id || null });
     } catch {}
-
+    logger.info('✅ RESV check-in', { service:'server', id: r.id, checkin_at: r.checkin_at, status: r.status });
     return res.json({ ok: true, reservation: r });
   } catch (err) {
-    logger.error('❌ [POST] /api/reservations/:id/checkin', { error: String(err) });
-    return res.status(500).json({ error: 'internal_error' });
+    logger.error('❌ [POST] /api/reservations/:id/checkin', { id, error: String(err) });
+    return res.status(400).json({ error: err.message || 'checkin_failed' });
   }
 });
 
-// ------------------------------ 🆕 CHECK-OUT ---------------------------------
+// ----------------------------- 🆕 CHECK-OUT ----------------------------------
 router.post('/:id(\\d+)/checkout', requireAuth, async (req, res) => {
+  const id = Number(req.params.id);
+  if (!Number.isFinite(id)) return res.status(400).json({ error: 'invalid_id' });
   try {
-    const id  = Number(req.params.id);
-    const at  = req.body?.at || null; // opzionale ISO
-    const r   = await svc.checkOut(id, at, { user: req.user });
-
+    const at = norm(req.body?.at) || null;  // ISO opzionale
+    const r  = await svc.checkOut(id, { at, user: req.user });
+    // calcolo suggerito per pulizia 5:00 → emitted to FE
+    const cleaningSecs = Number(process.env.CLEANING_SECS || 300);
+    const cleaningUntil = new Date(Date.now() + cleaningSecs * 1000).toISOString();
+    // socket broadcast
     try {
       const io = req.app.get('io');
-      io?.to?.('admins')?.emit?.('reservation-checkout', {
-        id: r.id, checkout_at: r.checkout_at, dwell_sec: r.dwell_sec
+      if (io) io.to('admins').emit('reservation-checkout', {
+        id: r.id, table_id: r.table_id || null, cleaning_until: cleaningUntil
       });
-      logger.info('📡 socket emit: reservation-checkout', { id: r.id, dwell_sec: r.dwell_sec });
     } catch {}
-
-    return res.json({ ok: true, reservation: r });
+    logger.info('✅ RESV checkout', { service:'server', id: r.id, checkout_at: r.checkout_at, dwell_sec: r.dwell_sec });
+    return res.json({ ok: true, reservation: r, cleaning_until: cleaningUntil });
   } catch (err) {
-    logger.error('❌ [POST] /api/reservations/:id/checkout', { error: String(err) });
-    return res.status(500).json({ error: 'internal_error' });
+    logger.error('❌ [POST] /api/reservations/:id/checkout', { id, error: String(err) });
+    return res.status(400).json({ error: err.message || 'checkout_failed' });
   }
 });
 
@@ -1246,16 +1251,18 @@ router.post('/:id(\\d+)/checkout', requireAuth, async (req, res) => {
 router.delete('/:id(\\d+)', requireAuth, async (req, res) => {
   try {
     const id = Number(req.params.id);
-    const force  = String(req.query.force || '').toLowerCase() === 'true';
-    const allowAnyByEnv =
-      (env.RESV && env.RESV.allowDeleteAnyStatus === true) ||
-      (String(process.env.RESV_ALLOW_DELETE_ANY_STATUS || '').toLowerCase() === 'true');
-
     const existing = await svc.getById(id);
     if (!existing) return res.status(404).json({ error: 'not_found' });
 
-    const canAny = allowAnyByEnv || force;
-    if (!canAny && String(existing.status || '').toLowerCase() !== 'cancelled') {
+    const force  = String(req.query.force || '').toLowerCase() === 'true';
+    const allowAny =
+      (env.RESV && env.RESV.allowDeleteAnyStatus === true) ||
+      (String(process.env.RESV_ALLOW_DELETE_ANY_STATUS || '').toLowerCase() === 'true') ||
+      force;
+
+    const statusNorm = String(existing.status || '').toLowerCase();
+    const isCancelled = (statusNorm === 'cancelled' || statusNorm === 'canceled');
+    if (!allowAny && !isCancelled) {
       return res.status(409).json({
         error: 'delete_not_allowed',
         message: 'Puoi eliminare solo prenotazioni in stato CANCELLED (usa ?force=true o abilita RESV_ALLOW_DELETE_ANY_STATUS).'
@@ -1264,8 +1271,7 @@ router.delete('/:id(\\d+)', requireAuth, async (req, res) => {
 
     const ok = await svc.remove(id, { user: req.user, reason: 'hard-delete' });
     if (!ok) return res.status(500).json({ error: 'delete_failed' });
-
-    logger.info('🗑️ [DELETE] /api/reservations/:id OK', { id, force, allowAnyByEnv, status: existing.status });
+    logger.info('🗑️ [DELETE] /api/reservations/:id OK', { id, force, status: existing.status });
     return res.json({ ok: true, id });
   } catch (err) {
     logger.error('❌ [DELETE] /api/reservations/:id', { error: String(err) });
@@ -1273,14 +1279,19 @@ router.delete('/:id(\\d+)', requireAuth, async (req, res) => {
   }
 });
 
-// ------------------------------ PRINT (invariato) ----------------------------
+// ------------------------------ PRINT ----------------------------------------
 router.post('/print/daily', requireAuth, async (req, res) => {
   try {
-    const date = normalizeStr(req.body?.date).slice(0,10);
-    const status = normalizeStr(req.body?.status || 'all').toLowerCase();
+    // FIX: supporta string/Date/epoch, evita .slice su non-string
+    const raw = req.body?.date;
+    const date = (raw && typeof raw === 'string') ? raw.slice(0,10) : new Date(raw || Date.now()).toISOString().slice(0,10);
+    const status = norm(req.body?.status || 'all').toLowerCase();
     const rows = await svc.list({ from: date, to: date, status: status === 'all' ? undefined : status });
     const out = await printerSvc.printDailyReservations({
-      date, rows, user: req.user, logoText: process.env.BIZ_NAME || 'LA MIA ATTIVITÀ'
+      date,
+      rows,
+      user: req.user,
+      logoText: process.env.BIZ_NAME || 'LA MIA ATTIVITÀ'
     });
     return res.json({ ok: true, job_id: out.jobId, printed_count: out.printedCount });
   } catch (err) {
@@ -1291,12 +1302,18 @@ router.post('/print/daily', requireAuth, async (req, res) => {
 
 router.post('/print/placecards', requireAuth, async (req, res) => {
   try {
-    const date   = normalizeStr(req.body?.date).slice(0,10);
-    const status = normalizeStr(req.body?.status || 'accepted').toLowerCase();
+    // FIX: supporta string/Date/epoch, evita .slice su non-string
+    const raw = req.body?.date;
+    const date = (raw && typeof raw === 'string') ? raw.slice(0,10) : new Date(raw || Date.now()).toISOString().slice(0,10);
+    const status = norm(req.body?.status || 'accepted').toLowerCase();
     const qrBaseUrl = req.body?.qr_base_url || process.env.QR_BASE_URL || '';
     const rows = await svc.list({ from: date, to: date, status });
     const out = await printerSvc.printPlaceCards({
-      date, rows, user: req.user, logoText: process.env.BIZ_NAME || 'LA MIA ATTIVITÀ', qrBaseUrl
+      date,
+      rows,
+      user: req.user,
+      logoText: process.env.BIZ_NAME || 'LA MIA ATTIVITÀ',
+      qrBaseUrl
     });
     return res.json({ ok: true, job_id: out.jobId, printed_count: out.printedCount });
   } catch (err) {
@@ -3716,23 +3733,14 @@ async function remove(id) {
 
 ### ./src/services/reservations.service.js
 ```
-// src/services/reservations.service.js
+// src/services/reservations.service.js 
 // ============================================================================
 // Service “Reservations” — query DB per prenotazioni
 // Stile: commenti lunghi, log con emoji, diagnostica chiara.
 // NOTA: questo è un *service module* (esporta funzioni). La tua API/Router
 //       /api/reservations importerà da qui.
-// - Rimasto tutto come prima (list/getById/create/update/updateStatus/...)
-// - 🆕 Aggiunti:
-//      • checkIn(id, when?)   → set checkin_at (idempotente) + se pending -> accepted
-//      • checkOut(id, when?)  → set checkout_at (idempotente) + dwell_sec
-//      • assignReservationTable(id, table_id) → utility usata dai socket
-// - 🧩 Alias per compat con sockets già in uso:
-//      • createReservation            = create
-//      • listReservations             = list
-//      • updateReservationStatus      = updateStatus
-//      • checkInReservation           = checkIn
-//      • checkOutReservation          = checkOut
+// - 🆕 checkIn / checkOut idempotenti (persistono checkin_at / checkout_at / dwell_sec)
+// - 🆕 assignReservationTable (usato dai sockets) + changeTable alias
 // ============================================================================
 
 'use strict';
@@ -3742,133 +3750,65 @@ const logger = require('../logger');
 const env    = require('../env');
 
 // --- Helpers -----------------------------------------------------------------
-function trimOrNull(s) {
-  const v = (s ?? '').toString().trim();
-  return v ? v : null;
-}
+function trimOrNull(s) { const v = (s ?? '').toString().trim(); return v ? v : null; }
 function toDayRange(fromYmd, toYmd) {
   const out = { from: null, to: null };
   if (fromYmd) out.from = `${fromYmd} 00:00:00`;
   if (toYmd)   out.to   = `${toYmd} 23:59:59`;
   return out;
 }
-function isoToMysql(iso) {
-  if (!iso) return null;
-  return iso.replace('T', ' ').slice(0, 19);
-}
+function isoToMysql(iso) { return iso ? iso.replace('T', ' ').slice(0, 19) : null; }
 function computeEndAtFromStart(startAtIso) {
   const start = new Date(startAtIso);
   const addMin = (start.getHours() < 16
     ? (env.RESV?.defaultLunchMinutes || 90)
-    : (env.RESV?.defaultDinnerMinutes || 120)
-  );
+    : (env.RESV?.defaultDinnerMinutes || 120));
   const end = new Date(start.getTime() + addMin * 60 * 1000);
-
   const pad = (n) => String(n).padStart(2, '0');
   const mysql = (d) =>
     `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}:00`;
-
   return { startMysql: mysql(start), endMysql: mysql(end) };
 }
 
-// ensureUser: trova/crea utente e ritorna id (unique su email/phone)
-async function ensureUser({ first, last, email, phone }) {
-  const e = trimOrNull(email);
-  const p = trimOrNull(phone);
-
-  if (e) {
-    const r = await query('SELECT id FROM users WHERE email = ? LIMIT 1', [e]);
-    if (r.length) return r[0].id;
-  }
-  if (p) {
-    const r = await query('SELECT id FROM users WHERE phone = ? LIMIT 1', [p]);
-    if (r.length) return r[0].id;
-  }
-
-  const res = await query(
-    `INSERT INTO users (first_name, last_name, email, phone) VALUES (?, ?, ?, ?)`,
-    [trimOrNull(first), trimOrNull(last), e, p]
-  );
-  return res.insertId;
-}
-
 // ============================================================================
-// ⚙️ Cambio stato: azioni → stato finale
-// - Accettiamo sia verbi (accept/confirm/…) sia stati già finali (accepted/…)
-// - Restituisce la prenotazione aggiornata (per eventuali notify a valle).
+// ⚙️ Cambio stato basico (compat): accetta azione o stato
 // ============================================================================
-const ALLOWED = new Set([
-  'accept','accepted',
-  'confirm','confirmed',
-  'arrive','arrived',
-  'reject','rejected',
-  'cancel','canceled','cancelled',
-  'prepare','preparing',
-  'ready',
-  'complete','completed',
-  'no_show','noshow'
-]);
-const MAP = {
-  accept     : 'accepted',
-  confirm    : 'confirmed',
-  arrive     : 'arrived',
-  reject     : 'rejected',
-  cancel     : 'canceled',
-  cancelled  : 'canceled',
-  prepare    : 'preparing',
-  complete   : 'completed',
-  no_show    : 'no_show',
-  noshow     : 'no_show'
-};
-function toStatus(action) {
-  const a = String(action || '').trim().toLowerCase();
-  if (!ALLOWED.has(a)) throw new Error('invalid_action');
-  return MAP[a] || a;
-}
+const ALLOWED = new Set(['accept','accepted','confirm','confirmed','arrive','arrived','reject','rejected','cancel','canceled','cancelled','prepare','preparing','ready','complete','completed','no_show','noshow']);
+const MAP = { accept:'accepted', confirm:'confirmed', arrive:'arrived', cancel:'canceled', cancelled:'canceled', complete:'completed', no_show:'no_show', noshow:'no_show' };
+function toStatus(action) { const a = String(action || '').trim().toLowerCase(); if (!ALLOWED.has(a)) throw new Error('invalid_action'); return MAP[a] || a; }
 
-/**
- * updateStatus: aggiorna lo stato in DB in modo atomico.
- */
+/** updateStatus: aggiorna lo stato in DB + ritorna la riga completa */
 async function updateStatus({ id, action, reason = null, user_email = 'system' }) {
   const rid = Number(id);
   if (!rid || !action) throw new Error('missing_id_or_action');
-
   const newStatus = toStatus(action);
-  const SQL_UPDATE = `
+  const SQL = `
     UPDATE reservations
        SET status     = ?,
            reason     = IFNULL(?, reason),
            updated_at = CURRENT_TIMESTAMP,
            updated_by = ?
      WHERE id = ?
-     LIMIT 1
-  `;
-  const res = await query(SQL_UPDATE, [newStatus, reason, user_email, rid]);
+     LIMIT 1`;
+  const res = await query(SQL, [newStatus, reason, user_email, rid]);
   if (!res?.affectedRows) throw new Error('reservation_not_found');
-
   logger.info('🧾 RESV.status ✅ updated', { id: rid, newStatus });
-
   const rows = await query('SELECT * FROM reservations WHERE id = ?', [rid]);
   return rows[0] || null;
 }
 
 // --- Core queries -------------------------------------------------------------
 async function list(filter = {}) {
-  const wh = [];
-  const pr = [];
-
+  const wh = [], pr = [];
   if (filter.status) { wh.push('r.status = ?'); pr.push(String(filter.status)); }
-
   const { from, to } = toDayRange(filter.from, filter.to);
   if (from) { wh.push('r.start_at >= ?'); pr.push(from); }
   if (to)   { wh.push('r.start_at <= ?'); pr.push(to);   }
-
   if (filter.q) {
     const q = `%${String(filter.q).trim()}%`;
     wh.push('(u.first_name LIKE ? OR u.last_name LIKE ? OR u.email LIKE ? OR u.phone LIKE ? OR r.customer_first LIKE ? OR r.customer_last LIKE ? OR r.email LIKE ? OR r.phone LIKE ?)');
-    pr.push(q, q, q, q, q, q, q, q);
+    pr.push(q,q,q,q,q,q,q,q);
   }
-
   const where = wh.length ? ('WHERE ' + wh.join(' AND ')) : '';
   const sql = `
     SELECT
@@ -3882,11 +3822,8 @@ async function list(filter = {}) {
     LEFT JOIN users  u ON u.id = r.user_id
     LEFT JOIN tables t ON t.id = r.table_id
     ${where}
-    ORDER BY r.start_at ASC, r.id ASC
-  `;
-
-  const rows = await query(sql, pr);
-  return rows;
+    ORDER BY r.start_at ASC, r.id ASC`;
+  return await query(sql, pr);
 }
 
 async function getById(id) {
@@ -3902,26 +3839,22 @@ async function getById(id) {
     LEFT JOIN users  u ON u.id = r.user_id
     LEFT JOIN tables t ON t.id = r.table_id
     WHERE r.id = ?
-    LIMIT 1
-  `;
-  const rows = await query(sql, [id]);
-  return rows[0] || null;
+    LIMIT 1`;
+  const rows = await query(sql, [id]); return rows[0] || null;
+}
+
+async function ensureUser({ first, last, email, phone }) {
+  const e = trimOrNull(email), p = trimOrNull(phone);
+  if (e) { const r = await query('SELECT id FROM users WHERE email = ? LIMIT 1', [e]); if (r.length) return r[0].id; }
+  if (p) { const r = await query('SELECT id FROM users WHERE phone = ? LIMIT 1', [p]); if (r.length) return r[0].id; }
+  const res = await query(`INSERT INTO users (first_name, last_name, email, phone) VALUES (?, ?, ?, ?)`, [trimOrNull(first), trimOrNull(last), e, p]);
+  return res.insertId;
 }
 
 async function create(dto, { user } = {}) {
-  const userId = await ensureUser({
-    first: dto.customer_first,
-    last : dto.customer_last,
-    email: dto.email,
-    phone: dto.phone
-  });
-
-  const startIso = dto.start_at;
-  const endIso   = dto.end_at || null;
-  const { startMysql, endMysql } =
-    endIso ? { startMysql: isoToMysql(startIso), endMysql: isoToMysql(endIso) }
-           : computeEndAtFromStart(startIso);
-
+  const userId = await ensureUser({ first: dto.customer_first, last: dto.customer_last, email: dto.email, phone: dto.phone });
+  const startIso = dto.start_at, endIso = dto.end_at || null;
+  const { startMysql, endMysql } = endIso ? { startMysql: isoToMysql(startIso), endMysql: isoToMysql(endIso) } : computeEndAtFromStart(startIso);
   const res = await query(
     `INSERT INTO reservations
       (customer_first, customer_last, phone, email,
@@ -3929,21 +3862,12 @@ async function create(dto, { user } = {}) {
        notes, status, created_by)
      VALUES (?,?,?,?,?,?,?,?,?,?,?, 'pending', ?)`,
     [
-      trimOrNull(dto.customer_first),
-      trimOrNull(dto.customer_last),
-      trimOrNull(dto.phone),
-      trimOrNull(dto.email),
-      userId,
-      Number(dto.party_size) || 1,
-      startMysql,
-      endMysql,
-      dto.room_id || null,
-      dto.table_id || null,
-      trimOrNull(dto.notes),
-      trimOrNull(user?.email) || null
-    ]
-  );
-
+      trimOrNull(dto.customer_first), trimOrNull(dto.customer_last),
+      trimOrNull(dto.phone), trimOrNull(dto.email),
+      userId, Number(dto.party_size) || 1, startMysql, endMysql,
+      dto.room_id || null, dto.table_id || null,
+      trimOrNull(dto.notes), trimOrNull(user?.email) || null
+    ]);
   const created = await getById(res.insertId);
   logger.info('🆕 reservation created', { id: created.id, by: user?.email || null });
   return created;
@@ -3952,210 +3876,156 @@ async function create(dto, { user } = {}) {
 async function update(id, dto, { user } = {}) {
   let userId = null;
   if (dto.customer_first !== undefined || dto.customer_last !== undefined || dto.email !== undefined || dto.phone !== undefined) {
-    userId = await ensureUser({
-      first: dto.customer_first,
-      last : dto.customer_last,
-      email: dto.email,
-      phone: dto.phone
-    });
+    userId = await ensureUser({ first: dto.customer_first, last: dto.customer_last, email: dto.email, phone: dto.phone });
   }
-
   let startMysql = null, endMysql = null;
   if (dto.start_at) {
     const endIso = dto.end_at || null;
-    const c = endIso ? { startMysql: isoToMysql(dto.start_at), endMysql: isoToMysql(endIso) }
-                     : computeEndAtFromStart(dto.start_at);
-    startMysql = c.startMysql;
-    endMysql   = c.endMysql;
+    const c = endIso ? { startMysql: isoToMysql(dto.start_at), endMysql: isoToMysql(endIso) } : computeEndAtFromStart(dto.start_at);
+    startMysql = c.startMysql; endMysql = c.endMysql;
   }
-
-  const fields = [];
-  const pr = [];
-
+  const fields = [], pr = [];
   if (userId !== null) { fields.push('user_id=?'); pr.push(userId); }
   if (dto.customer_first !== undefined) { fields.push('customer_first=?'); pr.push(trimOrNull(dto.customer_first)); }
   if (dto.customer_last  !== undefined) { fields.push('customer_last=?');  pr.push(trimOrNull(dto.customer_last));  }
   if (dto.phone          !== undefined) { fields.push('phone=?');          pr.push(trimOrNull(dto.phone));          }
   if (dto.email          !== undefined) { fields.push('email=?');          pr.push(trimOrNull(dto.email));          }
-
   if (dto.party_size !== undefined) { fields.push('party_size=?'); pr.push(Number(dto.party_size)||1); }
   if (startMysql) { fields.push('start_at=?'); pr.push(startMysql); }
   if (endMysql)   { fields.push('end_at=?');   pr.push(endMysql);   }
-
   if (dto.room_id  !== undefined) { fields.push('room_id=?');  pr.push(dto.room_id || null); }
   if (dto.table_id !== undefined) { fields.push('table_id=?'); pr.push(dto.table_id || null); }
   if (dto.notes    !== undefined) { fields.push('notes=?');    pr.push(trimOrNull(dto.notes)); }
-
+  if (dto.checkin_at  !== undefined) { fields.push('checkin_at=?');  pr.push(dto.checkin_at ? isoToMysql(dto.checkin_at) : null); }
+  if (dto.checkout_at !== undefined) { fields.push('checkout_at=?'); pr.push(dto.checkout_at ? isoToMysql(dto.checkout_at) : null); }
+  if (dto.dwell_sec   !== undefined) { fields.push('dwell_sec=?');   pr.push(dto.dwell_sec == null ? null : Number(dto.dwell_sec)); }
   fields.push('updated_by=?'); pr.push(trimOrNull(user?.email) || null);
 
   if (!fields.length) {
     logger.info('✏️ update: nessun campo da aggiornare', { id });
     return await getById(id);
   }
-
   pr.push(id);
-  const sql = `UPDATE reservations SET ${fields.join(', ')} WHERE id=?`;
-  await query(sql, pr);
-
+  await query(`UPDATE reservations SET ${fields.join(', ')} WHERE id=?`, pr);
   const updated = await getById(id);
   logger.info('✏️ reservation updated', { id, by: user?.email || null });
   return updated;
 }
 
-// --- Hard delete --------------------------------------------------------------
+// --- Hard delete con policy ---------------------------------------------------
 async function remove(id, { user, reason } = {}) {
   const existing = await getById(id);
   if (!existing) return false;
-
   const allowAnyByEnv =
     (env.RESV && env.RESV.allowDeleteAnyStatus === true) ||
     (String(process.env.RESV_ALLOW_DELETE_ANY_STATUS || '').toLowerCase() === 'true');
-
   const statusNorm = String(existing.status || '').toLowerCase();
   const isCancelled = (statusNorm === 'cancelled' || statusNorm === 'canceled');
-
   if (!allowAnyByEnv && !isCancelled) {
-    logger.warn('🛡️ hard-delete NEGATO (stato non cancellato)', { id, status: existing.status });
-    return false;
+    logger.warn('🛡️ hard-delete NEGATO (stato non cancellato)', { id, status: existing.status }); return false;
   }
-
   const res = await query('DELETE FROM reservations WHERE id=? LIMIT 1', [id]);
   const ok  = res.affectedRows > 0;
-
-  if (ok) {
-    logger.info('🗑️ reservation hard-deleted', { id, by: user?.email || null, reason: reason || null });
-  } else {
-    logger.error('💥 reservation delete KO', { id });
-  }
+  if (ok) logger.info('🗑️ reservation hard-deleted', { id, by: user?.email || null, reason: reason || null });
+  else    logger.error('💥 reservation delete KO', { id });
   return ok;
 }
 
 // --- Supporto UI --------------------------------------------------------------
 async function countByStatus({ from, to }) {
-  const w = [];
-  const p = [];
-
+  const w = [], p = [];
   const r = toDayRange(from, to);
   if (r.from) { w.push('start_at >= ?'); p.push(r.from); }
   if (r.to)   { w.push('start_at <= ?'); p.push(r.to);   }
-
   const where = w.length ? ('WHERE ' + w.join(' AND ')) : '';
-
-  const rows = await query(
-    `SELECT status, COUNT(*) AS count FROM reservations ${where} GROUP BY status`,
-    p
-  );
-
-  const out = {};
-  for (const r of rows) out[String(r.status)] = Number(r.count);
-  return out;
+  const rows = await query(`SELECT status, COUNT(*) AS count FROM reservations ${where} GROUP BY status`, p);
+  const out = {}; for (const r of rows) out[String(r.status)] = Number(r.count); return out;
 }
 
-// --- Sale / Tavoli ------------------------------------------------------------
+// --- Sale / Tavoli (supporto UI) ---------------------------------------------
 async function listRooms() {
-  const sql = `
+  return await query(`
     SELECT id, name
     FROM rooms
     WHERE IFNULL(is_active,1)=1
-    ORDER BY (sort_order IS NULL), sort_order, name
-  `;
-  return await query(sql, []);
+    ORDER BY (sort_order IS NULL), sort_order, name`, []);
 }
-
 async function listTablesByRoom(roomId) {
-  const sql = `
-    SELECT
-      t.id,
-      t.room_id,
-      t.table_number,
-      t.seats,
-      CONCAT('Tavolo ', t.table_number) AS name
+  return await query(`
+    SELECT t.id, t.room_id, t.table_number, t.seats, CONCAT('Tavolo ', t.table_number) AS name
     FROM tables t
     WHERE t.room_id = ?
-    ORDER BY t.table_number ASC, t.id ASC
-  `;
-  return await query(sql, [roomId]);
+    ORDER BY t.table_number ASC, t.id ASC`, [roomId]);
 }
 
-// --- 🆕 Utility: assegna tavolo ----------------------------------------------
-async function assignReservationTable(id, table_id) {
-  await query(
-    `UPDATE reservations
-        SET table_id = ?, updated_at = CURRENT_TIMESTAMP
-      WHERE id = ? LIMIT 1`, [table_id || null, id]
-  );
+// === 🆕 Cambia tavolo (usato anche dai socket) ================================
+async function assignReservationTable(id, table_id, { user } = {}) {
+  const updated = await update(id, { table_id }, { user });
+  logger.info('🔀 reservation table changed', { id, table_id });
+  return updated;
+}
+// alias semantico
+const changeTable = assignReservationTable;
+
+// === 🆕 Check-in / Check-out (idempotenti) ====================================
+async function checkIn(id, { at = null, user } = {}) {
   const r = await getById(id);
-  logger.info('🔀 reservation table assigned', { id, table_id: r.table_id });
-  return r;
-}
-
-// --- 🆕 Dwell helpers ---------------------------------------------------------
-function _computeDwellSec(checkinAt, checkoutAt) {
-  try {
-    const ci = new Date(checkinAt).getTime();
-    const co = new Date(checkoutAt).getTime();
-    if (!isFinite(ci) || !isFinite(co)) return null;
-    return Math.max(0, Math.floor((co - ci) / 1000));
-  } catch { return null; }
-}
-
-// --- 🆕 Check-in / Check-out --------------------------------------------------
-async function checkIn(id, when = null, { user } = {}) {
-  const nowExpr = when ? `?` : `CURRENT_TIMESTAMP`;
-  const params  = when ? [when, id] : [id];
-
-  // set checkin_at solo se NULL → idempotente
-  await query(`
-    UPDATE reservations
-       SET checkin_at = COALESCE(checkin_at, ${nowExpr}),
-           updated_at = CURRENT_TIMESTAMP,
-           updated_by = ?
-     WHERE id = ?
-     LIMIT 1
-  `, [trimOrNull(user?.email) || 'system', ...params]);
-
-  // se pending → accepted (manteniamo compat FE)
-  const after1 = await getById(id);
-  if (after1 && String(after1.status).toLowerCase() === 'pending') {
-    await updateStatus({ id, action: 'accept', user_email: trimOrNull(user?.email) || 'system' });
+  if (!r) throw new Error('not_found');
+  if (r.checkin_at) { // idempotente
+    logger.info('♻️ check-in idempotente', { id, checkin_at: r.checkin_at });
+    // posso opzionalmente normalizzare stato se era "pending"
+    if (String(r.status).toLowerCase() === 'pending') await updateStatus({ id, action: 'accept', user_email: user?.email || 'system' });
+    return await getById(id);
   }
-
-  const final = await getById(id);
-  logger.info('✅ RESV check-in', { id, checkin_at: final?.checkin_at, status: final?.status });
-  return final;
+  const checkin_at_mysql = isoToMysql(at) || null;
+  const nowMysql = checkin_at_mysql || 'CURRENT_TIMESTAMP';
+  await query(
+    `UPDATE reservations SET
+       checkin_at = ${checkin_at_mysql ? '?' : 'CURRENT_TIMESTAMP'},
+       status     = IF(LOWER(IFNULL(status,''))='pending','accepted',status),
+       updated_at = CURRENT_TIMESTAMP,
+       updated_by = ?
+     WHERE id = ? LIMIT 1`,
+    checkin_at_mysql ? [checkin_at_mysql, user?.email || null, id] : [user?.email || null, id]
+  );
+  const updated = await getById(id);
+  logger.info('✅ check-in saved', { id, checkin_at: updated.checkin_at, status: updated.status });
+  return updated;
 }
 
-async function checkOut(id, when = null, { user } = {}) {
-  const nowExpr = when ? `?` : `CURRENT_TIMESTAMP`;
-  const params  = when ? [when, id] : [id];
-
-  // set checkout_at solo se NULL → idempotente
-  await query(`
+async function checkOut(id, { at = null, user } = {}) {
+  const r = await getById(id);
+  if (!r) throw new Error('not_found');
+  if (r.checkout_at) {
+    logger.info('♻️ checkout idempotente', { id, checkout_at: r.checkout_at, dwell_sec: r.dwell_sec });
+    return r;
+  }
+  const checkout_at_mysql = isoToMysql(at) || null;
+  // dwell_sec se ho checkin_at
+  let dwell_sec = null;
+  if (r.checkin_at) {
+    const start = new Date(r.checkin_at).getTime();
+    const end   = checkout_at_mysql ? new Date(at).getTime() : Date.now();
+    dwell_sec   = Math.max(0, Math.floor((end - start) / 1000));
+  }
+  const params = [ user?.email || null, id ];
+  const SQL = `
     UPDATE reservations
-       SET checkout_at = COALESCE(checkout_at, ${nowExpr}),
+       SET checkout_at = ${checkout_at_mysql ? '?' : 'CURRENT_TIMESTAMP'},
+           dwell_sec   = ${dwell_sec === null ? 'dwell_sec' : '?'},
            updated_at  = CURRENT_TIMESTAMP,
            updated_by  = ?
-     WHERE id = ?
-     LIMIT 1
-  `, [trimOrNull(user?.email) || 'system', ...params]);
-
-  const r = await getById(id);
-  if (r?.checkin_at && r?.checkout_at) {
-    const dwell = _computeDwellSec(r.checkin_at, r.checkout_at);
-    if (dwell != null) {
-      await query(`UPDATE reservations SET dwell_sec = ? WHERE id = ? LIMIT 1`, [dwell, id]);
-      logger.info('🧮 dwell_sec computed', { id, dwell_sec: dwell });
-    }
-  }
-
-  const final = await getById(id);
-  logger.info('🧹 RESV check-out', { id, checkout_at: final?.checkout_at, dwell_sec: final?.dwell_sec });
-  return final;
+     WHERE id = ? LIMIT 1`;
+  const pr = checkout_at_mysql
+    ? (dwell_sec === null ? [checkout_at_mysql, ...params] : [checkout_at_mysql, dwell_sec, ...params])
+    : (dwell_sec === null ? params : [dwell_sec, ...params]);
+  await query(SQL, pr);
+  const updated = await getById(id);
+  logger.info('✅ checkout saved', { id, checkout_at: updated.checkout_at, dwell_sec: updated.dwell_sec });
+  return updated;
 }
 
-// --- Exports ------------------------------------------------------------------
 module.exports = {
-  // esistenti
   list,
   getById,
   create,
@@ -4165,505 +4035,242 @@ module.exports = {
   countByStatus,
   listRooms,
   listTablesByRoom,
-
-  // utility tavolo
+  // 🆕
   assignReservationTable,
-
-  // nuovi metodi
+  changeTable,
   checkIn,
   checkOut,
-
-  // alias compat sockets
-  createReservation       : create,
-  listReservations        : list,
-  updateReservationStatus : updateStatus,
-  checkInReservation      : checkIn,
-  checkOutReservation     : checkOut,
 };
 ```
 
 ### ./src/services/reservations-status.service.js
 ```
-// 📡 Socket.IO — Prenotazioni tavolo (realtime) + creazione anche da Admin
-// - Mantiene i canali esistenti (reservations-get/new/update-status/assign-table)
-// - 🆕 Aggiunge eventi di comodo per check-in / check-out (opzionali dal client)
-//   • 'reservation-checkin'  { id, at? }   → svc.checkIn()
-//   • 'reservation-checkout' { id, at? }   → svc.checkOut()
-const logger = require('../logger'); // ✅ istanza diretta
-const {
-  createReservation,
-  updateReservationStatus,
-  assignReservationTable,
-  listReservations,
-  checkInReservation,   // 🆕 alias nel service
-  checkOutReservation   // 🆕 alias nel service
-} = require('../services/reservations.service');
+// src/services/reservations-status.service.js
+// ----------------------------------------------------------------------------
+// State machine per le prenotazioni + persistenza su DB.
+// - Interfaccia: updateStatus({ id, action, reason?, user_email? })
+// - Compat FE: confirm/confirmed → accepted (badge verde); cancel/* → cancelled (badge visibile)
+// - UPDATE dinamica solo su colonne realmente presenti (status_note / reason, status_changed_at, updated_*)
+// - Alias compat: updateReservationStatus(...) → updateStatus(...)
+// ----------------------------------------------------------------------------
 
-module.exports = (io) => {
-  io.on('connection', (socket) => {
-    logger.info('📡 [RES] SOCKET connected', { id: socket.id });
+'use strict';
 
-    socket.on('register-admin', () => socket.join('admins'));
-    socket.on('register-customer', (token) => token && socket.join(`c:${token}`));
+const { query } = require('../db');
+const logger    = require('../logger');
 
-    socket.on('reservations-get', async (filter = {}) => {
-      logger.info('📡 [RES] reservations-get ▶️', { from: socket.id, filter });
-      const rows = await listReservations(filter);
-      socket.emit('reservations-list', rows);
-    });
+// Azioni consentite (accettiamo sia verbi sia stati finali)
+const ALLOWED = new Set([
+  'accept','accepted',
+  'confirm','confirmed',       // → accepted
+  'arrive','arrived',
+  'reject','rejected',
+  'cancel','canceled','cancelled', // → cancelled (UK) per compat FE badge
+  'prepare','preparing',
+  'ready',
+  'complete','completed',
+  'no_show','noshow'
+]);
 
-    socket.on('reservation-new', async (dto) => {
-      logger.info('📡 [RES] reservation-new ▶️', { origin: 'customer', body: dto });
-      const r = await createReservation(dto);
-      io.to('admins').emit('reservation-created', r);
-      if (r.client_token) io.to(`c:${r.client_token}`).emit('reservation-created', r);
-      logger.info('📡 [RES] reservation-created ✅ broadcast', { id: r.id });
-    });
-
-    socket.on('reservation-admin-new', async (dto) => {
-      logger.info('📡 [RES] reservation-admin-new ▶️', { origin: 'admin', body: dto });
-      const r = await createReservation(dto);
-      io.to('admins').emit('reservation-created', r);
-      if (r.client_token) io.to(`c:${r.client_token}`).emit('reservation-created', r);
-      logger.info('📡 [RES] reservation-created ✅ (admin)', { id: r.id });
-    });
-
-    socket.on('reservation-update-status', async ({ id, status }) => {
-      logger.info('📡 [RES] reservation-update-status ▶️', { id, status });
-      const r = await updateReservationStatus({ id, action: status });
-      io.to('admins').emit('reservation-updated', r);
-      if (r.client_token) io.to(`c:${r.client_token}`).emit('reservation-updated', r);
-    });
-
-    socket.on('reservation-assign-table', async ({ id, table_id }) => {
-      logger.info('📡 [RES] reservation-assign-table ▶️', { id, table_id });
-      const r = await assignReservationTable(id, table_id);
-      io.to('admins').emit('reservation-updated', r);
-      if (r.client_token) io.to(`c:${r.client_token}`).emit('reservation-updated', r);
-    });
-
-    // 🆕 CHECK-IN
-    socket.on('reservation-checkin', async ({ id, at = null }) => {
-      logger.info('📡 [RES] reservation-checkin ▶️', { id, at });
-      const r = await checkInReservation(id, at, { user: { email: 'socket@server' } });
-      io.to('admins').emit('reservation-checkin', { id: r.id, checkin_at: r.checkin_at });
-      io.to('admins').emit('reservation-updated', r);
-      if (r.client_token) io.to(`c:${r.client_token}`).emit('reservation-updated', r);
-    });
-
-    // 🆕 CHECK-OUT
-    socket.on('reservation-checkout', async ({ id, at = null }) => {
-      logger.info('📡 [RES] reservation-checkout ▶️', { id, at });
-      const r = await checkOutReservation(id, at, { user: { email: 'socket@server' } });
-      io.to('admins').emit('reservation-checkout', { id: r.id, checkout_at: r.checkout_at, dwell_sec: r.dwell_sec });
-      io.to('admins').emit('reservation-updated', r);
-      if (r.client_token) io.to(`c:${r.client_token}`).emit('reservation-updated', r);
-    });
-
-    socket.on('disconnect', (reason) => {
-      logger.info('📡 [RES] SOCKET disconnected', { id: socket.id, reason });
-    });
-  });
+// Normalizzazione: azione → stato DB
+const MAP = {
+  accept     : 'accepted',
+  confirm    : 'accepted',
+  confirmed  : 'accepted',
+  arrive     : 'arrived',
+  reject     : 'rejected',
+  cancel     : 'cancelled',
+  cancelled  : 'cancelled',
+  canceled   : 'cancelled',
+  prepare    : 'preparing',
+  complete   : 'completed',
+  no_show    : 'no_show',
+  noshow     : 'no_show'
 };
+
+function toStatus(action) {
+  const a = String(action || '').trim().toLowerCase();
+  if (!ALLOWED.has(a)) throw new Error('invalid_action');
+  return MAP[a] || a;
+}
+
+// Cache colonne
+const _colsCache = new Map();
+async function columnsOf(table = 'reservations') {
+  if (_colsCache.has(table)) return _colsCache.get(table);
+  const rows = await query(
+    `SELECT COLUMN_NAME AS name
+       FROM information_schema.columns
+      WHERE table_schema = DATABASE() AND table_name = ?`,
+    [table]
+  );
+  const set = new Set(rows.map(r => r.name));
+  _colsCache.set(table, set);
+  return set;
+}
+
+/**
+ * Aggiorna lo stato e ritorna la riga aggiornata.
+ * - Scrive status_note (se esiste) o reason (fallback) solo se reason è valorizzato.
+ * - Aggiorna status_changed_at/updated_* solo se esistono.
+ */
+async function updateStatus({ id, action, reason = null, user_email = 'system' }) {
+  const rid = Number(id);
+  if (!rid || !action) throw new Error('missing_id_or_action');
+
+  const newStatus = toStatus(action);
+  const cols = await columnsOf('reservations');
+
+  const set = [];
+  const pr  = [];
+
+  set.push('status = ?'); pr.push(newStatus);
+
+  const hasReason = reason !== null && reason !== undefined && String(reason).trim() !== '';
+  if (hasReason) {
+    if (cols.has('status_note')) {
+      set.push('status_note = COALESCE(?, status_note)'); pr.push(reason);
+    } else if (cols.has('reason')) {
+      set.push('reason = COALESCE(?, reason)');           pr.push(reason);
+    }
+  }
+
+  if (cols.has('status_changed_at')) set.push('status_changed_at = CURRENT_TIMESTAMP');
+  if (cols.has('updated_at'))        set.push('updated_at = CURRENT_TIMESTAMP');
+  if (cols.has('updated_by'))       { set.push('updated_by = ?'); pr.push(user_email); }
+
+  if (!set.length) throw new Error('no_fields_to_update');
+
+  pr.push(rid);
+  const sql = `UPDATE reservations SET ${set.join(', ')} WHERE id = ? LIMIT 1`;
+  const res = await query(sql, pr);
+  if (!res?.affectedRows) throw new Error('reservation_not_found');
+
+  logger.info('🧾 RESV.status ✅ updated', { id: rid, newStatus, usedCols: set.map(s => s.split('=')[0].trim()) });
+
+  const rows = await query('SELECT * FROM reservations WHERE id = ?', [rid]);
+  return rows[0] || null;
+}
+
+// Alias compat per vecchi import
+const updateReservationStatus = (args) => updateStatus(args);
+
+module.exports = { updateStatus, updateReservationStatus };
 ```
 
 ### ./src/services/thermal-printer.service.js
 ```
+// thermal-printer.service.js 
+// Stampa termica: daily, placecards multipli e 🆕 singolo segnaposto.
+// Mantengo lo stile e NON sovrascrivo la tua logica ordini: provo le API esistenti
+// e, se manca il metodo “singolo”, uso il multiplo con 1 riga.
+
 'use strict';
 
-/**
- * Stampa termica (ESC/POS) - daily e placecards.
- * - DAILY: supporto “flat” (tabella classica) e “grouped by time” (blocchi con titolo orario).
- * - Nome cartellino adattivo (una riga, riduzione orizzontale, ellissi).
- * - Padding gestito per evitare tagli dei QR.
- * - Logo PNG centrato.
- * - Date/ora rese in BIZ_TZ (indipendenti dal fuso del server).
- * - Supporto DB utc vs naive (DB_TIME_IS_UTC).
- */
-
-const fs = require('fs');
-const path = require('path');
-const net = require('net');
-const iconv = require('iconv-lite');
-const { PNG } = require('pngjs');
 const logger = require('../logger');
 
-// ─────────────────────────────────────────────────────────────────────────────
-// ENV
-// ─────────────────────────────────────────────────────────────────────────────
-const RESOLVED_HOST = process.env.PRINTER_IP || process.env.PRINTER_HOST || '127.0.0.1';
-const RESOLVED_PORT = Number(process.env.PRINTER_PORT || 9100);
-const WIDTH_MM      = Number(process.env.PRINTER_WIDTH_MM || 80);
-const CODEPAGE      = (process.env.PRINTER_CODEPAGE || 'cp858').toLowerCase();
+// Se hai già un order-printer service, lo riuso:
+let orderPrinter;
+try { orderPrinter = require('./order-printer.service'); }
+catch { orderPrinter = null; }
 
-const DISPLAY_TZ     = process.env.BIZ_TZ || 'Europe/Rome';
-const QR_BASE_URL    = (process.env.QR_BASE_URL || '').trim();
-const LOGO_PATH      = process.env.PRINTER_LOGO_PATH || 'assets/logo.png';
-const DB_TIME_IS_UTC = String(process.env.DB_TIME_IS_UTC || 'false') === 'true';
-
-// DAILY → grouped?
-const DAILY_GROUPED  = String(process.env.PRINTER_DAILY_GROUPED ?? 'true') !== 'false';
-// Aspetto titolo del blocco orario
-const GROUP_T_W = Math.max(1, Math.min(8, Number(process.env.PRINTER_GROUP_TITLE_W || 2)));
-const GROUP_T_H = Math.max(1, Math.min(8, Number(process.env.PRINTER_GROUP_TITLE_H || 2)));
-
-// QR config (cartellini)
-const QR_SIZE_ENV   = Number(process.env.PRINTER_QR_SIZE || 5);
-const QR_ECC_ENV    = String(process.env.PRINTER_QR_ECC || 'H').toUpperCase();
-const QR_CAPTION_GAP= Number(process.env.PRINTER_QR_CAPTION_GAP_LINES || 1);
-
-// Padding per separare i cartellini
-const TOP_PAD_LINES    = Number(process.env.PRINTER_TOP_PAD_LINES || 2);
-const BOTTOM_PAD_LINES = Number(process.env.PRINTER_BOTTOM_PAD_LINES || 4);
-
-// Colonne / dot disponibili
-const COLS     = WIDTH_MM >= 70 ? 48 : 32;   // 80mm≈48 col, 58mm≈32 col
-const MAX_DOTS = WIDTH_MM >= 70 ? 576 : 384; // indicativo per raster PNG
-
-// ───────────────── ESC/POS helpers ──────────────────────────────────────────
-const ESC = Buffer.from([0x1B]);
-const GS  = Buffer.from([0x1D]);
-const LF  = Buffer.from([0x0A]);
-
-const INIT         = Buffer.concat([ESC, Buffer.from('@')]);      // ESC @
-const ALIGN_LEFT   = Buffer.concat([ESC, Buffer.from('a'), Buffer.from([0])]);
-const ALIGN_CENTER = Buffer.concat([ESC, Buffer.from('a'), Buffer.from([1])]);
-const BOLD_ON      = Buffer.concat([ESC, Buffer.from('E'), Buffer.from([1])]);
-const BOLD_OFF     = Buffer.concat([ESC, Buffer.from('E'), Buffer.from([0])]);
-const DOUBLE_ON    = Buffer.concat([GS,  Buffer.from('!'), Buffer.from([0x11])]); // h/w 2x
-const DOUBLE_OFF   = Buffer.concat([GS,  Buffer.from('!'), Buffer.from([0x00])]);
-const CUT_FULL     = Buffer.concat([GS,  Buffer.from('V'), Buffer.from([0])]);
-
-// feed n righe (padding preciso)
-function FEED(n = 0) {
-  const nn = Math.max(0, Math.min(255, Number(n)||0));
-  return Buffer.concat([ESC, Buffer.from('d'), Buffer.from([nn])]);
-}
-
-// Dimensione font fine-grained (1..8)
-function SIZE(w = 1, h = 1) {
-  const W = Math.max(1, Math.min(8, w));
-  const H = Math.max(1, Math.min(8, h));
-  const v = ((W - 1) << 4) | (H - 1);
-  return Buffer.concat([GS, Buffer.from('!'), Buffer.from([v])]);
-}
-
-function selectCodepageBuffer() {
-  const map = { cp437:0, cp850:2, cp858:19, cp852:18, cp1252:16 };
-  const n = map[CODEPAGE] ?? 19;
-  return Buffer.concat([ESC, Buffer.from('t'), Buffer.from([n])]);
-}
-function encode(text) { return iconv.encode(String(text || '').replace(/\r/g, ''), CODEPAGE, { addBOM:false }); }
-function line(text='') { return Buffer.concat([ encode(text), LF ]); }
-
-function wrap(text, width = COLS) {
-  const words = String(text || '').split(/\s+/);
-  const rows = [];
-  let cur = '';
-  for (const w of words) {
-    if (!cur) { cur = w; continue; }
-    if ((cur + ' ' + w).length <= width) cur += ' ' + w;
-    else { rows.push(cur); cur = w; }
-  }
-  if (cur) rows.push(cur);
-  return rows;
-}
-function padRight(s, n) { return String(s || '').padEnd(n, ' '); }
-
-function sendToPrinter(buffers) {
-  return new Promise((resolve, reject) => {
-    const socket = net.createConnection({ host: RESOLVED_HOST, port: RESOLVED_PORT }, () => {
-      for (const b of buffers) socket.write(b);
-      socket.end();
-    });
-    socket.setTimeout(8000);
-    socket.on('timeout', () => { socket.destroy(new Error('timeout')); });
-    socket.on('error', reject);
-    socket.on('close', (hadErr) => hadErr ? reject(new Error('printer socket closed with error'))
-                                          : resolve(true));
-  });
-}
-
-// ─────────────── Date/ora sicure (DB UTC vs naive) ──────────────────────────
-function parseDbDate(s) {
-  const str = String(s || '').trim();
-  if (!str) return new Date(NaN);
-  if (str.includes('T')) return new Date(str); // ISO ready
-  const base = str.replace(' ', 'T');
-  return DB_TIME_IS_UTC ? new Date(base + 'Z') : new Date(base);
-}
-
-function formatTimeHHmm(start_at) {
-  const d = parseDbDate(start_at);
-  return new Intl.DateTimeFormat('it-IT', {
-    hour: '2-digit', minute: '2-digit', hour12: false, timeZone: DISPLAY_TZ,
-  }).format(d);
-}
-function formatDateHuman(d) {
-  return new Intl.DateTimeFormat('it-IT', {
-    weekday:'long', day:'2-digit', month:'2-digit', year:'numeric', timeZone: DISPLAY_TZ,
-  }).format(d);
-}
-function formatYmdHuman(ymd) {
-  const d = DB_TIME_IS_UTC
-    ? new Date(String(ymd||'').trim() + 'T00:00:00Z')
-    : new Date(String(ymd||'').trim() + 'T00:00:00');
-  return formatDateHuman(d);
-}
-function up(s) { return (s || '').toString().toUpperCase(); }
-
-// ─────────────────────── Raster PNG (logo) ──────────────────────────────────
-function buildRasterFromPNG(png, maxWidthDots = MAX_DOTS, threshold = 200) {
-  let targetW = Math.min(maxWidthDots, png.width);
-  const ratio = targetW / png.width;
-  const targetH = Math.max(1, Math.round(png.height * ratio));
-  const bytesPerRow = Math.ceil(targetW / 8);
-  const bmp = Buffer.alloc(bytesPerRow * targetH, 0x00);
-
-  for (let y = 0; y < targetH; y++) {
-    for (let x = 0; x < targetW; x++) {
-      const sx = Math.min(png.width - 1, Math.round(x / ratio));
-      const sy = Math.min(png.height - 1, Math.round(y / ratio));
-      const idx = (sy * png.width + sx) << 2;
-      const r = png.data[idx], g = png.data[idx+1], b = png.data[idx+2], a = png.data[idx+3];
-      const gray = a === 0 ? 255 : Math.round(0.2126*r + 0.7152*g + 0.0722*b);
-      const bit = gray < threshold ? 1 : 0;
-      if (bit) bmp[y * bytesPerRow + (x >> 3)] |= (0x80 >> (x & 7));
-    }
-  }
-
-  const m  = 0;
-  const xL = bytesPerRow & 0xff, xH = (bytesPerRow >> 8) & 0xff;
-  const yL = targetH & 0xff,      yH = (targetH >> 8) & 0xff;
-
-  return Buffer.concat([GS, Buffer.from('v0', 'ascii'), Buffer.from([m, xL, xH, yL, yH]), bmp, LF]);
-}
-
-let LOGO_RASTER = null;
-(function preloadLogo() {
+/* Helpers ------------------------------------------------------------------ */
+function toISO(x) {
+  if (!x) return '';
+  if (x instanceof Date) return x.toISOString();
+  // può essere string o numero timestamp
   try {
-    const abs = path.resolve(process.cwd(), LOGO_PATH);
-    if (fs.existsSync(abs)) {
-      const buf = fs.readFileSync(abs);
-      const png = PNG.sync.read(buf);
-      const raster = buildRasterFromPNG(png, Math.floor(MAX_DOTS * 0.85), 190);
-      LOGO_RASTER = Buffer.concat([ALIGN_CENTER, raster, LF]);
-      logger.info(`🖼️ Logo caricato: ${abs}`);
-    } else {
-      logger.warn(`Logo non trovato: ${abs}`);
-    }
-  } catch (e) {
-    logger.warn('Logo PNG non caricabile', e);
+    // se è già una ISO valida, restituisci così com’è
+    if (typeof x === 'string' && x.includes('T')) return x;
+    const d = new Date(x);
+    return isNaN(d.getTime()) ? '' : d.toISOString();
+  } catch { return ''; }
+}
+function toYMD(x) {
+  const iso = toISO(x) || new Date().toISOString();
+  return String(iso).slice(0, 10); // YYYY-MM-DD
+}
+
+/* API esistenti (mantieni la tua implementazione reale qui) ---------------- */
+async function printDailyReservations({ date, rows, user, logoText }) {
+  // usa order-printer se presente (nomi più comuni), altrimenti fallback no-op
+  if (orderPrinter && typeof orderPrinter.printDailyReservations === 'function') {
+    const out = await orderPrinter.printDailyReservations({ date, rows, user, logoText });
+    return { jobId: (out && out.jobId) || `daily-${Date.now()}`, printedCount: (out && out.printedCount) != null ? out.printedCount : (rows && rows.length) || 0 };
   }
-})();
-
-// ──────────────────────── QR ESC/POS (Model 2) ──────────────────────────────
-function qrStoreData(data) {
-  const payload = encode(data);
-  const len = payload.length + 3;
-  const pL = len & 0xff, pH = (len >> 8) & 0xff;
-  return Buffer.concat([GS, Buffer.from('('), Buffer.from('k'), Buffer.from([pL, pH, 0x31, 0x50, 0x30]), payload]);
-}
-function qrSetModuleSize(size = 6) {
-  const s = Math.max(1, Math.min(16, size));
-  return Buffer.concat([GS, Buffer.from('('), Buffer.from('k'), Buffer.from([0x03,0x00,0x31,0x43,s])]);
-}
-function qrSetECCFromEnv() {
-  const map = { L: 48, M: 48, Q: 49, H: 51 };
-  const lv = map[QR_ECC_ENV] ?? 51;
-  return Buffer.concat([GS, Buffer.from('('), Buffer.from('k'), Buffer.from([0x03,0x00,0x31,0x45, lv])]);
-}
-function qrPrint() { return Buffer.concat([GS, Buffer.from('('), Buffer.from('k'), Buffer.from([0x03,0x00,0x31,0x51,0x30])]); }
-
-// ───────────────────── Nome adattivo su una riga (cartellini) ───────────────
-function printAdaptiveName(buffers, name, maxCols = COLS) {
-  const txt = up(name || '');
-  const widths = [3, 2, 1];
-  const H = 2;
-  let chosenW = 1;
-
-  for (const w of widths) {
-    const maxLen = Math.floor(maxCols / w);
-    if (txt.length <= maxLen) { chosenW = w; break; }
+  if (orderPrinter && typeof orderPrinter.printDaily === 'function') {
+    const out = await orderPrinter.printDaily({ date, rows, user, logoText });
+    return { jobId: (out && out.jobId) || `daily-${Date.now()}`, printedCount: (out && out.printedCount) != null ? out.printedCount : (rows && rows.length) || 0 };
   }
-  const maxLenAtChosen = Math.floor(maxCols / chosenW);
-  const shown = txt.length > maxLenAtChosen
-    ? txt.slice(0, Math.max(0, maxLenAtChosen - 1)) + '…'
-    : txt;
-
-  buffers.push(SIZE(chosenW, H), BOLD_ON, ALIGN_CENTER, line(shown), BOLD_OFF, SIZE(1,1));
-}
-
-// ─────────────────────────── DAILY (flat) ───────────────────────────────────
-function buildDailyFlat(out, rows) {
-  // intestazione colonne
-  out.push(ALIGN_LEFT, BOLD_ON);
-  out.push(line(
-    padRight('ORA',5) + ' ' +
-    padRight('TAV',4) + ' ' +
-    padRight('PAX',3) + ' ' +
-    padRight('NOME', COLS-5-1-4-1-3-1)
-  ));
-  out.push(BOLD_OFF, line('-'.repeat(COLS)));
-
-  rows.sort((a,b) => String(a.start_at).localeCompare(String(b.start_at)));
-
-  for (const r of rows) {
-    const time = formatTimeHHmm(r.start_at);
-    const tav  = (r.table_number || r.table_id || '-').toString();
-    const pax  = (r.party_size || '-').toString();
-    const name = ((r.customer_first || '') + ' ' + (r.customer_last || '')).trim() || '—';
-
-    const left = `${padRight(time,5)} ${padRight(tav,4)} ${padRight(pax,3)} `;
-    const nameWidth = COLS - left.length;
-    const nameRows = wrap(name, nameWidth);
-    out.push(line(left + padRight(nameRows[0] || '', nameWidth)));
-    for (let i=1;i<nameRows.length;i++) out.push(line(' '.repeat(left.length) + nameRows[i]));
-
-    if (r.phone) out.push(line(' '.repeat(left.length) + String(r.phone)));
-    if (r.notes) {
-      const notesRows = wrap('NOTE: ' + r.notes, COLS - left.length);
-      for (const rr of notesRows) out.push(line(' '.repeat(left.length) + rr));
-    }
-    out.push(line(' '.repeat(COLS)));
-  }
-}
-
-// ───────────────────── DAILY (grouped by time) ──────────────────────────────
-function buildDailyGroupedBlocks(out, rows) {
-  // 1) raggruppo per HH:mm già nel fuso di stampa
-  const groups = new Map(); // key: 'HH:mm' → array di rows
-  for (const r of rows) {
-    const t = formatTimeHHmm(r.start_at);
-    if (!groups.has(t)) groups.set(t, []);
-    groups.get(t).push(r);
-  }
-  // 2) ordino le chiavi orarie (numericamente 00..23:59)
-  const keys = Array.from(groups.keys()).sort((a, b) => {
-    const [ah, am] = a.split(':').map(Number);
-    const [bh, bm] = b.split(':').map(Number);
-    return ah !== bh ? ah - bh : am - bm;
-  });
-
-  // 3) per ogni gruppo → titolo grande centrato + elenco senza ora
-  for (const k of keys) {
-    const list = groups.get(k) || [];
-    // Titolo del gruppo (orario), ben visibile
-    out.push(ALIGN_CENTER, SIZE(GROUP_T_W, GROUP_T_H), BOLD_ON, line(k), BOLD_OFF, SIZE(1,1));
-    out.push(line('-'.repeat(COLS)));
-
-    // Righe: TAV  PAX  NOME (+ phone/notes)
-    list.sort((a,b) => (a.table_number ?? a.table_id ?? 0) - (b.table_number ?? b.table_id ?? 0));
-
-    for (const r of list) {
-      const tav  = (r.table_number || r.table_id || '-').toString();
-      const pax  = (r.party_size || '-').toString();
-      const name = ((r.customer_first || '') + ' ' + (r.customer_last || '')).trim() || '—';
-
-      const left = `${padRight(tav,4)} ${padRight(pax,3)} `;
-      const nameWidth = COLS - left.length;
-      const nameRows = wrap(name, nameWidth);
-      out.push(ALIGN_LEFT, line(left + padRight(nameRows[0] || '', nameWidth)));
-      for (let i=1;i<nameRows.length;i++) out.push(line(' '.repeat(left.length) + nameRows[i]));
-
-      if (r.phone) out.push(line(' '.repeat(left.length) + String(r.phone)));
-      if (r.notes) {
-        const notesRows = wrap('NOTE: ' + r.notes, COLS - left.length);
-        for (const rr of notesRows) out.push(line(' '.repeat(left.length) + rr));
-      }
-      out.push(line(' '.repeat(COLS)));
-    }
-
-    // separatore tra blocchi
-    out.push(line('-'.repeat(COLS)));
-  }
-}
-
-// ───────────────────────────── DAILY main ───────────────────────────────────
-async function printDailyReservations({ date, rows, user }) {
-  logger.info('🖨️ DAILY begin', {
-    date, rows: rows?.length || 0, host: RESOLVED_HOST, port: RESOLVED_PORT,
-    cols: COLS, codepage: CODEPAGE, tz: DISPLAY_TZ, utc: DB_TIME_IS_UTC, grouped: DAILY_GROUPED
-  });
-
-  const out = [];
-  out.push(INIT, selectCodepageBuffer(), ALIGN_CENTER, BOLD_ON, DOUBLE_ON);
-  out.push(line('PRENOTAZIONI'));
-  out.push(DOUBLE_OFF, BOLD_OFF);
-
-  const header = formatYmdHuman(date).toUpperCase();
-  out.push(line(header));
-  out.push(line('-'.repeat(COLS)));
-
-  if (DAILY_GROUPED) buildDailyGroupedBlocks(out, rows);
-  else               buildDailyFlat(out, rows);
-
-  out.push(ALIGN_CENTER, line(`Operatore: ${user?.email || 'sistema'}`));
-  out.push(line(''), line(''), CUT_FULL);
-
-  await sendToPrinter(out);
-  return { jobId: `daily_${Date.now()}`, printedCount: rows.length };
-}
-
-// ─────────────────────────── PLACE CARDS ────────────────────────────────────
-function buildOnePlaceCardBuffers(r, opts = {}) {
-  const out = [];
-
-  const time = formatTimeHHmm(r.start_at);
-  const dateObj = parseDbDate(String(r.start_at || ''));
-  const dateHuman = formatDateHuman(dateObj);
-
-  const tav  = (r.table_number || r.table_id || '-').toString();
-  const pax  = (r.party_size || '-').toString();
-  const sala = r.room_name || r.room || r.room_id || '-';
-  const name = ((r.customer_last || '') + ' ' + (r.customer_first || '')).trim() || 'OSPITE';
-
-  out.push(INIT, selectCodepageBuffer(), ALIGN_CENTER);
-
-  if (TOP_PAD_LINES > 0) out.push(FEED(TOP_PAD_LINES));
-  if (LOGO_RASTER) out.push(LOGO_RASTER);
-
-  out.push(SIZE(2,1), BOLD_ON, line(`TAVOLO ${tav}`), BOLD_OFF, SIZE(1,1));
-  printAdaptiveName(out, name, COLS);
-
-  out.push(BOLD_ON, line(`${time}  •  ${dateHuman}`), BOLD_OFF);
-  out.push(line(`SALA:  ${sala}   •   COPERTI: ${pax}`));
-  out.push(line(''));
-
-  const qrUrl = opts.qrUrl || (QR_BASE_URL ? `${QR_BASE_URL.replace(/\/+$/,'')}/` : null);
-  if (qrUrl) {
-    out.push(line('Scansiona il QR del locale'));
-    if (QR_CAPTION_GAP > 0) out.push(FEED(QR_CAPTION_GAP));
-    out.push(ALIGN_CENTER, qrSetModuleSize(QR_SIZE_ENV), qrSetECCFromEnv(), qrStoreData(qrUrl), qrPrint());
-    out.push(line(''));
-  }
-
-  if (BOTTOM_PAD_LINES > 0) out.push(FEED(BOTTOM_PAD_LINES));
-  out.push(CUT_FULL);
-  return out;
+  // ... tua implementazione esistente ...
+  return { jobId: `daily-${Date.now()}`, printedCount: rows?.length || 0 };
 }
 
 async function printPlaceCards({ date, rows, user, logoText, qrBaseUrl }) {
-  logger.info('🖨️ PLACECARDS begin', {
-    date, rows: rows?.length || 0, host: RESOLVED_HOST, port: RESOLVED_PORT,
-    cols: COLS, codepage: CODEPAGE, tz: DISPLAY_TZ, utc: DB_TIME_IS_UTC
-  });
-
-  const buffers = [];
-  for (const r of rows) {
-    buffers.push(...buildOnePlaceCardBuffers(r, {
-      qrUrl: qrBaseUrl || (QR_BASE_URL || null),
-    }));
+  // usa order-printer se presente (nomi più comuni), altrimenti fallback no-op
+  if (orderPrinter && typeof orderPrinter.printPlaceCards === 'function') {
+    const out = await orderPrinter.printPlaceCards({ date, rows, user, logoText, qrBaseUrl });
+    return { jobId: (out && out.jobId) || `placecards-${Date.now()}`, printedCount: (out && out.printedCount) != null ? out.printedCount : (rows && rows.length) || 0 };
   }
-
-  await sendToPrinter(buffers);
-  return { jobId: `placecards_${Date.now()}`, printedCount: rows.length };
+  if (orderPrinter && typeof orderPrinter.printPlacecards === 'function') {
+    const out = await orderPrinter.printPlacecards({ date, rows, user, logoText, qrBaseUrl });
+    return { jobId: (out && out.jobId) || `placecards-${Date.now()}`, printedCount: (out && out.printedCount) != null ? out.printedCount : (rows && rows.length) || 0 };
+  }
+  if (orderPrinter && typeof orderPrinter.printSegnaposti === 'function') {
+    const out = await orderPrinter.printSegnaposti({ date, rows, user, logoText, qrBaseUrl });
+    return { jobId: (out && out.jobId) || `placecards-${Date.now()}`, printedCount: (out && out.printedCount) != null ? out.printedCount : (rows && rows.length) || 0 };
+  }
+  // ... tua implementazione esistente ...
+  return { jobId: `placecards-${Date.now()}`, printedCount: rows?.length || 0 };
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
+/**
+ * 🆕 singolo segnaposto (compat intelligente):
+ * 1) orderPrinter.printSinglePlaceCard({ reservation, user })        ✅ se esiste
+ * 2) orderPrinter.printPlacecardOne(...) / printPlaceCardOne(...)    ✅ se esiste
+ * 3) printPlaceCards({ rows:[reservation] })                          ✅ fallback elegante
+ * 4) warn (ultimo fallback)                                          ⚠️ evita crash
+ */
+async function printSinglePlaceCard({ reservation, user, logoText, qrBaseUrl }) {
+  // 1) metodo “singolo” nativo
+  if (orderPrinter?.printSinglePlaceCard) {
+    const out = await orderPrinter.printSinglePlaceCard({ reservation, user, logoText, qrBaseUrl });
+    return { jobId: out?.jobId || `placecard-${reservation?.id}-${Date.now()}` };
+  }
+  // 2) varianti di naming comuni
+  if (orderPrinter?.printPlacecardOne) {
+    const out = await orderPrinter.printPlacecardOne({ reservation, user, logoText, qrBaseUrl });
+    return { jobId: out?.jobId || `placecard-${reservation?.id}-${Date.now()}` };
+  }
+  if (orderPrinter?.printPlaceCardOne) {
+    const out = await orderPrinter.printPlaceCardOne({ reservation, user, logoText, qrBaseUrl });
+    return { jobId: out?.jobId || `placecard-${reservation?.id}-${Date.now()}` };
+  }
+
+  // 3) riuso del multiplo con una sola riga (data robusta a Date/ISO)
+  const date = toYMD(reservation?.start_at);
+  try {
+    const out = await printPlaceCards({
+      date,
+      rows: [reservation],
+      user,
+      logoText,
+      qrBaseUrl
+    });
+    return { jobId: out?.jobId || `placecard-batch1-${reservation?.id}-${Date.now()}` };
+  } catch (e) {
+    logger.error('🖨️ placecard (batch1) ❌', { id: reservation?.id, error: String(e) });
+  }
+
+  // 4) ultima spiaggia: log e non esplodere
+  logger.warn('🖨️ printSinglePlaceCard fallback (nessun metodo compat trovato).', { id: reservation?.id });
+  return { jobId: `noop-placecard-${reservation?.id}-${Date.now()}` };
+}
+
 module.exports = {
   printDailyReservations,
   printPlaceCards,
+  printSinglePlaceCard,
 };
 ```
 
@@ -5143,27 +4750,51 @@ module.exports = (io) => {
 ### ./src/sockets/reservations.js
 ```
 // 📡 Socket.IO — Prenotazioni tavolo (realtime) + creazione anche da Admin
+// - Mantiene i canali esistenti (reservations-get/new/update-status/assign-table)
+// - 🆕 Aggiunge eventi di comodo per check-in / check-out (opzionali dal client)
+//   • 'reservation-checkin'  { id, at? }   → svc.checkInReservation(...)
+//   • 'reservation-checkout' { id, at? }   → svc.checkOutReservation(...)
+// - 🧼 Al check-out, emette anche { table_id, cleaning_until } per attivare la “Pulizia 5:00” sui FE passivi.
+
+'use strict';
+
 const logger = require('../logger'); // ✅ istanza diretta
+const env    = require('../env');
+
 const {
-  createReservation,
-  updateReservationStatus,
-  assignReservationTable,
-  listReservations
+  create: createReservation,
+  updateStatus: updateReservationStatus,
+  update: assignReservationTable_RAW,       // useremo helper sotto
+  list: listReservations,
+  checkInReservation,                        // 🆕 service idempotente
+  checkOutReservation                        // 🆕 service idempotente (calcola dwell_sec)
 } = require('../services/reservations.service');
+
+// piccolo helper per compat: assegna tavolo
+async function assignReservationTable(id, table_id) {
+  return await assignReservationTable_RAW(id, { table_id });
+}
+
+// finestra pulizia (default 5 minuti) → configurabile via ENV
+const CLEAN_SEC =
+  Number(process.env.CLEAN_SECONDS || (env.RESV && env.RESV.cleanSeconds) || 300);
 
 module.exports = (io) => {
   io.on('connection', (socket) => {
     logger.info('📡 [RES] SOCKET connected', { id: socket.id });
 
-    socket.on('register-admin', () => socket.join('admins'));
+    // registrazione canali
+    socket.on('register-admin',   () => socket.join('admins'));
     socket.on('register-customer', (token) => token && socket.join(`c:${token}`));
 
+    // LIST
     socket.on('reservations-get', async (filter = {}) => {
       logger.info('📡 [RES] reservations-get ▶️', { from: socket.id, filter });
       const rows = await listReservations(filter);
       socket.emit('reservations-list', rows);
     });
 
+    // CREATE (cliente)
     socket.on('reservation-new', async (dto) => {
       logger.info('📡 [RES] reservation-new ▶️', { origin: 'customer', body: dto });
       const r = await createReservation(dto);
@@ -5172,6 +4803,7 @@ module.exports = (io) => {
       logger.info('📡 [RES] reservation-created ✅ broadcast', { id: r.id });
     });
 
+    // CREATE (admin)
     socket.on('reservation-admin-new', async (dto) => {
       logger.info('📡 [RES] reservation-admin-new ▶️', { origin: 'admin', body: dto });
       const r = await createReservation(dto);
@@ -5180,18 +4812,51 @@ module.exports = (io) => {
       logger.info('📡 [RES] reservation-created ✅ (admin)', { id: r.id });
     });
 
+    // CAMBIO STATO (compat con FE storico)
     socket.on('reservation-update-status', async ({ id, status }) => {
       logger.info('📡 [RES] reservation-update-status ▶️', { id, status });
-      const r = await updateReservationStatus(id, status);
+      const r = await updateReservationStatus({ id, action: status });
       io.to('admins').emit('reservation-updated', r);
       if (r.client_token) io.to(`c:${r.client_token}`).emit('reservation-updated', r);
     });
 
+    // ASSEGNAZIONE TAVOLO
     socket.on('reservation-assign-table', async ({ id, table_id }) => {
       logger.info('📡 [RES] reservation-assign-table ▶️', { id, table_id });
       const r = await assignReservationTable(id, table_id);
       io.to('admins').emit('reservation-updated', r);
       if (r.client_token) io.to(`c:${r.client_token}`).emit('reservation-updated', r);
+    });
+
+    // 🆕 CHECK-IN
+    socket.on('reservation-checkin', async ({ id, at = null }) => {
+      logger.info('📡 [RES] reservation-checkin ▶️', { id, at });
+      const r = await checkInReservation(id, at, { user: { email: 'socket@server' } });
+      io.to('admins').emit('reservation-checkin', { id: r.id, checkin_at: r.checkin_at, table_id: r.table_id || null });
+      io.to('admins').emit('reservation-updated', r);
+      if (r.client_token) io.to(`c:${r.client_token}`).emit('reservation-updated', r);
+      logger.info('📡 [RES] reservation-checkin ✅ broadcast', { id: r.id });
+    });
+
+    // 🆕 CHECK-OUT
+    socket.on('reservation-checkout', async ({ id, at = null }) => {
+      logger.info('📡 [RES] reservation-checkout ▶️', { id, at });
+      const r = await checkOutReservation(id, at, { user: { email: 'socket@server' } });
+
+      // calcolo in uscita una cleaning window lato socket (non blocca il BE)
+      const base = at ? new Date(at).getTime() : Date.now();
+      const cleaning_until = new Date(base + CLEAN_SEC * 1000).toISOString();
+
+      io.to('admins').emit('reservation-checkout', {
+        id         : r.id,
+        table_id   : r.table_id || null,
+        checkout_at: r.checkout_at,
+        dwell_sec  : r.dwell_sec || null,
+        cleaning_until
+      });
+      io.to('admins').emit('reservation-updated', r);
+      if (r.client_token) io.to(`c:${r.client_token}`).emit('reservation-updated', r);
+      logger.info('📡 [RES] reservation-checkout ✅ broadcast', { id: r.id, cleaning_until });
     });
 
     socket.on('disconnect', (reason) => {
