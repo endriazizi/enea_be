@@ -1,6 +1,6 @@
 # 🧩 Project code (file ammessi in .)
 
-_Generato: Sun, Nov  9, 2025 10:12:49 PM_
+_Generato: Mon, Nov 10, 2025  2:49:28 AM_
 
 ### ./package.json
 ```
@@ -1013,6 +1013,7 @@ module.exports = router;
 
 ### ./src/api/reservations.js
 ```
+// C:\Users\Endri Azizi\progetti-dev\my_dev\be\src\api\reservations.js
 'use strict';
 
 /**
@@ -1170,7 +1171,7 @@ router.put('/:id(\\d+)/status', requireAuth, async (req, res) => {
       user_email: req.user?.email || 'dev@local'
     });
 
-    // (2) ricarico riga “idratata” (JOIN con users/tables) per notifiche & FE
+    // (2) ricarico riga “idratata”
     const updated = await svc.getById(id);
 
     // (3) email best-effort
@@ -1219,7 +1220,10 @@ router.post('/:id(\\d+)/checkin', requireAuth, async (req, res) => {
     // socket (se presente)
     try {
       const io = req.app.get('io');
-      if (io) io.to('admins').emit('reservation-checkin', { id: r.id, table_id: r.table_id || null });
+      if (io) {
+        io.to('admins').emit('reservation-checkin', { id: r.id, table_id: r.table_id || null });
+        logger.info('📡 emit reservation-checkin', { id: r.id, table_id: r.table_id || null });
+      }
     } catch {}
     logger.info('✅ RESV check-in', { service:'server', id: r.id, checkin_at: r.checkin_at, status: r.status });
     return res.json({ ok: true, reservation: r });
@@ -1236,22 +1240,34 @@ router.post('/:id(\\d+)/checkout', requireAuth, async (req, res) => {
   try {
     const at = norm(req.body?.at) || null;  // ISO opzionale
     const r  = await svc.checkOut(id, { at, user: req.user });
-    // calcolo suggerito per pulizia 5:00 → emitted to FE
-    const cleaningSecs = Number(process.env.CLEANING_SECS || 300);
+
+    // finestra pulizia 5:00 per FE (anche se idempotente)
+    const cleaningSecs  = Number(process.env.CLEANING_SECS || 300);
     const cleaningUntil = new Date(Date.now() + cleaningSecs * 1000).toISOString();
-    // socket broadcast
+
+    // socket broadcast (SEMPRE) + log
     try {
       const io = req.app.get('io');
-      if (io) io.to('admins').emit('reservation-checkout', {
-        id: r.id, table_id: r.table_id || null, cleaning_until: cleaningUntil
-      });
+      if (io) {
+        io.to('admins').emit('reservation-checkout', {
+          id: r.id, table_id: r.table_id || null, cleaning_until: cleaningUntil
+        });
+        logger.info('📡 emit reservation-checkout', { id: r.id, table_id: r.table_id || null, cleaning_until: cleaningUntil });
+      }
     } catch {}
+
     logger.info('✅ RESV checkout', { service:'server', id: r.id, checkout_at: r.checkout_at, dwell_sec: r.dwell_sec });
     return res.json({ ok: true, reservation: r, cleaning_until: cleaningUntil });
   } catch (err) {
     logger.error('❌ [POST] /api/reservations/:id/checkout', { id, error: String(err) });
     return res.status(400).json({ error: err.message || 'checkout_failed' });
   }
+});
+
+// Alias "ricco" per eventuali FE
+router.post('/:id(\\d+)/checkout-with-meta', requireAuth, async (req, res) => {
+  req.url = `/api/reservations/${req.params.id}/checkout`;
+  return router.handle(req, res);
 });
 
 // ------------------------------ DELETE (hard) --------------------------------
@@ -3981,7 +3997,6 @@ async function checkIn(id, { at = null, user } = {}) {
     return await getById(id);
   }
   const checkin_at_mysql = isoToMysql(at) || null;
-  const nowMysql = checkin_at_mysql || 'CURRENT_TIMESTAMP';
   await query(
     `UPDATE reservations SET
        checkin_at = ${checkin_at_mysql ? '?' : 'CURRENT_TIMESTAMP'},
@@ -3999,10 +4014,31 @@ async function checkIn(id, { at = null, user } = {}) {
 async function checkOut(id, { at = null, user } = {}) {
   const r = await getById(id);
   if (!r) throw new Error('not_found');
+
+  // === Idempotente: già chiuso
   if (r.checkout_at) {
+    // Backfill dwell_sec se manca e ho checkin_at
+    if (!r.dwell_sec && r.checkin_at) {
+      const start = new Date(r.checkin_at).getTime();
+      const end   = new Date(r.checkout_at).getTime();
+      const dwell_sec = Math.max(0, Math.floor((end - start) / 1000));
+      await query(
+        `UPDATE reservations
+           SET dwell_sec  = ?,
+               updated_at = CURRENT_TIMESTAMP,
+               updated_by = ?
+         WHERE id = ? LIMIT 1`,
+        [dwell_sec, user?.email || null, id]
+      );
+      const updated = await getById(id);
+      logger.info('♻️ checkout idempotente + ⏱️ dwell backfill', { id, checkout_at: updated.checkout_at, dwell_sec: updated.dwell_sec });
+      return updated;
+    }
     logger.info('♻️ checkout idempotente', { id, checkout_at: r.checkout_at, dwell_sec: r.dwell_sec });
     return r;
   }
+
+  // === Primo checkout: salvo checkout_at e (se possibile) dwell_sec
   const checkout_at_mysql = isoToMysql(at) || null;
   // dwell_sec se ho checkin_at
   let dwell_sec = null;
@@ -5268,31 +5304,27 @@ module.exports = (io) => {
 
 ### ./src/sockets/reservations.js
 ```
+// C:\Users\Endri Azizi\progetti-dev\my_dev\be\src\sockets\reservations.js
 // 📡 Socket.IO — Prenotazioni tavolo (realtime) + creazione anche da Admin
 // - Mantiene i canali esistenti (reservations-get/new/update-status/assign-table)
-// - 🆕 Aggiunge eventi di comodo per check-in / check-out (opzionali dal client)
-//   • 'reservation-checkin'  { id, at? }   → svc.checkInReservation(...)
-//   • 'reservation-checkout' { id, at? }   → svc.checkOutReservation(...)
+// - 🆕 Eventi di comodo per check-in / check-out (opzionali dal client)
+//   • 'reservation-checkin'  { id, at? }   → svc.checkIn(...)
+//   • 'reservation-checkout' { id, at? }   → svc.checkOut(...)
 // - 🧼 Al check-out, emette anche { table_id, cleaning_until } per attivare la “Pulizia 5:00” sui FE passivi.
 
 'use strict';
 
-const logger = require('../logger'); // ✅ istanza diretta
+const logger = require('../logger');
 const env    = require('../env');
 
 const {
   create: createReservation,
   updateStatus: updateReservationStatus,
-  update: assignReservationTable_RAW,       // useremo helper sotto
+  assignReservationTable,          // ✅ c'è già nel service
   list: listReservations,
-  checkInReservation,                        // 🆕 service idempotente
-  checkOutReservation                        // 🆕 service idempotente (calcola dwell_sec)
+  checkIn,                         // ✅ nomi reali dal service
+  checkOut                         // ✅ nomi reali dal service
 } = require('../services/reservations.service');
-
-// piccolo helper per compat: assegna tavolo
-async function assignReservationTable(id, table_id) {
-  return await assignReservationTable_RAW(id, { table_id });
-}
 
 // finestra pulizia (default 5 minuti) → configurabile via ENV
 const CLEAN_SEC =
@@ -5350,7 +5382,7 @@ module.exports = (io) => {
     // 🆕 CHECK-IN
     socket.on('reservation-checkin', async ({ id, at = null }) => {
       logger.info('📡 [RES] reservation-checkin ▶️', { id, at });
-      const r = await checkInReservation(id, at, { user: { email: 'socket@server' } });
+      const r = await checkIn(id, { at, user: { email: 'socket@server' } });
       io.to('admins').emit('reservation-checkin', { id: r.id, checkin_at: r.checkin_at, table_id: r.table_id || null });
       io.to('admins').emit('reservation-updated', r);
       if (r.client_token) io.to(`c:${r.client_token}`).emit('reservation-updated', r);
@@ -5360,7 +5392,7 @@ module.exports = (io) => {
     // 🆕 CHECK-OUT
     socket.on('reservation-checkout', async ({ id, at = null }) => {
       logger.info('📡 [RES] reservation-checkout ▶️', { id, at });
-      const r = await checkOutReservation(id, at, { user: { email: 'socket@server' } });
+      const r = await checkOut(id, { at, user: { email: 'socket@server' } });
 
       // calcolo in uscita una cleaning window lato socket (non blocca il BE)
       const base = at ? new Date(at).getTime() : Date.now();
