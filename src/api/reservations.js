@@ -1,3 +1,4 @@
+// C:\Users\Endri Azizi\progetti-dev\my_dev\be\src\api\reservations.js
 'use strict';
 
 /**
@@ -155,7 +156,7 @@ router.put('/:id(\\d+)/status', requireAuth, async (req, res) => {
       user_email: req.user?.email || 'dev@local'
     });
 
-    // (2) ricarico riga “idratata” (JOIN con users/tables) per notifiche & FE
+    // (2) ricarico riga “idratata”
     const updated = await svc.getById(id);
 
     // (3) email best-effort
@@ -204,7 +205,10 @@ router.post('/:id(\\d+)/checkin', requireAuth, async (req, res) => {
     // socket (se presente)
     try {
       const io = req.app.get('io');
-      if (io) io.to('admins').emit('reservation-checkin', { id: r.id, table_id: r.table_id || null });
+      if (io) {
+        io.to('admins').emit('reservation-checkin', { id: r.id, table_id: r.table_id || null });
+        logger.info('📡 emit reservation-checkin', { id: r.id, table_id: r.table_id || null });
+      }
     } catch {}
     logger.info('✅ RESV check-in', { service:'server', id: r.id, checkin_at: r.checkin_at, status: r.status });
     return res.json({ ok: true, reservation: r });
@@ -221,22 +225,34 @@ router.post('/:id(\\d+)/checkout', requireAuth, async (req, res) => {
   try {
     const at = norm(req.body?.at) || null;  // ISO opzionale
     const r  = await svc.checkOut(id, { at, user: req.user });
-    // calcolo suggerito per pulizia 5:00 → emitted to FE
-    const cleaningSecs = Number(process.env.CLEANING_SECS || 300);
+
+    // finestra pulizia 5:00 per FE (anche se idempotente)
+    const cleaningSecs  = Number(process.env.CLEANING_SECS || 300);
     const cleaningUntil = new Date(Date.now() + cleaningSecs * 1000).toISOString();
-    // socket broadcast
+
+    // socket broadcast (SEMPRE) + log
     try {
       const io = req.app.get('io');
-      if (io) io.to('admins').emit('reservation-checkout', {
-        id: r.id, table_id: r.table_id || null, cleaning_until: cleaningUntil
-      });
+      if (io) {
+        io.to('admins').emit('reservation-checkout', {
+          id: r.id, table_id: r.table_id || null, cleaning_until: cleaningUntil
+        });
+        logger.info('📡 emit reservation-checkout', { id: r.id, table_id: r.table_id || null, cleaning_until: cleaningUntil });
+      }
     } catch {}
+
     logger.info('✅ RESV checkout', { service:'server', id: r.id, checkout_at: r.checkout_at, dwell_sec: r.dwell_sec });
     return res.json({ ok: true, reservation: r, cleaning_until: cleaningUntil });
   } catch (err) {
     logger.error('❌ [POST] /api/reservations/:id/checkout', { id, error: String(err) });
     return res.status(400).json({ error: err.message || 'checkout_failed' });
   }
+});
+
+// Alias "ricco" per eventuali FE
+router.post('/:id(\\d+)/checkout-with-meta', requireAuth, async (req, res) => {
+  req.url = `/api/reservations/${req.params.id}/checkout`;
+  return router.handle(req, res);
 });
 
 // ------------------------------ DELETE (hard) --------------------------------

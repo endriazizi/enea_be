@@ -1,28 +1,24 @@
+// C:\Users\Endri Azizi\progetti-dev\my_dev\be\src\sockets\reservations.js
 // 📡 Socket.IO — Prenotazioni tavolo (realtime) + creazione anche da Admin
 // - Mantiene i canali esistenti (reservations-get/new/update-status/assign-table)
-// - 🆕 Aggiunge eventi di comodo per check-in / check-out (opzionali dal client)
-//   • 'reservation-checkin'  { id, at? }   → svc.checkInReservation(...)
-//   • 'reservation-checkout' { id, at? }   → svc.checkOutReservation(...)
+// - 🆕 Eventi di comodo per check-in / check-out (opzionali dal client)
+//   • 'reservation-checkin'  { id, at? }   → svc.checkIn(...)
+//   • 'reservation-checkout' { id, at? }   → svc.checkOut(...)
 // - 🧼 Al check-out, emette anche { table_id, cleaning_until } per attivare la “Pulizia 5:00” sui FE passivi.
 
 'use strict';
 
-const logger = require('../logger'); // ✅ istanza diretta
+const logger = require('../logger');
 const env    = require('../env');
 
 const {
   create: createReservation,
   updateStatus: updateReservationStatus,
-  update: assignReservationTable_RAW,       // useremo helper sotto
+  assignReservationTable,          // ✅ c'è già nel service
   list: listReservations,
-  checkInReservation,                        // 🆕 service idempotente
-  checkOutReservation                        // 🆕 service idempotente (calcola dwell_sec)
+  checkIn,                         // ✅ nomi reali dal service
+  checkOut                         // ✅ nomi reali dal service
 } = require('../services/reservations.service');
-
-// piccolo helper per compat: assegna tavolo
-async function assignReservationTable(id, table_id) {
-  return await assignReservationTable_RAW(id, { table_id });
-}
 
 // finestra pulizia (default 5 minuti) → configurabile via ENV
 const CLEAN_SEC =
@@ -80,7 +76,7 @@ module.exports = (io) => {
     // 🆕 CHECK-IN
     socket.on('reservation-checkin', async ({ id, at = null }) => {
       logger.info('📡 [RES] reservation-checkin ▶️', { id, at });
-      const r = await checkInReservation(id, at, { user: { email: 'socket@server' } });
+      const r = await checkIn(id, { at, user: { email: 'socket@server' } });
       io.to('admins').emit('reservation-checkin', { id: r.id, checkin_at: r.checkin_at, table_id: r.table_id || null });
       io.to('admins').emit('reservation-updated', r);
       if (r.client_token) io.to(`c:${r.client_token}`).emit('reservation-updated', r);
@@ -90,7 +86,7 @@ module.exports = (io) => {
     // 🆕 CHECK-OUT
     socket.on('reservation-checkout', async ({ id, at = null }) => {
       logger.info('📡 [RES] reservation-checkout ▶️', { id, at });
-      const r = await checkOutReservation(id, at, { user: { email: 'socket@server' } });
+      const r = await checkOut(id, { at, user: { email: 'socket@server' } });
 
       // calcolo in uscita una cleaning window lato socket (non blocca il BE)
       const base = at ? new Date(at).getTime() : Date.now();

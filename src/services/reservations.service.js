@@ -243,7 +243,6 @@ async function checkIn(id, { at = null, user } = {}) {
     return await getById(id);
   }
   const checkin_at_mysql = isoToMysql(at) || null;
-  const nowMysql = checkin_at_mysql || 'CURRENT_TIMESTAMP';
   await query(
     `UPDATE reservations SET
        checkin_at = ${checkin_at_mysql ? '?' : 'CURRENT_TIMESTAMP'},
@@ -261,10 +260,31 @@ async function checkIn(id, { at = null, user } = {}) {
 async function checkOut(id, { at = null, user } = {}) {
   const r = await getById(id);
   if (!r) throw new Error('not_found');
+
+  // === Idempotente: già chiuso
   if (r.checkout_at) {
+    // Backfill dwell_sec se manca e ho checkin_at
+    if (!r.dwell_sec && r.checkin_at) {
+      const start = new Date(r.checkin_at).getTime();
+      const end   = new Date(r.checkout_at).getTime();
+      const dwell_sec = Math.max(0, Math.floor((end - start) / 1000));
+      await query(
+        `UPDATE reservations
+           SET dwell_sec  = ?,
+               updated_at = CURRENT_TIMESTAMP,
+               updated_by = ?
+         WHERE id = ? LIMIT 1`,
+        [dwell_sec, user?.email || null, id]
+      );
+      const updated = await getById(id);
+      logger.info('♻️ checkout idempotente + ⏱️ dwell backfill', { id, checkout_at: updated.checkout_at, dwell_sec: updated.dwell_sec });
+      return updated;
+    }
     logger.info('♻️ checkout idempotente', { id, checkout_at: r.checkout_at, dwell_sec: r.dwell_sec });
     return r;
   }
+
+  // === Primo checkout: salvo checkout_at e (se possibile) dwell_sec
   const checkout_at_mysql = isoToMysql(at) || null;
   // dwell_sec se ho checkin_at
   let dwell_sec = null;
