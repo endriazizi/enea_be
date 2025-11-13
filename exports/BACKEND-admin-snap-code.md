@@ -1,6 +1,6 @@
 # 🧩 Project code (file ammessi in .)
 
-_Generato: Mon, Nov 10, 2025  2:49:28 AM_
+_Generato: Thu, Nov 13, 2025 10:56:07 AM_
 
 ### ./package.json
 ```
@@ -27,6 +27,7 @@ _Generato: Mon, Nov 10, 2025  2:49:28 AM_
         "mysql2": "^3.10.0",
         "nodemailer": "7.0.10",
         "pngjs": "7.0.0",
+        "qrcode": "1.5.4",
         "socket.io": "^4.7.5",
         "twilio": "5.10.3",
         "winston": "^3.13.0",
@@ -424,6 +425,103 @@ router.get('/', async (req, res) => {
 module.exports = router;
 ```
 
+### ./src/api/nfc.js
+```
+// server/src/api/nfc.js
+// ============================================================================
+// API NFC — bind/resolve/qr/url per tag NFC dei tavoli
+// Mantiene stile log con emoji e risposte { ok, ... }.
+// ============================================================================
+
+const express = require('express');
+const router  = express.Router();
+const NFC     = require('../services/nfc.service');
+const logger  = require('../logger');
+
+// POST /api/nfc/bind { table_id, forceNew? }
+// → { ok:true, token, url }
+router.post('/bind', async (req, res) => {
+  try {
+    const { table_id, forceNew } = req.body || {};
+    if (!table_id) return res.status(400).json({ ok: false, error: 'table_id mancante' });
+
+    const token = await NFC.bindTable(Number(table_id), { forceNew: !!forceNew });
+    const url   = NFC.buildPublicUrl(token, req);
+    logger.info(`🔗 [API] bind table_id=${table_id} → ${token}`);
+    res.json({ ok: true, token, url });
+  } catch (err) {
+    logger.error('❌ [API] /nfc/bind', { error: String(err) });
+    res.status(500).json({ ok: false, error: err?.message || 'internal_error' });
+  }
+});
+
+// GET /api/nfc/resolve?token=XYZ → { ok, table_id, room_id, table_number, reservation_id? }
+router.get('/resolve', async (req, res) => {
+  try {
+    const token = String(req.query.token || '').trim();
+    if (!token) return res.status(400).json({ ok: false, error: 'token mancante' });
+
+    const info = await NFC.resolveToken(token);
+    if (!info)  return res.status(404).json({ ok: false, error: 'not_found_or_revoked' });
+
+    logger.info(`🔎 [API] resolve token=${token} → table_id=${info.table_id}`);
+    res.json(info);
+  } catch (err) {
+    logger.error('❌ [API] /nfc/resolve', { error: String(err) });
+    res.status(500).json({ ok: false, error: err?.message || 'internal_error' });
+  }
+});
+
+// GET /api/nfc/url/:tableId → { ok, token, url }
+router.get('/url/:tableId', async (req, res) => {
+  try {
+    const tableId = Number(req.params.tableId);
+    if (!tableId) return res.status(400).json({ ok: false, error: 'tableId non valido' });
+
+    // Riuso se esiste, altrimenti crea
+    const token = await NFC.bindTable(tableId, { forceNew: false });
+    const url   = NFC.buildPublicUrl(token, req);
+    res.json({ ok: true, token, url });
+  } catch (err) {
+    logger.error('❌ [API] /nfc/url/:tableId', { error: String(err) });
+    res.status(500).json({ ok: false, error: err?.message || 'internal_error' });
+  }
+});
+
+// GET /api/nfc/qr?u=ENCODED_URL → PNG (qrcode)
+// GET /api/nfc/qr/token/:token   → PNG (qrcode della URL pubblica)
+router.get('/qr', async (req, res) => {
+  try {
+    const url = String(req.query.u || '').trim();
+    if (!url) return res.status(400).json({ ok: false, error: 'u mancante' });
+
+    const QR = require('qrcode'); // runtime require
+    res.setHeader('Content-Type', 'image/png');
+    QR.toFileStream(res, url, { errorCorrectionLevel: 'M', margin: 1, scale: 6 });
+  } catch (err) {
+    logger.error('❌ [API] /nfc/qr', { error: String(err) });
+    res.status(500).json({ ok: false, error: err?.message || 'internal_error' });
+  }
+});
+
+router.get('/qr/token/:token', async (req, res) => {
+  try {
+    const token = String(req.params.token || '').trim();
+    if (!token) return res.status(400).json({ ok: false, error: 'token mancante' });
+
+    const url = NFC.buildPublicUrl(token, req);
+    const QR  = require('qrcode');
+    res.setHeader('Content-Type', 'image/png');
+    QR.toFileStream(res, url, { errorCorrectionLevel: 'M', margin: 1, scale: 6 });
+  } catch (err) {
+    logger.error('❌ [API] /nfc/qr/token/:token', { error: String(err) });
+    res.status(500).json({ ok: false, error: err?.message || 'internal_error' });
+  }
+});
+
+module.exports = router;
+```
+
 ### ./src/api/notifications.js
 ```
 'use strict';
@@ -636,14 +734,14 @@ module.exports = router;
 
 ### ./src/api/orders.js
 ```
-// src/api/orders.js
 // ============================================================================
 // ORDERS API (root = /api/orders)
 // - GET    /                lista (hours | from/to | status | q)
-// - GET    /:id(\d+)        dettaglio full con items
+// - GET    /:id(\d+)        dettaglio full con items (+ meta sala/tavolo ⚙️)
 // - POST   /                crea ordine (header + items) → 201 + full
 // - PATCH  /:id(\d+)/status cambio stato
-// - POST   /:id(\d+)/print  stampa Pizzeria/Cucina (best-effort)
+// - POST   /:id(\d+)/print               stampa CONTO (DUAL Pizzeria/Cucina)
+// - POST   /:id(\d+)/print/comanda       🆕 stampa SOLO un centro (PIZZERIA|CUCINA)
 // - GET    /stream          SSE (montato qui)
 // Stile: commenti lunghi, log con emoji
 // ============================================================================
@@ -654,7 +752,7 @@ const router  = express.Router();
 const logger  = require('../logger');
 const { query } = require('../db');
 const sse     = require('../sse');
-const { printOrderDual } = require('../utils/print-order');
+const { printOrderDual, printOrderForCenter } = require('../utils/print-order'); // 🧾
 
 // Monta subito l’endpoint SSE (/api/orders/stream)
 sse.mount(router);
@@ -666,7 +764,74 @@ const toNum = (v, def = 0) => {
 };
 const toDate = (v) => v ? new Date(v) : null;
 
+// 🧠 Util: parsing rapido da eventuali note "Tavolo X — Sala Y"
+function parseLocationHintsFromNote(noteRaw) {
+  const note = (noteRaw || '').toString();
+  const mT = note.match(/Tavolo\s+([A-Za-z0-9\-_]+)/i);
+  const mR = note.match(/Sala\s+([A-Za-z0-9 \-_]+)/i);
+  return {
+    table_hint: mT ? mT[1] : null,
+    room_hint : mR ? mR[1] : null,
+  };
+}
+
+/**
+ * 🔍 Risolve meta "location" per la stampa:
+ * - tenta un match con la prenotazione del GIORNO di `scheduled_at`
+ * - ordina per vicinanza temporale a `scheduled_at` (± minuti)
+ * - JOIN su `tables` (usa SOLO colonne esistenti: id, table_number) e `rooms` (name)
+ *
+ * Non richiede colonne extra su `orders`.
+ */
+async function resolveLocationMeta(order) {
+  if (!order?.scheduled_at) return { reservation: null, table: null, room: null };
+
+  const hints = parseLocationHintsFromNote(order.note);
+
+  // ⚠️ FIX: niente t.number / t.label. Usiamo t.table_number e, come "nome",
+  //         riutilizziamo la stessa o "T{id}" come fallback.
+  const rows = await query(
+    `SELECT r.id,
+            r.table_id, r.room_id,
+            t.table_number                         AS table_number,
+            COALESCE(NULLIF(t.table_number,''), CONCAT('T', t.id)) AS table_name,
+            rm.name                                AS room_name,
+            ABS(TIMESTAMPDIFF(MINUTE, r.start_at, ?)) AS delta_min
+     FROM reservations r
+     LEFT JOIN tables t ON t.id = r.table_id
+     LEFT JOIN rooms  rm ON rm.id = r.room_id
+     WHERE DATE(r.start_at) = DATE(?)
+       AND r.table_id IS NOT NULL
+     ORDER BY delta_min ASC, r.id DESC
+     LIMIT 1`,
+    [ order.scheduled_at, order.scheduled_at ]
+  );
+
+  const best = rows && rows[0] ? rows[0] : null;
+
+  logger.info('🧭 orders.resolveLocationMeta', {
+    id: order.id,
+    hasScheduled: !!order.scheduled_at,
+    table_hint: hints.table_hint || null,
+    room_hint : hints.room_hint  || null,
+    match_id  : best?.id || null,
+    match_delta_min: best?.delta_min ?? null,
+    table_id  : best?.table_id ?? null,
+    table_num : best?.table_number ?? null,
+    table_lbl : best?.table_name ?? null,
+    room_id   : best?.room_id ?? null,
+    room_name : best?.room_name ?? null,
+  });
+
+  const reservation = best ? { id: best.id, table_id: best.table_id, room_id: best.room_id } : null;
+  const table = best ? { id: best.table_id, number: best.table_number, label: best.table_name } : null;
+  const room  = best ? { id: best.room_id, name: best.room_name } : null;
+
+  return { reservation, table, room };
+}
+
 async function getOrderFullById(id) {
+  // Header base (come prima)
   const [o] = await query(
     `SELECT id, customer_name, phone, email, people, scheduled_at, status,
             total, channel, note, created_at, updated_at
@@ -674,17 +839,41 @@ async function getOrderFullById(id) {
   );
   if (!o) return null;
 
+  // Righe con categoria risolta
   const items = await query(
     `SELECT i.id, i.order_id, i.product_id, i.name, i.qty, i.price, i.notes, i.created_at,
             COALESCE(c.name,'Altro') AS category
      FROM order_items i
-     LEFT JOIN products p ON p.id = i.product_id
+     LEFT JOIN products   p ON p.id = i.product_id
      LEFT JOIN categories c ON c.id = p.category_id
      WHERE i.order_id=?
-     ORDER BY i.id ASC`, [id] // <-- fix 'p.category' mancante
+     ORDER BY i.id ASC`, [id]
   );
 
-  return { ...o, items };
+  // 🆕 Arricchisco con meta SALA/TAVOLO inferita dal calendario prenotazioni
+  const meta = await resolveLocationMeta(o);
+
+  return {
+    ...o,
+    // campi piatti comodi per la stampante (print-order.js li legge già)
+    table_id:      meta.table?.id ?? null,
+    table_number:  meta.table?.number ?? null,
+    table_name:    meta.table?.label ?? null,  // label "umano" (qui = table_number se non c'è altro)
+
+    room_id:       meta.room?.id ?? null,
+    room_name:     meta.room?.name ?? null,
+
+    // annidati per completezza/diagnosi
+    reservation: meta.reservation ? {
+      id: meta.reservation.id,
+      table_id: meta.reservation.table_id,
+      room_id : meta.reservation.room_id,
+      table: meta.table,
+      room : meta.room,
+    } : null,
+
+    items
+  };
 }
 
 // ROUTES ----------------------------------------------------------------------
@@ -737,8 +926,12 @@ router.post('/', async (req, res) => {
   try {
     const scheduled = dto.scheduled_at ? toDate(dto.scheduled_at) : null;
     const items = Array.isArray(dto.items) ? dto.items : [];
+
+    // ✅ FIX: rimosso label "theTotal:" che generava SyntaxError con `const`
     const total = items.reduce((acc, it) => acc + toNum(it.price) * toNum(it.qty, 1), 0);
 
+    // NB: non assumo colonne extra su "orders" (reservation_id/table_id/room_id)
+    //     → salvo solo ciò che esiste sicuramente; la meta di stampa verrà “risolta”
     const r = await query(
       `INSERT INTO orders (customer_name, phone, email, people, scheduled_at, note, channel, status, total)
        VALUES (?,?,?,?,?,?,?,?,?)`,
@@ -764,13 +957,14 @@ router.post('/', async (req, res) => {
       );
     }
 
+    // Ritorno già l’oggetto arricchito (serve anche al FE)
     const full = await getOrderFullById(orderId);
     // Notifica SSE best-effort
     try { sse.emitCreated(full); } catch (e) { logger.warn('🧵 SSE created ⚠️', { e: String(e) }); }
 
     res.status(201).json(full);
   } catch (e) {
-    logger.error('🆕 orders create ❌', { reason: String(e) });
+    logger.error('🆕 orders create ❌', { service: 'server', reason: String(e) });
     res.status(500).json({ ok: false, error: 'orders_create_error', reason: String(e) });
   }
 });
@@ -784,20 +978,24 @@ router.patch('/:id(\\d+)/status', async (req, res) => {
     if (!allowed.has(status)) return res.status(400).json({ error: 'invalid_status' });
 
     await query(`UPDATE orders SET status=?, updated_at=UTC_TIMESTAMP() WHERE id=?`, [status, id]);
+
+    // Ritorno full arricchito (coerente con GET)
+    const full = await getOrderFullById(id);
     // Notifica SSE best-effort
     try { sse.emitStatus({ id, status }); } catch (e) { logger.warn('🧵 SSE status ⚠️', { e: String(e) }); }
-    res.json({ ok: true });
+
+    res.json(full);
   } catch (e) {
     logger.error('✏️ orders status ❌', { error: String(e) });
     res.status(500).json({ ok: false, error: 'orders_status_error' });
   }
 });
 
-// Stampa (best-effort, non blocca)
+// Stampa (best-effort, non blocca) — CONTO / DUAL
 router.post('/:id(\\d+)/print', async (req, res) => {
   try {
     const id = toNum(req.params.id);
-    const full = await getOrderFullById(id);
+    const full = await getOrderFullById(id); // 👈 con meta sala/tavolo
     if (!full) return res.status(404).json({ ok: false, error: 'not_found' });
 
     try {
@@ -810,6 +1008,33 @@ router.post('/:id(\\d+)/print', async (req, res) => {
   } catch (e) {
     logger.error('🖨️ orders print ❌', { error: String(e) });
     res.status(500).json({ ok: false, error: 'orders_print_error' });
+  }
+});
+
+// 🆕 Stampa COMANDA SOLO per un centro (PIZZERIA | CUCINA)
+router.post('/:id(\\d+)/print/comanda', async (req, res) => {
+  try {
+    const id = toNum(req.params.id);
+    const full = await getOrderFullById(id); // 👈 con meta sala/tavolo
+    if (!full) return res.status(404).json({ ok: false, error: 'not_found' });
+
+    const centerRaw = (req.body?.center || req.query?.center || 'pizzeria').toString().toUpperCase();
+    const center = centerRaw === 'CUCINA' ? 'CUCINA' : 'PIZZERIA';
+    const copies = Math.max(1, toNum(req.body?.copies || req.query?.copies, 1));
+
+    try {
+      for (let i = 0; i < copies; i++) {
+        await printOrderForCenter(full, center); // single copy per iter
+      }
+      logger.info('🧾 comanda OK', { id, center, copies });
+      return res.json({ ok: true, center, copies });
+    } catch (e) {
+      logger.warn('🧾 comanda ⚠️', { id, center, error: String(e) });
+      return res.status(502).json({ ok: false, error: 'printer_error', reason: String(e) });
+    }
+  } catch (e) {
+    logger.error('🧾 comanda ❌', { error: String(e) });
+    res.status(500).json({ ok: false, error: 'orders_comanda_error' });
   }
 });
 
@@ -2502,6 +2727,9 @@ if (ensureExists('api/product_ingredients', 'API /api/product-ingredients')) app
 app.use('/api/google/oauth', googleOauth);
 app.use('/api/google/people', googlePeople);
 
+// 🆕 NFC API
+app.use('/api/nfc', require('./api/nfc'));
+
 // Health
 if (ensureExists('api/health', 'API /api/health')) app.use('/api/health', require('./api/health'));
 
@@ -2903,6 +3131,230 @@ module.exports = {
   verifySmtp,
   sendStatusChangeEmail,
   sendReservationRejectionEmail,
+};
+```
+
+### ./src/services/nfc.service.js
+```
+// server/src/services/nfc.service.js
+// ============================================================================
+// NFC Service — gestione token/tag per tavoli
+// - generateToken(len): token base62 random (default 12)
+// - getActiveByTable(tableId): se esiste token attivo, lo ritorna; altrimenti ne crea uno
+// - bindTable(tableId, {forceNew}): forza rigenerazione (revoca i precedenti attivi) opzionale
+// - resolveToken(token): ritorna mapping + info tavolo/room + reservation "odierna" se presente
+// - revokeToken(token): set is_revoked=1 + revoked_at
+// - buildPublicUrl(token, req): preferisce ENV.PUBLIC_BASE_URL, fall back da req
+//
+// Dipendenze: db (mysql2 pool), logger, config ENV
+// NOTE ROBUSTEZZA:
+//   - Mai più "rows[0]" su variabile indefinita: wrapper query() che normalizza SEMPRE l'array.
+//   - Colonne allineate al tuo schema: tables.table_number (NON "number").
+// ============================================================================
+
+const crypto = require('crypto');
+const dbMod  = require('../db');           // può esportare direttamente il pool o { pool }
+const logger = require('../logger');       // winston (stile esistente)
+
+const TABLE = 'nfc_tags';
+
+// ————————————————————————————————————————————————————————————————————————————
+// Helpers
+// ————————————————————————————————————————————————————————————————————————————
+
+/** Ritorna sempre il pool (compat: module → pool | { pool }) */
+function getPool() {
+  return dbMod?.pool || dbMod;
+}
+
+/** Esegue query normalizzando SEMPRE rows in Array */
+async function query(sql, params = [], conn) {
+  const runner = conn || getPool();
+  try {
+    const ret = await runner.query(sql, params);
+    // mysql2/promise => [rows, fields] | alcuni wrapper => rows
+    const rows = Array.isArray(ret?.[0]) ? ret[0] : (Array.isArray(ret) ? ret : []);
+    return rows;
+  } catch (err) {
+    logger.error('❌ [NFC][SQL] Error', { sql, params, error: String(err) });
+    throw err;
+  }
+}
+
+function base62(bytes = 9) {
+  // 9 bytes ~ 12 char base62
+  const alphabet = '0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ';
+  const buf = crypto.randomBytes(bytes);
+  let out = '';
+  for (let i = 0; i < buf.length; i++) out += alphabet[buf[i] % alphabet.length];
+  return out;
+}
+
+function generateToken(len = 12) {
+  // token base62 di lunghezza "len"
+  let token = '';
+  while (token.length < len) token += base62(9);
+  return token.slice(0, len);
+}
+
+// ————————————————————————————————————————————————————————————————————————————
+// Core queries
+// ————————————————————————————————————————————————————————————————————————————
+
+async function getActiveByTable(tableId) {
+  const rows = await query(
+    `SELECT id, table_id, token, is_revoked, created_at
+       FROM ${TABLE}
+      WHERE table_id = ? AND is_revoked = 0
+      ORDER BY id DESC
+      LIMIT 1`,
+    [tableId]
+  );
+  return rows[0] || null; // ← sicuro: rows è sempre []
+}
+
+async function insertToken(tableId, token, conn) {
+  await query(
+    `INSERT INTO ${TABLE} (table_id, token, is_revoked, created_at)
+     VALUES (?, ?, 0, NOW())`,
+    [tableId, token],
+    conn
+  );
+}
+
+async function revokeByTable(tableId, conn) {
+  await query(
+    `UPDATE ${TABLE}
+        SET is_revoked = 1, revoked_at = NOW()
+      WHERE table_id = ? AND is_revoked = 0`,
+    [tableId],
+    conn
+  );
+}
+
+// ————————————————————————————————————————————————————————————————————————————
+// API publiche del servizio
+// ————————————————————————————————————————————————————————————————————————————
+
+async function bindTable(tableId, opts = {}) {
+  // Se forceNew → revoca e crea nuovo; altrimenti riusa se esiste
+  if (!tableId) throw new Error('table_id mancante');
+  const { forceNew = false } = opts;
+
+  if (!forceNew) {
+    const current = await getActiveByTable(tableId);
+    if (current) {
+      logger.info(`🔗 [NFC] Token esistente per table_id=${tableId} → ${current.token}`);
+      return current.token;
+    }
+  }
+
+  const pool = getPool();
+  const conn = await pool.getConnection();
+  try {
+    if (forceNew) {
+      logger.warn(`♻️ [NFC] Rigenerazione token per table_id=${tableId} (revoca precedenti)`);
+      await revokeByTable(tableId, conn);
+    }
+
+    // Genera un token unico (retry se collisione su UNIQUE uk_nfc_token)
+    let token = generateToken(12);
+    let ok = false;
+
+    for (let i = 0; i < 5 && !ok; i++) {
+      try {
+        await insertToken(tableId, token, conn);
+        ok = true;
+      } catch (err) {
+        const msg = String(err?.message || '');
+        if (msg.includes('uk_nfc_token') || msg.includes('Duplicate') || msg.includes('ER_DUP_ENTRY')) {
+          token = generateToken(12); // collisione → rigenera
+        } else {
+          throw err;
+        }
+      }
+    }
+
+    if (!ok) throw new Error('Impossibile generare token univoco');
+
+    logger.info(`✅ [NFC] Creato token ${token} per table_id=${tableId}`);
+    return token;
+  } finally {
+    try { conn.release(); } catch {}
+  }
+}
+
+async function resolveToken(token) {
+  if (!token) throw new Error('token mancante');
+
+  // 1) Trova mapping attivo + info tavolo/sala (schema allineato al tuo FE)
+  const rows = await query(
+    `SELECT n.table_id,
+            n.is_revoked,
+            t.table_number AS table_number,   -- 👈 allineato al tuo /api/tables
+            t.room_id,
+            r.name        AS room_name
+       FROM ${TABLE} n
+       JOIN tables t ON t.id = n.table_id
+  LEFT JOIN rooms  r ON r.id = t.room_id
+      WHERE n.token = ? AND n.is_revoked = 0
+      LIMIT 1`,
+    [token]
+  );
+  const m = rows[0];
+  if (!m) return null;
+
+  // 2) (Opzionale) Prenotazione "odierna" pending/accepted per quel tavolo
+  //    DB in UTC (tua policy): finestra [UTC_DATE(), UTC_DATE()+1d)
+  const resv = await query(
+    `SELECT id
+       FROM reservations
+      WHERE table_id = ?
+        AND status IN ('pending','accepted')
+        AND start_at >= UTC_DATE()
+        AND start_at <  (UTC_DATE() + INTERVAL 1 DAY)
+      ORDER BY start_at ASC
+      LIMIT 1`,
+    [m.table_id]
+  );
+
+  const reservation_id = resv?.[0]?.id || null;
+
+  return {
+    ok: true,
+    table_id: m.table_id,
+    table_number: m.table_number,
+    room_id: m.room_id,
+    room_name: m.room_name,
+    reservation_id
+  };
+}
+
+async function revokeToken(token) {
+  if (!token) throw new Error('token mancante');
+  await query(
+    `UPDATE ${TABLE}
+        SET is_revoked = 1, revoked_at = NOW()
+      WHERE token = ? AND is_revoked = 0`,
+    [token]
+  );
+  return { ok: true };
+}
+
+function buildPublicUrl(token, req) {
+  // Preferisci ENV.PUBLIC_BASE_URL (es. https://admin.miodominio.it)
+  const base = process.env.PUBLIC_BASE_URL
+    || `${req?.protocol || 'http'}://${req?.get ? req.get('host') : 'localhost:3000'}`;
+  return `${String(base).replace(/\/+$/, '')}/t/${encodeURIComponent(token)}`;
+}
+
+module.exports = {
+  generateToken,
+  bindTable,
+  resolveToken,
+  revokeToken,
+  getActiveByTable,
+  buildPublicUrl,
 };
 ```
 
@@ -5481,7 +5933,15 @@ module.exports = { mount, emitCreated, emitStatus };
 // Stampa ESC/POS “Pizzeria/Cucina”. NIENTE simbolo € (codepage problemi).
 // - legge env PRINTER_* e mapping categorie PIZZERIA_CATEGORIES / KITCHEN_CATEGORIES
 // - se PRINTER_ENABLED=false → no-op (non blocca i flussi)
+// - 🆕 per COMANDA (centro produzione): font più grande + bold, cliente/tavolo/sala evidenti,
+//   raggruppamento per categoria (ANTIPASTI → PIZZE ROSSE → PIZZE BIANCHE → altre)
+//   + spaziatura maggiore e wrapping note (leggibile per dislessia)
+//   + prezzi per riga (in piccolo) e totale finale (senza simbolo €)
+//   + orario “DOMENICA 10/11/2025  ore 04:42”
 // ============================================================================
+// Nota: manteniamo lo stile verboso con emoji nei log, come da progetto.
+// ============================================================================
+
 'use strict';
 
 const net = require('net');
@@ -5501,8 +5961,66 @@ const {
 } = process.env;
 
 function esc(...codes) { return Buffer.from(codes); }
-const TXT = s => Buffer.from(String(s) + '\n', 'utf8');
 
+// --- ESC/POS helpers (dimensioni/bold/alignment/spacing/font/codepage) ------
+function init(sock) { sock.write(esc(0x1B,0x40)); }                    // ESC @
+function alignLeft(sock){ sock.write(esc(0x1B,0x61,0x00)); }           // ESC a 0
+function alignCenter(sock){ sock.write(esc(0x1B,0x61,0x01)); }         // ESC a 1
+function boldOn(sock){ sock.write(esc(0x1B,0x45,0x01)); }              // ESC E 1
+function boldOff(sock){ sock.write(esc(0x1B,0x45,0x00)); }             // ESC E 0
+function sizeNormal(sock){ sock.write(esc(0x1D,0x21,0x00)); }          // GS ! 0 (1x)
+function sizeTall(sock){ sock.write(esc(0x1D,0x21,0x01)); }            // GS ! 1 (2x altezza)
+function sizeBig(sock){ sock.write(esc(0x1D,0x21,0x11)); }             // GS ! 17 (2x larghezza+altezza)
+function fontA(sock){ sock.write(esc(0x1B,0x4D,0x00)); }               // ESC M 0 → Font A (leggibile)
+function charSpacing(sock, n){ sock.write(esc(0x1B,0x20, Math.max(0,Math.min(255,n)))); } // ESC SP n
+function setLineSpacing(sock, n){ sock.write(esc(0x1B,0x33, Math.max(0,Math.min(255,n)))); } // ESC 3 n
+function resetLineSpacing(sock){ sock.write(esc(0x1B,0x32)); }         // ESC 2 (default)
+function feedLines(sock, n){ sock.write(esc(0x1B,0x64, Math.max(0,Math.min(255,n)))); }     // ESC d n
+function cutIfEnabled(sock){ if (PRINTER_CUT === 'true') sock.write(esc(0x1D,0x56,0x42,0x00)); } // GS V B n
+function codepageCP1252(sock){ try{ sock.write(esc(0x1B,0x74,0x10)); }catch{} } // ESC t 16 → CP1252 (tipico Epson)
+
+// --- Scrittura linea con sanificazione (accenti/apici/dash) -----------------
+function sanitizeForEscpos(s) {
+  return String(s || '')
+    // apici/virgolette tipografiche → ASCII
+    .replace(/[\u2018\u2019]/g, "'")
+    .replace(/[\u201C\u201D]/g, '"')
+    // em/en dash → trattino semplice
+    .replace(/[\u2013\u2014]/g, '-')
+    // simbolo euro → testuale
+    .replace(/€+/g, 'EUR')
+    // spazi multipli → singolo
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+function writeLine(sock, s) {
+  const line = sanitizeForEscpos(s) + '\n';
+  // molti ESC/POS accettano latin1; con CP1252 selezionata gli accenti IT vanno ok
+  sock.write(Buffer.from(line, 'latin1'));
+}
+
+// --- Layout/Wrap COMANDA -----------------------------------------------------
+const COMANDA_MAX_COLS = 42;        // stima sicura per 80mm con Font A
+const COMANDA_LINE_SP  = 48;        // spaziatura righe “larga” per leggibilità
+
+function wrapText(s, max = COMANDA_MAX_COLS) {
+  const text = sanitizeForEscpos(s);
+  if (!text) return [];
+  const words = text.split(' ');
+  const out = []; let cur = '';
+  for (const w of words) {
+    const candidate = cur ? cur + ' ' + w : w;
+    if (candidate.length <= max) cur = candidate;
+    else { if (cur) out.push(cur); cur = w; }
+  }
+  if (cur) out.push(cur);
+  return out;
+}
+
+function qtyStr(q) { return String(Math.max(1, Number(q) || 1)).padStart(2,' '); }
+function money(n){ return Number(n || 0).toFixed(2); }
+
+// ----------------------------------------------------------------------------
 function openSocket() {
   return new Promise((resolve, reject) => {
     const socket = net.createConnection(
@@ -5528,41 +6046,203 @@ function splitByDept(items) {
   return { pizzeria, kitchen };
 }
 
+// --- Ordinamento categorie per COMANDA (centro produzione) -------------------
+const COMANDA_CATEGORY_ORDER = [
+  'ANTIPASTI',
+  'PIZZE ROSSE',
+  'PIZZE BIANCHE',
+];
+function categoryRank(name) {
+  const up = (name || 'Altro').toString().toUpperCase().trim();
+  const idx = COMANDA_CATEGORY_ORDER.indexOf(up);
+  return idx === -1 ? 100 + up.charCodeAt(0) : idx; // sconosciute dopo, ma stabili
+}
+
+// --- Estrai "Sala ..." e "Tavolo ..." ---------------------------------------
+function extractTableLabel(order) {
+  const direct = order.table_name || order.table_number || order.table_label || order.table_id;
+  if (direct) return `Tavolo ${direct}`;
+  const note = (order.note || '').toString();
+  const m = note.match(/Tavolo\s+([A-Za-z0-9\-_]+)/i);
+  return m ? `Tavolo ${m[1]}` : null;
+}
+function extractRoomLabel(order) {
+  const direct = order.room_name || order.room_label || order.room;
+  if (direct) return `Sala ${direct}`;
+  if (order.room_id) return `Sala ${order.room_id}`;
+  return null;
+}
+
+// --- Formattazione orario stile “DOMENICA 10/11/2025  ore 04:42” -------------
+function fmtComandaDate(iso) {
+  try{
+    const d = iso ? new Date(iso) : new Date();
+    const gg = d.toLocaleDateString('it-IT', { weekday: 'long' }).toUpperCase();
+    const dd = String(d.getDate()).padStart(2,'0');
+    const mm = String(d.getMonth()+1).padStart(2,'0');
+    const yy = d.getFullYear();
+    const hh = String(d.getHours()).padStart(2,'0');
+    const mn = String(d.getMinutes()).padStart(2,'0');
+    return `${gg} ${dd}/${mm}/${yy}  ore ${hh}:${mn}`;
+  }catch{ return String(iso || ''); }
+}
+
+// --- Stampa standard (CONTO) -------------------------------------------------
 async function printSlip(title, order) {
   const sock = await openSocket();
-
   const write = (buf) => sock.write(buf);
-  const cut   = () => { if (PRINTER_CUT === 'true') write(esc(0x1D, 0x56, 0x42, 0x00)); };
 
-  const headerLines = (PRINTER_HEADER || '').split('|').filter(Boolean);
-  write(esc(0x1B,0x40));            // init
-  write(esc(0x1B,0x21,0x20));       // double height
-  write(TXT(title));
+  init(sock);
+  // Titolo alto (come prima)
+  write(esc(0x1B,0x21,0x20));       // double height (compat classic)
+  write(Buffer.from(String(title)+'\n','latin1'));
   write(esc(0x1B,0x21,0x00));       // normal
 
-  for (const h of headerLines) write(TXT(h));
+  const headerLines = (PRINTER_HEADER || '').split('|').filter(Boolean);
+  for (const h of headerLines) write(Buffer.from(sanitizeForEscpos(h)+'\n','latin1'));
 
-  write(TXT('------------------------------'));
-  write(TXT(`#${order.id}  ${order.customer_name}`));
-  if (order.phone) write(TXT(order.phone));
-  if (order.people) write(TXT(`Coperti: ${order.people}`));
-  if (order.scheduled_at) write(TXT(`Orario: ${order.scheduled_at}`));
-  write(TXT('------------------------------'));
+  write(Buffer.from('------------------------------\n','latin1'));
+  write(Buffer.from(`#${order.id}  ${sanitizeForEscpos(order.customer_name)}\n`,'latin1'));
+  if (order.phone) write(Buffer.from(`${sanitizeForEscpos(order.phone)}\n`,'latin1'));
+  if (order.people) write(Buffer.from(`Coperti: ${order.people}\n`,'latin1'));
+  if (order.scheduled_at) write(Buffer.from(`Orario: ${fmtComandaDate(order.scheduled_at)}\n`,'latin1'));
+  write(Buffer.from('------------------------------\n','latin1'));
 
   for (const it of order.items) {
-    // NO simbolo euro: stampa “prezzo” semplice
-    write(TXT(`${it.qty} x ${it.name}  ${Number(it.price).toFixed(2)}`));
-    if (it.notes) write(TXT(`  NOTE: ${it.notes}`));
+    write(Buffer.from(`${it.qty} x ${sanitizeForEscpos(it.name)}  ${money(it.price)}\n`,'latin1'));
+    if (it.notes) write(Buffer.from(`  NOTE: ${sanitizeForEscpos(it.notes)}\n`,'latin1'));
   }
 
-  write(TXT('------------------------------'));
-  write(TXT(`Totale: ${Number(order.total || 0).toFixed(2)}`));
+  write(Buffer.from('------------------------------\n','latin1'));
+  write(Buffer.from(`Totale: ${money(order.total || 0)}\n`,'latin1'));
   if (PRINTER_FOOTER) {
-    write(TXT(''));
-    for (const f of (PRINTER_FOOTER || '').split('|')) write(TXT(f));
+    write(Buffer.from('\n','latin1'));
+    for (const f of (PRINTER_FOOTER || '').split('|')) write(Buffer.from(sanitizeForEscpos(f)+'\n','latin1'));
   }
-  write(TXT(''));
-  cut();
+  write(Buffer.from('\n','latin1'));
+  cutIfEnabled(sock);
+  sock.end();
+}
+
+// --- Normalizzazione NOTE prodotto → “SENZA: …\nAGGIUNGI: …” -----------------
+function normalizeNotesForKitchen(raw) {
+  if (!raw) return null;
+  let s = String(raw);
+  // separatore “—” → newline; EXTRA → AGGIUNGI
+  s = s.replace(/—/g, '\n'); // em-dash → newline
+  s = s.replace(/\bEXTRA:/gi, 'AGGIUNGI:');
+  // se qualcuno scrive “SENZA: … AGGIUNGI: …” su 1 sola riga con trattini → forza newline
+  s = s.replace(/\s*[-–—]\s*AGGIUNGI:/gi, '\nAGGIUNGI:');
+  // pulizia
+  s = sanitizeForEscpos(s);
+  return s;
+}
+
+// --- Stampa COMANDA (centro produzione) — font grande/bold + spacing ---------
+async function printComandaSlip(title, order) {
+  const sock = await openSocket();
+
+  // init + set leggibilità (Font A, spaziatura righe, leggera spaziatura caratteri, codepage)
+  init(sock);
+  codepageCP1252(sock);
+  fontA(sock);
+  setLineSpacing(sock, COMANDA_LINE_SP);
+  charSpacing(sock, 1);
+
+  // Intestazione centrale
+  alignCenter(sock);
+  sizeBig(sock); boldOn(sock); writeLine(sock, title); boldOff(sock);
+
+  const client = (order.customer_name || 'Cliente').toString().trim();
+  sizeBig(sock); boldOn(sock); writeLine(sock, client); boldOff(sock);
+
+  const room = extractRoomLabel(order);
+  const table = extractTableLabel(order);
+  if (room) { sizeBig(sock); boldOn(sock); writeLine(sock, room); boldOff(sock); }
+  if (table){ sizeBig(sock); boldOn(sock); writeLine(sock, table); boldOff(sock); }
+
+  // Sub-intestazione compatta
+  sizeNormal(sock);
+  writeLine(sock, '==============================');
+  alignLeft(sock);
+  writeLine(sock, `#${order.id}`);
+  if (order.people) writeLine(sock, `Coperti: ${order.people}`);
+  if (order.scheduled_at) writeLine(sock, `Orario: ${fmtComandaDate(order.scheduled_at)}`);
+  if (order.phone) writeLine(sock, `Tel: ${order.phone}`);
+  if (order.note) {
+    const nlines = wrapText(`Note: ${order.note}`, COMANDA_MAX_COLS);
+    for (const ln of nlines) writeLine(sock, ln);
+  }
+  writeLine(sock, '------------------------------');
+
+  // Raggruppa per categoria con ordinamento desiderato
+  const groups = new Map(); // cat -> items[]
+  for (const it of (order.items || [])) {
+    const cat = (it.category || 'Altro').toString();
+    if (!groups.has(cat)) groups.set(cat, []);
+    groups.get(cat).push(it);
+  }
+  const categories = Array.from(groups.keys()).sort((a,b) => {
+    const ra = categoryRank(a), rb = categoryRank(b);
+    return ra === rb ? a.localeCompare(b, 'it') : ra - rb;
+  });
+
+  // Stampa per categoria
+  let grand = 0;
+  for (const cat of categories) {
+    const list = groups.get(cat) || [];
+
+    // Header categoria in bold (un pelo più grande)
+    writeLine(sock, ''); // riga vuota
+    boldOn(sock); sizeTall(sock); writeLine(sock, cat.toUpperCase()); boldOff(sock); sizeNormal(sock);
+    writeLine(sock, '------------------------------');
+
+    // Prodotto: qty ben visibile + nome in bold (UPPER), con spaziatura verticale extra
+    for (const it of list) {
+      const qty = Math.max(1, Number(it.qty) || 1);
+      const qtyTxt = qtyStr(qty);
+      const name = (it.name || '').toString().trim().toUpperCase();
+
+      // Riga principale (grande)
+      boldOn(sock); sizeTall(sock);
+      writeLine(sock, `${qtyTxt} x ${name}`);
+      boldOff(sock); sizeNormal(sock);
+
+      // NOTE (normalizzate: SENZA → newline → AGGIUNGI)
+      if (it.notes) {
+        const norm = normalizeNotesForKitchen(it.notes);
+        const lines = wrapText(`NOTE: ${norm}`, COMANDA_MAX_COLS);
+        boldOn(sock);
+        for (const ln of lines) writeLine(sock, '  ' + ln);
+        boldOff(sock);
+      }
+
+      // Prezzi in piccolo (unitario e totale riga)
+      const unit = Number(it.price || 0);
+      const rowTot = unit * qty;
+      if (unit > 0) {
+        writeLine(sock, `  prezzo: ${money(unit)}  •  riga: ${money(rowTot)}`);
+      }
+      grand += rowTot;
+
+      // aria tra righe prodotto
+      feedLines(sock, 1);
+    }
+  }
+
+  // Totale COMANDA (solo numerico, niente €)
+  alignCenter(sock);
+  writeLine(sock, '==============================');
+  boldOn(sock); writeLine(sock, `TOTALE: ${money(grand)}`); boldOff(sock);
+
+  // Footer tecnico + reset spacing + taglio
+  writeLine(sock, '');
+  writeLine(sock, 'COMANDA');
+  writeLine(sock, '');
+
+  resetLineSpacing(sock);
+  charSpacing(sock, 0);
+  cutIfEnabled(sock);
   sock.end();
 }
 
@@ -5579,19 +6259,57 @@ async function printOrderDual(orderFull) {
     people: orderFull.people,
     scheduled_at: orderFull.scheduled_at,
     total: orderFull.total,
+    note: orderFull.note,                 // per eventuale 'Tavolo ...'
+    table_name: orderFull.table_name,     // se forniti dal chiamante
+    table_number: orderFull.table_number, // idem
+    table_id: orderFull.table_id,         // idem
+    room_name: orderFull.room_name,       // 🆕 sala se disponibile
+    room_id: orderFull.room_id,           // 🆕 id sala come fallback
   };
 
-  // stampa PIZZERIA
   if (pizzeria.length) {
     await printSlip('PIZZERIA', { ...head, items: pizzeria });
     logger.info('🖨️  PIZZERIA printed', { id: orderFull.id, items: pizzeria.length });
   }
-  // stampa CUCINA
   if (kitchen.length) {
     await printSlip('CUCINA', { ...head, items: kitchen });
     logger.info('🖨️  CUCINA printed', { id: orderFull.id, items: kitchen.length });
   }
 }
 
-module.exports = { printOrderDual };
+// 🆕 Stampa SOLO un centro (PIZZERIA | CUCINA) — usa la formattazione COMANDA
+async function printOrderForCenter(orderFull, center = 'PIZZERIA') {
+  if (PRINTER_ENABLED !== 'true') {
+    logger.warn('🧾 PRINT(comanda) disabled (PRINTER_ENABLED=false)');
+    return;
+  }
+  const { pizzeria, kitchen } = splitByDept(orderFull.items || []);
+  const head = {
+    id: orderFull.id,
+    customer_name: orderFull.customer_name,
+    phone: orderFull.phone,
+    people: orderFull.people,
+    scheduled_at: orderFull.scheduled_at,
+    total: orderFull.total,
+    note: orderFull.note,
+    table_name: orderFull.table_name,
+    table_number: orderFull.table_number,
+    table_id: orderFull.table_id,
+    room_name: orderFull.room_name,   // 🆕
+    room_id: orderFull.room_id,       // 🆕
+  };
+
+  const which = String(center || 'PIZZERIA').toUpperCase();
+  const payload = which === 'CUCINA' ? kitchen : pizzeria;
+  const title   = which === 'CUCINA' ? 'CUCINA' : 'PIZZERIA';
+
+  if (!payload.length) {
+    logger.info('🧾 comanda skip (no items per centro)', { id: orderFull.id, center: which });
+    return;
+  }
+  await printComandaSlip(title, { ...head, items: payload }); // 👈 stile COMANDA
+  logger.info('🧾 comanda printed', { id: orderFull.id, center: which, items: payload.length });
+}
+
+module.exports = { printOrderDual, printOrderForCenter };
 ```

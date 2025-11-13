@@ -67,6 +67,9 @@ if (ensureExists('api/product_ingredients', 'API /api/product-ingredients')) app
 app.use('/api/google/oauth', googleOauth);
 app.use('/api/google/people', googlePeople);
 
+// 🆕 NFC API
+app.use('/api/nfc', require('./api/nfc'));
+
 // Health
 if (ensureExists('api/health', 'API /api/health')) app.use('/api/health', require('./api/health'));
 

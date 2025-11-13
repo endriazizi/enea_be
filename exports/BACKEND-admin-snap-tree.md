@@ -1,6 +1,6 @@
 # 📁 Project tree (.)
 
-_Generato: Mon, Nov 10, 2025  2:49:27 AM_
+_Generato: Thu, Nov 13, 2025 10:56:06 AM_
 
 ```text
 .
@@ -25,6 +25,7 @@ src/api/google/people.js
 src/api/google.js
 src/api/health.js
 src/api/ingredients.js
+src/api/nfc.js
 src/api/notifications.js
 src/api/orders.js
 src/api/printer.js
@@ -56,6 +57,7 @@ src/server.js
 src/services
 src/services/google.service.js
 src/services/mailer.service.js
+src/services/nfc.service.js
 src/services/notify.service.js
 src/services/order-printer.service.js
 src/services/orders.service.js
