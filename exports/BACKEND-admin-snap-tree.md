@@ -1,6 +1,6 @@
 # 📁 Project tree (.)
 
-_Generato: Thu, Nov 13, 2025 10:56:06 AM_
+_Generato: Fri, Nov 14, 2025  6:38:17 PM_
 
 ```text
 .
@@ -25,6 +25,7 @@ src/api/google/people.js
 src/api/google.js
 src/api/health.js
 src/api/ingredients.js
+src/api/nfc-session.js
 src/api/nfc.js
 src/api/notifications.js
 src/api/orders.js
@@ -72,6 +73,7 @@ src/services/whatsapp.twilio.service.jS
 src/services/whatsender.service.js
 src/sockets
 src/sockets/index.js
+src/sockets/nfc.session.js
 src/sockets/orders.channel.js
 src/sockets/orders.js
 src/sockets/reservations.js

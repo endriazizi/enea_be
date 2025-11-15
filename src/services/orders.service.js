@@ -1,4 +1,4 @@
-// server/src/api/orders.js
+// C:\Users\Endri Azizi\progetti-dev\my_dev\be\src\services\orders.service.js
 // ============================================================================
 // ORDERS API (REST + SSE) — stile Endri: commenti lunghi, log con emoji
 // Rotte:

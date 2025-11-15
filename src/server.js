@@ -1,4 +1,4 @@
-// server/src/server.js
+// C:\Users\Endri Azizi\progetti-dev\my_dev\be\src\server.js
 'use strict';
 
 const path = require('path');
@@ -60,8 +60,6 @@ if (ensureExists('api/product_ingredients', 'API /api/product-ingredients')) app
  * 🧹 GOOGLE – MOUNT PULITI
  * - Disabilito il vecchio router /api/google (cercava user_id e ti rompeva).
  * - Lascio solo /api/google/oauth e /api/google/people.
- *
- *  (Prima l’ordine poteva far prendere il router sbagliato → errore user_id)  // ref: tuo snapshot
  */
 // ❌ legacy: app.use('/api/google', require('./api/google'));  // DISATTIVATO
 app.use('/api/google/oauth', googleOauth);
@@ -69,6 +67,8 @@ app.use('/api/google/people', googlePeople);
 
 // 🆕 NFC API
 app.use('/api/nfc', require('./api/nfc'));
+// 🆕 NFC Session API (ultimo ordine per sessione)
+app.use('/api/nfc/session', require('./api/nfc-session')); // <— AGGIUNTA
 
 // Health
 if (ensureExists('api/health', 'API /api/health')) app.use('/api/health', require('./api/health'));

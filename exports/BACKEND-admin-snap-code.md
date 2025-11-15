@@ -1,6 +1,6 @@
 # 🧩 Project code (file ammessi in .)
 
-_Generato: Thu, Nov 13, 2025 10:56:07 AM_
+_Generato: Fri, Nov 14, 2025  6:38:18 PM_
 
 ### ./package.json
 ```
@@ -427,9 +427,10 @@ module.exports = router;
 
 ### ./src/api/nfc.js
 ```
-// server/src/api/nfc.js
+// C:\Users\Endri Azizi\progetti-dev\my_dev\be\src\api\nfc.js
 // ============================================================================
-// API NFC — bind/resolve/qr/url per tag NFC dei tavoli
+// API NFC — bind/resolve/qr/url per tag NFC dei tavoli + gestione sessione
+// + 🆕 CART snapshot con optimistic locking e broadcast Socket.IO
 // Mantiene stile log con emoji e risposte { ok, ... }.
 // ============================================================================
 
@@ -438,8 +439,13 @@ const router  = express.Router();
 const NFC     = require('../services/nfc.service');
 const logger  = require('../logger');
 
-// POST /api/nfc/bind { table_id, forceNew? }
-// → { ok:true, token, url }
+// Helper per ottenere io: preferisci req.app.get('io'), fallback al singleton
+function getIO(req) {
+  try { return req.app?.get('io') || require('../sockets').io(); }
+  catch { return null; }
+}
+
+// POST /api/nfc/bind { table_id, forceNew? } → { ok, token, url }
 router.post('/bind', async (req, res) => {
   try {
     const { table_id, forceNew } = req.body || {};
@@ -455,7 +461,7 @@ router.post('/bind', async (req, res) => {
   }
 });
 
-// GET /api/nfc/resolve?token=XYZ → { ok, table_id, room_id, table_number, reservation_id? }
+// GET /api/nfc/resolve?token=XYZ → { ok, table_id, room_id, table_number, reservation_id?, session_id }
 router.get('/resolve', async (req, res) => {
   try {
     const token = String(req.query.token || '').trim();
@@ -464,7 +470,7 @@ router.get('/resolve', async (req, res) => {
     const info = await NFC.resolveToken(token);
     if (!info)  return res.status(404).json({ ok: false, error: 'not_found_or_revoked' });
 
-    logger.info(`🔎 [API] resolve token=${token} → table_id=${info.table_id}`);
+    logger.info(`🔎 [API] resolve token=${token} → table_id=${info.table_id} (session_id=${info.session_id})`);
     res.json(info);
   } catch (err) {
     logger.error('❌ [API] /nfc/resolve', { error: String(err) });
@@ -478,7 +484,6 @@ router.get('/url/:tableId', async (req, res) => {
     const tableId = Number(req.params.tableId);
     if (!tableId) return res.status(400).json({ ok: false, error: 'tableId non valido' });
 
-    // Riuso se esiste, altrimenti crea
     const token = await NFC.bindTable(tableId, { forceNew: false });
     const url   = NFC.buildPublicUrl(token, req);
     res.json({ ok: true, token, url });
@@ -489,13 +494,12 @@ router.get('/url/:tableId', async (req, res) => {
 });
 
 // GET /api/nfc/qr?u=ENCODED_URL → PNG (qrcode)
-// GET /api/nfc/qr/token/:token   → PNG (qrcode della URL pubblica)
 router.get('/qr', async (req, res) => {
   try {
     const url = String(req.query.u || '').trim();
     if (!url) return res.status(400).json({ ok: false, error: 'u mancante' });
 
-    const QR = require('qrcode'); // runtime require
+    const QR = require('qrcode');
     res.setHeader('Content-Type', 'image/png');
     QR.toFileStream(res, url, { errorCorrectionLevel: 'M', margin: 1, scale: 6 });
   } catch (err) {
@@ -504,6 +508,7 @@ router.get('/qr', async (req, res) => {
   }
 });
 
+// GET /api/nfc/qr/token/:token → PNG
 router.get('/qr/token/:token', async (req, res) => {
   try {
     const token = String(req.params.token || '').trim();
@@ -516,6 +521,176 @@ router.get('/qr/token/:token', async (req, res) => {
   } catch (err) {
     logger.error('❌ [API] /nfc/qr/token/:token', { error: String(err) });
     res.status(500).json({ ok: false, error: err?.message || 'internal_error' });
+  }
+});
+
+// =========================== SESSIONI (stato veloce) =======================
+// GET /api/nfc/session/active?table_id=123
+// → { ok:true, active:false }  oppure
+// → { ok:true, active:true, session_id, started_at, cart_updated_at }
+router.get('/session/active', async (req, res) => {
+  try {
+    const tableId = Number(req.query.table_id || 0) || 0;
+    if (!tableId) return res.status(400).json({ ok: false, error: 'table_id mancante' });
+
+    let row = null;
+    // Tollerante ai nomi metodo nel service
+    if (typeof NFC.getActiveSessionForTable === 'function') {
+      row = await NFC.getActiveSessionForTable(tableId);
+    } else if (typeof NFC.getActiveSession === 'function') {
+      row = await NFC.getActiveSession(tableId);
+    } else if (typeof NFC.findActiveSessionForTable === 'function') {
+      row = await NFC.findActiveSessionForTable(tableId);
+    }
+
+    if (!row) return res.json({ ok: true, active: false });
+
+    const session_id      = Number(row.session_id || row.id || 0) || null;
+    const started_at      = row.started_at || row.created_at || null;
+    const cart_updated_at = row.cart_updated_at || null;
+
+    res.json({ ok: true, active: true, session_id, started_at, cart_updated_at });
+  } catch (err) {
+    logger.error('❌ [API] /nfc/session/active', { error: String(err) });
+    res.status(500).json({ ok: false, error: err?.message || 'internal_error' });
+  }
+});
+
+// =========================== CART SNAPSHOT ================================
+// GET /api/nfc/session/cart?session_id=SID → { ok, session_id, version, cart, updated_at }
+router.get('/session/cart', async (req, res) => {
+  try {
+    const sessionId = Number(req.query.session_id || 0) || 0;
+    if (!sessionId) return res.status(400).json({ ok: false, error: 'session_id mancante' });
+
+    const cur = await NFC.getSessionCart(sessionId);
+    if (!cur) return res.status(404).json({ ok: false, error: 'session_not_found' });
+
+    let cart = null;
+    try { cart = cur.cart_json ? JSON.parse(cur.cart_json) : null; } catch { cart = null; }
+
+    res.json({ ok: true, session_id: sessionId, version: cur.version || 0, cart, updated_at: cur.cart_updated_at || null });
+  } catch (err) {
+    logger.error('❌ [API] GET /nfc/session/cart', { error: String(err) });
+    res.status(500).json({ ok: false, error: err?.message || 'internal_error' });
+  }
+});
+
+// PUT /api/nfc/session/cart  { session_id, version, cart }
+router.put('/session/cart', async (req, res) => {
+  try {
+    const { session_id, version, cart } = req.body || {};
+    const sessionId = Number(session_id || 0) || 0;
+    if (!sessionId) return res.status(400).json({ ok: false, error: 'session_id mancante' });
+
+    const out = await NFC.saveSessionCart(sessionId, Number(version || 0), cart || null);
+
+    // Broadcast Socket.IO su stanza session:<SID>
+    const io = getIO(req);
+    if (io && out?.ok) {
+      io.to(`session:${sessionId}`).emit('nfc:cart_updated', {
+        session_id: sessionId,
+        version   : out.version,
+        at        : out.updated_at
+      });
+    }
+
+    res.json({ ok: true, session_id: sessionId, version: out.version, updated_at: out.updated_at });
+  } catch (err) {
+    if (err?.status === 409) {
+      return res.status(409).json({ ok: false, error: 'version_conflict', current: err.current || null });
+    }
+    logger.error('❌ [API] PUT /nfc/session/cart', { error: String(err) });
+    res.status(500).json({ ok: false, error: err?.message || 'internal_error' });
+  }
+});
+
+// 🆕 POST /api/nfc/session/close { table_id, by? } → { ok:true, closed, session_id? }
+router.post('/session/close', async (req, res) => {
+  try {
+    const table_id = Number(req.body?.table_id || 0);
+    const by       = (req.body?.by || 'api/nfc').toString();
+    if (!table_id) return res.status(400).json({ ok: false, error: 'table_id mancante' });
+
+    const out = await NFC.closeActiveSession(table_id, { by, reason: 'manual' });
+    logger.info(`🛑 [API] close session table_id=${table_id} →`, out);
+
+    // Broadcast di chiusura (facoltativo)
+    const io = getIO(req);
+    if (io && out?.session_id) io.to(`session:${out.session_id}`).emit('nfc:cart_updated', { session_id: out.session_id, closed: true });
+
+    res.json({ ok: true, ...out });
+  } catch (err) {
+    logger.error('❌ [API] /nfc/session/close', { error: String(err) });
+    res.status(500).json({ ok: false, error: err?.message || 'internal_error' });
+  }
+});
+
+module.exports = router;
+```
+
+### ./src/api/nfc-session.js
+```
+// C:\Users\Endri Azizi\progetti-dev\my_dev\be\src\api\nfc-session.js
+// ============================================================================
+// API NFC Session — interrogazione stato sessione (ultimo ordine, ecc.)
+// - GET /api/nfc/session/last-order?session_id=123
+//   → { ok:true, hasOrder:boolean, order: { id, status, total, items:[...] } | null }
+// Stile: commenti lunghi, log con emoji
+// ============================================================================
+'use strict';
+
+const express = require('express');
+const router  = express.Router();
+const { query } = require('../db');
+
+router.get('/last-order', async (req, res) => {
+  const log = req.app.get('logger');
+  try {
+    const sessionId = Number(req.query.session_id || 0) || 0;
+    if (!sessionId) return res.status(400).json({ ok:false, error:'session_id_required' });
+
+    // 1) prendo last_order_id dalla sessione
+    const rows1 = await query('SELECT last_order_id FROM table_sessions WHERE id = ?', [ sessionId ]);
+    const lastOrderId = Number(rows1?.[0]?.last_order_id || 0) || 0;
+    if (!lastOrderId) {
+      log?.info?.('📭 [NFC] no last_order for session', { sessionId });
+      return res.json({ ok:true, hasOrder:false, order:null });
+    }
+
+    // 2) header + total aggregato
+    const rows2 = await query(`
+      SELECT
+        o.id, o.status, o.customer_name, o.phone, o.note, o.people,
+        o.channel, o.reservation_id, o.table_id, o.room_id, o.scheduled_at,
+        o.created_at, o.updated_at,
+        IFNULL(SUM(oi.qty * oi.price), 0) AS total
+      FROM orders o
+      LEFT JOIN order_items oi ON oi.order_id = o.id
+      WHERE o.id = ?
+      GROUP BY o.id
+    `, [ lastOrderId ]);
+
+    if (!rows2?.length) {
+      log?.warn?.('❓ [NFC] last_order_id presente ma ordine non trovato', { sessionId, lastOrderId });
+      return res.json({ ok:true, hasOrder:false, order:null });
+    }
+
+    const order = rows2[0];
+
+    // 3) items dettagliati
+    const items = await query(`
+      SELECT id, name, qty, price, notes
+      FROM order_items
+      WHERE order_id = ?
+      ORDER BY id
+    `, [ lastOrderId ]);
+
+    log?.info?.('📦 [NFC] last-order found', { sessionId, lastOrderId, items: items.length });
+    return res.json({ ok:true, hasOrder:true, order: { ...order, items } });
+  } catch (e) {
+    req.app.get('logger')?.error?.('💥 [NFC] /session/last-order failed', { error: String(e) });
+    return res.status(500).json({ ok:false, error:'last_order_failed' });
   }
 });
 
@@ -734,6 +909,7 @@ module.exports = router;
 
 ### ./src/api/orders.js
 ```
+//C:\Users\Endri Azizi\progetti-dev\my_dev\be\src\api\orders.js
 // ============================================================================
 // ORDERS API (root = /api/orders)
 // - GET    /                lista (hours | from/to | status | q)
@@ -2658,7 +2834,7 @@ module.exports = function reqResLogger(req, res, next) {
 
 ### ./src/server.js
 ```
-// server/src/server.js
+// C:\Users\Endri Azizi\progetti-dev\my_dev\be\src\server.js
 'use strict';
 
 const path = require('path');
@@ -2720,8 +2896,6 @@ if (ensureExists('api/product_ingredients', 'API /api/product-ingredients')) app
  * 🧹 GOOGLE – MOUNT PULITI
  * - Disabilito il vecchio router /api/google (cercava user_id e ti rompeva).
  * - Lascio solo /api/google/oauth e /api/google/people.
- *
- *  (Prima l’ordine poteva far prendere il router sbagliato → errore user_id)  // ref: tuo snapshot
  */
 // ❌ legacy: app.use('/api/google', require('./api/google'));  // DISATTIVATO
 app.use('/api/google/oauth', googleOauth);
@@ -2729,6 +2903,8 @@ app.use('/api/google/people', googlePeople);
 
 // 🆕 NFC API
 app.use('/api/nfc', require('./api/nfc'));
+// 🆕 NFC Session API (ultimo ordine per sessione)
+app.use('/api/nfc/session', require('./api/nfc-session')); // <— AGGIUNTA
 
 // Health
 if (ensureExists('api/health', 'API /api/health')) app.use('/api/health', require('./api/health'));
@@ -3136,108 +3312,68 @@ module.exports = {
 
 ### ./src/services/nfc.service.js
 ```
-// server/src/services/nfc.service.js
+'use strict';
+
+// src/services/nfc.service.js
 // ============================================================================
-// NFC Service — gestione token/tag per tavoli
-// - generateToken(len): token base62 random (default 12)
-// - getActiveByTable(tableId): se esiste token attivo, lo ritorna; altrimenti ne crea uno
-// - bindTable(tableId, {forceNew}): forza rigenerazione (revoca i precedenti attivi) opzionale
-// - resolveToken(token): ritorna mapping + info tavolo/room + reservation "odierna" se presente
-// - revokeToken(token): set is_revoked=1 + revoked_at
-// - buildPublicUrl(token, req): preferisce ENV.PUBLIC_BASE_URL, fall back da req
-//
-// Dipendenze: db (mysql2 pool), logger, config ENV
-// NOTE ROBUSTEZZA:
-//   - Mai più "rows[0]" su variabile indefinita: wrapper query() che normalizza SEMPRE l'array.
-//   - Colonne allineate al tuo schema: tables.table_number (NON "number").
+// NFC Service — token/tag per tavoli + "Sessione Tavolo"
+// - generateToken / bindTable / revokeToken
+// - resolveToken(token): prima verifica su nfc_tags, poi JOIN per meta tavolo
+// - sessione tavolo (table_sessions)
+// Stile: commenti lunghi + log con emoji
 // ============================================================================
 
 const crypto = require('crypto');
-const dbMod  = require('../db');           // può esportare direttamente il pool o { pool }
-const logger = require('../logger');       // winston (stile esistente)
+const { query } = require('../db');      // wrapper mysql2
+const logger   = require('../logger');
 
-const TABLE = 'nfc_tags';
+const TABLE    = 'nfc_tags';
+const TABLE_TS = 'table_sessions';
 
-// ————————————————————————————————————————————————————————————————————————————
-// Helpers
-// ————————————————————————————————————————————————————————————————————————————
-
-/** Ritorna sempre il pool (compat: module → pool | { pool }) */
-function getPool() {
-  return dbMod?.pool || dbMod;
-}
-
-/** Esegue query normalizzando SEMPRE rows in Array */
-async function query(sql, params = [], conn) {
-  const runner = conn || getPool();
-  try {
-    const ret = await runner.query(sql, params);
-    // mysql2/promise => [rows, fields] | alcuni wrapper => rows
-    const rows = Array.isArray(ret?.[0]) ? ret[0] : (Array.isArray(ret) ? ret : []);
-    return rows;
-  } catch (err) {
-    logger.error('❌ [NFC][SQL] Error', { sql, params, error: String(err) });
-    throw err;
-  }
-}
-
+// ----------------------------- utils ----------------------------------------
 function base62(bytes = 9) {
-  // 9 bytes ~ 12 char base62
   const alphabet = '0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ';
   const buf = crypto.randomBytes(bytes);
   let out = '';
   for (let i = 0; i < buf.length; i++) out += alphabet[buf[i] % alphabet.length];
   return out;
 }
-
 function generateToken(len = 12) {
-  // token base62 di lunghezza "len"
   let token = '';
   while (token.length < len) token += base62(9);
   return token.slice(0, len);
 }
 
-// ————————————————————————————————————————————————————————————————————————————
-// Core queries
-// ————————————————————————————————————————————————————————————————————————————
-
+// --------------------------- token <-> tavolo --------------------------------
 async function getActiveByTable(tableId) {
   const rows = await query(
     `SELECT id, table_id, token, is_revoked, created_at
        FROM ${TABLE}
-      WHERE table_id = ? AND is_revoked = 0
-      ORDER BY id DESC
-      LIMIT 1`,
-    [tableId]
+      WHERE table_id=? AND is_revoked=0
+   ORDER BY id DESC
+      LIMIT 1`, [tableId]
   );
-  return rows[0] || null; // ← sicuro: rows è sempre []
+  return rows[0] || null;
 }
 
-async function insertToken(tableId, token, conn) {
+async function insertToken(tableId, token) {
   await query(
-    `INSERT INTO ${TABLE} (table_id, token, is_revoked, created_at)
-     VALUES (?, ?, 0, NOW())`,
-    [tableId, token],
-    conn
+    `INSERT INTO ${TABLE} (table_id, token, is_revoked) VALUES (?, ?, 0)`,
+    [tableId, token]
   );
+  return token;
 }
 
-async function revokeByTable(tableId, conn) {
+async function revokeByTable(tableId) {
   await query(
     `UPDATE ${TABLE}
-        SET is_revoked = 1, revoked_at = NOW()
-      WHERE table_id = ? AND is_revoked = 0`,
-    [tableId],
-    conn
+        SET is_revoked=1, revoked_at=NOW()
+      WHERE table_id=? AND is_revoked=0`,
+    [tableId]
   );
 }
 
-// ————————————————————————————————————————————————————————————————————————————
-// API publiche del servizio
-// ————————————————————————————————————————————————————————————————————————————
-
 async function bindTable(tableId, opts = {}) {
-  // Se forceNew → revoca e crea nuovo; altrimenti riusa se esiste
   if (!tableId) throw new Error('table_id mancante');
   const { forceNew = false } = opts;
 
@@ -3248,113 +3384,192 @@ async function bindTable(tableId, opts = {}) {
       return current.token;
     }
   }
-
-  const pool = getPool();
-  const conn = await pool.getConnection();
-  try {
-    if (forceNew) {
-      logger.warn(`♻️ [NFC] Rigenerazione token per table_id=${tableId} (revoca precedenti)`);
-      await revokeByTable(tableId, conn);
-    }
-
-    // Genera un token unico (retry se collisione su UNIQUE uk_nfc_token)
-    let token = generateToken(12);
-    let ok = false;
-
-    for (let i = 0; i < 5 && !ok; i++) {
-      try {
-        await insertToken(tableId, token, conn);
-        ok = true;
-      } catch (err) {
-        const msg = String(err?.message || '');
-        if (msg.includes('uk_nfc_token') || msg.includes('Duplicate') || msg.includes('ER_DUP_ENTRY')) {
-          token = generateToken(12); // collisione → rigenera
-        } else {
-          throw err;
-        }
-      }
-    }
-
-    if (!ok) throw new Error('Impossibile generare token univoco');
-
-    logger.info(`✅ [NFC] Creato token ${token} per table_id=${tableId}`);
-    return token;
-  } finally {
-    try { conn.release(); } catch {}
+  if (forceNew) {
+    logger.warn(`♻️ [NFC] Rigenerazione token per table_id=${tableId} (revoca precedenti)`);
+    await revokeByTable(tableId);
   }
-}
 
-async function resolveToken(token) {
-  if (!token) throw new Error('token mancante');
-
-  // 1) Trova mapping attivo + info tavolo/sala (schema allineato al tuo FE)
-  const rows = await query(
-    `SELECT n.table_id,
-            n.is_revoked,
-            t.table_number AS table_number,   -- 👈 allineato al tuo /api/tables
-            t.room_id,
-            r.name        AS room_name
-       FROM ${TABLE} n
-       JOIN tables t ON t.id = n.table_id
-  LEFT JOIN rooms  r ON r.id = t.room_id
-      WHERE n.token = ? AND n.is_revoked = 0
-      LIMIT 1`,
-    [token]
-  );
-  const m = rows[0];
-  if (!m) return null;
-
-  // 2) (Opzionale) Prenotazione "odierna" pending/accepted per quel tavolo
-  //    DB in UTC (tua policy): finestra [UTC_DATE(), UTC_DATE()+1d)
-  const resv = await query(
-    `SELECT id
-       FROM reservations
-      WHERE table_id = ?
-        AND status IN ('pending','accepted')
-        AND start_at >= UTC_DATE()
-        AND start_at <  (UTC_DATE() + INTERVAL 1 DAY)
-      ORDER BY start_at ASC
-      LIMIT 1`,
-    [m.table_id]
-  );
-
-  const reservation_id = resv?.[0]?.id || null;
-
-  return {
-    ok: true,
-    table_id: m.table_id,
-    table_number: m.table_number,
-    room_id: m.room_id,
-    room_name: m.room_name,
-    reservation_id
-  };
+  let token = generateToken(12);
+  for (let i = 0; i < 5; i++) {
+    try { await insertToken(tableId, token); return token; }
+    catch (err) {
+      const msg = String(err?.message || '');
+      if (msg.includes('ER_DUP_ENTRY')) { token = generateToken(12); continue; }
+      throw err;
+    }
+  }
+  throw new Error('Impossibile generare token univoco');
 }
 
 async function revokeToken(token) {
   if (!token) throw new Error('token mancante');
   await query(
     `UPDATE ${TABLE}
-        SET is_revoked = 1, revoked_at = NOW()
-      WHERE token = ? AND is_revoked = 0`,
+        SET is_revoked=1, revoked_at=NOW()
+      WHERE token=? AND is_revoked=0`,
     [token]
   );
   return { ok: true };
 }
 
 function buildPublicUrl(token, req) {
-  // Preferisci ENV.PUBLIC_BASE_URL (es. https://admin.miodominio.it)
   const base = process.env.PUBLIC_BASE_URL
     || `${req?.protocol || 'http'}://${req?.get ? req.get('host') : 'localhost:3000'}`;
-  return `${String(base).replace(/\/+$/, '')}/t/${encodeURIComponent(token)}`;
+  return `${base.replace(/\/+$/, '')}/t/${encodeURIComponent(token)}`;
 }
 
+// ---------------------------- sessione tavolo --------------------------------
+async function getActiveSession(tableId) {
+  const rows = await query(
+    `SELECT id, table_id, opened_at, opened_by
+       FROM ${TABLE_TS}
+      WHERE table_id=? AND closed_at IS NULL
+   ORDER BY id DESC
+      LIMIT 1`,
+    [tableId]
+  );
+  return rows?.[0] || null;
+}
+async function openSession(tableId, { by, note } = {}) {
+  const res = await query(
+    `INSERT INTO ${TABLE_TS} (table_id, opened_by, note) VALUES (?,?,?)`,
+    [tableId, by || null, note || null]
+  );
+  const id = res?.insertId || null;
+  logger.info(`🟢 [NFC] Sessione APERTA table_id=${tableId} (session_id=${id})`);
+  return id;
+}
+async function closeActiveSession(tableId, { by, reason } = {}) {
+  const act = await getActiveSession(tableId);
+  if (!act) return { closed: 0 };
+  await query(
+    `UPDATE ${TABLE_TS}
+        SET closed_at = NOW(), closed_by = ?
+      WHERE id = ? AND closed_at IS NULL`,
+    [by || reason || null, act.id]
+  );
+  logger.info(`🔴 [NFC] Sessione CHIUSA table_id=${tableId} (session_id=${act.id})`);
+  return { closed: 1, session_id: act.id };
+}
+async function ensureSession(tableId, { ttlHours = 6, by } = {}) {
+  const act = await getActiveSession(tableId);
+  if (act) {
+    if (!ttlHours) return act.id;
+    const ageMs = Date.now() - new Date(act.opened_at).getTime();
+    if (ageMs <= ttlHours * 3_600_000) return act.id;
+    await closeActiveSession(tableId, { by: 'ensureSession:ttl' });
+  }
+  return await openSession(tableId, { by });
+}
+
+// ------------------------------ resolve --------------------------------------
+async function resolveToken(token) {
+  if (!token) throw new Error('token mancante');
+
+  // 1) esiste in nfc_tags (non revocato)?
+  const tag = (await query(
+    `SELECT id, table_id
+       FROM ${TABLE}
+      WHERE token = ? AND is_revoked = 0
+      LIMIT 1`,
+    [token]
+  ))?.[0];
+
+  logger.info('🔎 [NFC] resolve.check', { token, found: !!tag, table_id: tag?.table_id });
+
+  if (!tag) return null;                      // ← 404 not_found_or_revoked
+
+  // 2) meta tavolo (JOIN) — usa table_number
+  const meta = (await query(
+    `SELECT t.table_number, t.room_id, r.name AS room_name
+       FROM tables t
+  LEFT JOIN rooms  r ON r.id = t.room_id
+      WHERE t.id = ?
+      LIMIT 1`,
+    [tag.table_id]
+  ))?.[0] || {};
+
+  // 3) prenotazione odierna
+  const resv = (await query(
+    `SELECT id FROM reservations
+      WHERE table_id = ?
+        AND status IN ('pending','accepted')
+        AND start_at >= UTC_DATE()
+        AND start_at <  (UTC_DATE() + INTERVAL 1 DAY)
+      ORDER BY start_at ASC
+      LIMIT 1`,
+    [tag.table_id]
+  ))?.[0] || null;
+
+  // 4) assicura sessione
+  const session_id = await ensureSession(tag.table_id, { ttlHours: 6, by: 'nfc/resolve' });
+
+  return {
+    ok: true,
+    table_id: tag.table_id,
+    table_number: meta.table_number ?? null,
+    room_id: meta.room_id ?? null,
+    room_name: meta.room_name ?? null,
+    reservation_id: resv?.id ?? null,
+    session_id,
+  };
+}
+
+// ------------------------------ cart snapshot --------------------------------
+async function getSessionCart(sessionId) {
+  if (!sessionId) throw new Error('session_id mancante');
+  const s = (await query(
+    `SELECT id, closed_at, cart_json, cart_version, cart_updated_at
+       FROM ${TABLE_TS}
+      WHERE id=? LIMIT 1`,
+    [sessionId]
+  ))?.[0];
+  if (!s) return null;
+  return {
+    id: s.id,
+    is_open: !s.closed_at,
+    version: Number(s.cart_version || 0),
+    cart_json: s.cart_json || null,
+    cart_updated_at: s.cart_updated_at || null,
+  };
+}
+async function saveSessionCart(sessionId, version, cartObj) {
+  if (!sessionId) throw new Error('session_id mancante');
+  const cartJson = cartObj ? JSON.stringify(cartObj) : null;
+  const res = await query(
+    `UPDATE ${TABLE_TS}
+        SET cart_json = ?, cart_version = cart_version + 1, cart_updated_at = NOW()
+      WHERE id = ? AND closed_at IS NULL AND cart_version = ?`,
+    [cartJson, sessionId, Number(version || 0)]
+  );
+  if (Number(res?.affectedRows || 0) === 1) {
+    const cur = await getSessionCart(sessionId);
+    return { ok: true, version: cur?.version ?? 0, updated_at: cur?.cart_updated_at ?? null };
+  }
+  const current = await getSessionCart(sessionId);
+  const err = new Error('version_conflict');
+  err.status = 409;
+  err.current = current;
+  throw err;
+}
+
+// ------------------------------- exports -------------------------------------
 module.exports = {
+  // Token
   generateToken,
-  bindTable,
-  resolveToken,
-  revokeToken,
   getActiveByTable,
+  bindTable,
+  revokeToken,
+  resolveToken,
   buildPublicUrl,
+  // Sessione
+  getActiveSession,
+  openSession,
+  closeActiveSession,
+  ensureSession,
+  // Cart
+  getSessionCart,
+  saveSessionCart,
 };
 ```
 
@@ -3658,7 +3873,7 @@ module.exports = { printOrderSplitByCategory };
 
 ### ./src/services/orders.service.js
 ```
-// server/src/api/orders.js
+// C:\Users\Endri Azizi\progetti-dev\my_dev\be\src\services\orders.service.js
 // ============================================================================
 // ORDERS API (REST + SSE) — stile Endri: commenti lunghi, log con emoji
 // Rotte:
@@ -5566,40 +5781,31 @@ module.exports = { sendOrder, sendOrderStatus };
 
 ### ./src/sockets/index.js
 ```
-// src/sockets/index.js
 'use strict';
-
 /**
  * Socket entry — singleton + bootstrap canali
  * -------------------------------------------------------------
  * - Mantiene i tuoi log di connessione/disconnessione
  * - Mantiene il ping/pong ("🏓") per diagnostica rapida
  * - Espone un singleton io() richiamabile dai router/service
- * - Monta il canale ordini (orders.channel) per eventi live
+ * - Monta i canali modulari (orders, nfc.session)
  */
 
 const logger = require('../logger');
-
 let _io = null;
 
-/**
- * Inizializza una sola volta il socket server.
- * @param {import('socket.io').Server} io
- */
+/** @param {import('socket.io').Server} io */
 function init(io) {
   if (_io) {
-    // Già inizializzato: evito doppio wiring degli handler
     logger.warn('🔌 SOCKET init chiamato più volte — uso il singleton esistente');
     return _io;
   }
-
   _io = io;
 
-  // === HANDLER BASE (il tuo file locale) ====================================
+  // === HANDLER BASE =========================================================
   io.on('connection', (socket) => {
     logger.info('🔌 SOCKET connected', { id: socket.id });
 
-    // Ping/Pong diagnostico
     socket.on('ping', () => {
       logger.info('🏓 ping from', { id: socket.id });
       socket.emit('pong');
@@ -5611,7 +5817,6 @@ function init(io) {
   });
 
   // === CANALI MODULARI ======================================================
-  // Canale "orders" (emette orders:created / orders:status / ...)
   try {
     require('./orders.channel')(io);
     logger.info('📡 SOCKET channel mounted: orders');
@@ -5619,14 +5824,18 @@ function init(io) {
     logger.warn('📡 SOCKET channel orders non disponibile', { error: String(err) });
   }
 
+  // 🆕 canale NFC session (join/leave stanza session:<SID>)
+  try {
+    require('./nfc.session')(io);
+    logger.info('📡 SOCKET channel mounted: nfc.session');
+  } catch (err) {
+    logger.warn('📡 SOCKET channel nfc.session non disponibile', { error: String(err) });
+  }
+
   logger.info('🔌 SOCKET bootstrap completato ✅');
   return _io;
 }
 
-/**
- * Restituisce l'istanza singleton di socket.io
- * (utile nei router/service per emettere eventi).
- */
 function io() {
   if (!_io) throw new Error('socket.io non inizializzato');
   return _io;
@@ -5634,6 +5843,50 @@ function io() {
 
 module.exports = (serverOrIo) => init(serverOrIo);
 module.exports.io = io;
+```
+
+### ./src/sockets/nfc.session.js
+```
+'use strict';
+/**
+ * Canale Socket — NFC Session
+ * - join_session { session_id }
+ * - leave_session { session_id }
+ * Stanza: "session:<SID>"
+ */
+
+const logger = require('../logger');
+
+/** @param {import('socket.io').Server} io */
+module.exports = function(io) {
+  io.on('connection', (socket) => {
+
+    socket.on('join_session', (p) => {
+      try{
+        const sid = Number(p?.session_id || 0) || 0;
+        if (!sid) return;
+        const room = `session:${sid}`;
+        socket.join(room);
+        logger.info('🔗 [SOCKET] join_session', { sid, socket: socket.id });
+      }catch(e){
+        logger.warn('⚠️ [SOCKET] join_session KO', { error: String(e) });
+      }
+    });
+
+    socket.on('leave_session', (p) => {
+      try{
+        const sid = Number(p?.session_id || 0) || 0;
+        if (!sid) return;
+        const room = `session:${sid}`;
+        socket.leave(room);
+        logger.info('🔗 [SOCKET] leave_session', { sid, socket: socket.id });
+      }catch(e){
+        logger.warn('⚠️ [SOCKET] leave_session KO', { error: String(e) });
+      }
+    });
+
+  });
+};
 ```
 
 ### ./src/sockets/orders.channel.js
