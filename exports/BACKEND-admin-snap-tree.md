@@ -1,6 +1,6 @@
 # 📁 Project tree (.)
 
-_Generato: Fri, Nov 14, 2025  6:38:17 PM_
+_Generato: Sun, Nov 16, 2025  1:27:26 AM_
 
 ```text
 .
@@ -19,6 +19,7 @@ readme.md
 src
 src/api
 src/api/auth.js
+src/api/customers.js
 src/api/google
 src/api/google/oauth.js
 src/api/google/people.js

@@ -1,6 +1,6 @@
 # 🧩 Project code (file ammessi in .)
 
-_Generato: Fri, Nov 14, 2025  6:38:18 PM_
+_Generato: Sun, Nov 16, 2025  1:27:27 AM_
 
 ### ./package.json
 ```
@@ -179,6 +179,262 @@ router.get('/me', requireAuth, async (req, res) => {
 });
 
 module.exports = router;
+```
+
+### ./src/api/customers.js
+```
+// server/src/api/customers.js
+// ============================================================================
+// CUSTOMERS API — i “clienti” sono righe della tabella `users`
+// Rotte:
+//   GET  /api/customers               → lista (SEMPRE ARRAY)
+//   GET  /api/customers/:id           → dettaglio (OGGETTO)
+//   POST /api/customers               → crea
+//   PUT  /api/customers/:id           → aggiorna
+//   PUT  /api/customers/:id/disable   → is_active=0
+//   PUT  /api/customers/:id/enable    → is_active=1
+//   GET  /api/customers/:id/orders    → storico ordini
+// Stile: commenti 🇮🇹 + log a emoji. Query robuste (JOIN aggregati) e LIMIT/OFFSET letterali.
+// ============================================================================
+
+'use strict';
+const express = require('express');
+const router  = express.Router();
+
+module.exports = (app) => {
+  const db  = app?.get('db');
+  const log = app?.get('logger') || console;
+
+  const like = (v) => `%${String(v || '').trim().toLowerCase()}%`;
+  const normPhone = (v) => String(v || '').replace(/\s+/g, '').replace(/^\+/, '').replace(/-/g, '');
+
+  // ----------------------------------------------------------------------------
+  // LIST — sempre ARRAY
+  // ----------------------------------------------------------------------------
+  router.get('/', async (req, res) => {
+    const qRaw   = String(req.query.q || '').trim();
+    const q      = qRaw.toLowerCase();
+
+    // 👇 numeri ripuliti e forzati a interi (evito placeholder su LIMIT/OFFSET)
+    const limit  = (Math.max(1, Math.min(200, Number(req.query.limit || 50))) | 0);
+    const offset = (Math.max(0, Number(req.query.offset || 0)) | 0);
+
+    res.set('x-route', 'customers:list');
+    res.set('Cache-Control', 'no-store');
+    log.info('👥 [Customers] list ▶️', { q: qRaw || '(tutti)', limit, offset });
+
+    // WHERE dinamico
+    let where = '1=1';
+    const params = [];
+    if (q) {
+      where = `(
+        LOWER(COALESCE(u.full_name, ''))     LIKE ?
+        OR LOWER(COALESCE(u.first_name, '')) LIKE ?
+        OR LOWER(COALESCE(u.last_name, ''))  LIKE ?
+        OR LOWER(COALESCE(u.email, ''))      LIKE ?
+        OR REPLACE(REPLACE(REPLACE(COALESCE(u.phone,''),' ',''),'+',''),'-','') LIKE ?
+      )`;
+      const qp = like(q);
+      params.push(qp, qp, qp, qp, normPhone(q));
+    }
+
+    // 👉 JOIN aggregati (niente sub-query correlate riga-per-riga)
+    const sql = `
+      SELECT
+        u.id, u.full_name, u.first_name, u.last_name, u.email, u.phone,
+        u.is_active, u.tags, u.note,
+        COALESCE(oc.orders_count, 0)  AS orders_count,
+        COALESCE(ot.total_spent, 0)   AS total_spent,
+        ol.last_order_at
+      FROM users u
+      /* ultimo ordine + count ordini */
+      LEFT JOIN (
+        SELECT o.customer_user_id AS user_id,
+               COUNT(*)           AS orders_count,
+               MAX(o.created_at)  AS last_order_at
+        FROM orders o
+        GROUP BY o.customer_user_id
+      ) oc ON oc.user_id = u.id
+      /* totale speso (sum items) */
+      LEFT JOIN (
+        SELECT o.customer_user_id AS user_id,
+               SUM(i.qty * i.price) AS total_spent
+        FROM order_items i
+        JOIN orders o ON o.id = i.order_id
+        GROUP BY o.customer_user_id
+      ) ot ON ot.user_id = u.id
+      /* alias comodo per ordinarci sopra */
+      LEFT JOIN (
+        SELECT o.customer_user_id AS user_id,
+               MAX(o.created_at)  AS last_order_at
+        FROM orders o
+        GROUP BY o.customer_user_id
+      ) ol ON ol.user_id = u.id
+      WHERE ${where}
+      ORDER BY COALESCE(ol.last_order_at, 0) DESC, u.id DESC
+      LIMIT ${limit} OFFSET ${offset}
+    `;
+
+    try {
+      const [rows] = await db.query(sql, params);
+      const out = Array.isArray(rows) ? rows : (rows ? [rows] : []);
+      log.info(`✅ [Customers] list ← ${out.length} righe`);
+      res.json(out);
+    } catch (e) {
+      log.error('❌ /api/customers list', { error: String(e) });
+      res.status(500).json([]);
+    }
+  });
+
+  // ----------------------------------------------------------------------------
+  // DETAIL — oggetto singolo
+  // ----------------------------------------------------------------------------
+  router.get('/:id(\\d+)', async (req, res) => {
+    const id = Number(req.params.id);
+    res.set('x-route', 'customers:detail');
+    res.set('Cache-Control', 'no-store');
+
+    try {
+      const [rows] = await db.query(
+        `
+        SELECT
+          u.id, u.full_name, u.first_name, u.last_name, u.email, u.phone,
+          u.is_active, u.tags, u.note,
+          COALESCE(oc.orders_count, 0)  AS orders_count,
+          COALESCE(ot.total_spent, 0)   AS total_spent,
+          ol.last_order_at
+        FROM users u
+        LEFT JOIN (
+          SELECT o.customer_user_id AS user_id,
+                 COUNT(*)           AS orders_count,
+                 MAX(o.created_at)  AS last_order_at
+          FROM orders o
+          GROUP BY o.customer_user_id
+        ) oc ON oc.user_id = u.id
+        LEFT JOIN (
+          SELECT o.customer_user_id AS user_id,
+                 SUM(i.qty * i.price) AS total_spent
+          FROM order_items i
+          JOIN orders o ON o.id = i.order_id
+          GROUP BY o.customer_user_id
+        ) ot ON ot.user_id = u.id
+        LEFT JOIN (
+          SELECT o.customer_user_id AS user_id,
+                 MAX(o.created_at)  AS last_order_at
+          FROM orders o
+          GROUP BY o.customer_user_id
+        ) ol ON ol.user_id = u.id
+        WHERE u.id = ?
+        LIMIT 1
+        `,
+        [id]
+      );
+      const row = rows?.[0];
+      if (!row) return res.status(404).json({ ok:false, error:'not_found' });
+      res.json(row);
+    } catch {
+      res.status(500).json({ ok:false, error:'customer_detail_error' });
+    }
+  });
+
+  // ----------------------------------------------------------------------------
+  // CREATE / UPDATE / ENABLE / DISABLE / ORDERS (immutati)
+  // ----------------------------------------------------------------------------
+  router.post('/', async (req, res) => {
+    const { full_name, first_name, last_name, phone, email, note, tags, is_active } = req.body || {};
+    try {
+      const [r] = await db.query(
+        `INSERT INTO users (full_name, first_name, last_name, phone, email, note, tags, is_active)
+         VALUES (?,?,?,?,?,?,?,?)`,
+        [full_name||null, first_name||null, last_name||null, phone||null, email||null, note||null, tags||null,
+         (is_active===0?0:1)]
+      );
+      const [[out]] = await db.query(`SELECT * FROM users WHERE id=?`, [r.insertId]);
+      log.info('🟢 [Customers] create id=', r.insertId);
+      res.status(201).json(out);
+    } catch (e) {
+      log.error('❌ [Customers] create', String(e));
+      res.status(500).json({ ok:false, error:'customer_create_error' });
+    }
+  });
+
+  router.put('/:id(\\d+)', async (req, res) => {
+    const id = Number(req.params.id);
+    const { full_name, first_name, last_name, phone, email, note, tags, is_active } = req.body || {};
+    try {
+      await db.query(
+        `UPDATE users SET
+           full_name = COALESCE(?, full_name),
+           first_name= COALESCE(?, first_name),
+           last_name = COALESCE(?, last_name),
+           phone     = COALESCE(?, phone),
+           email     = COALESCE(?, email),
+           note      = COALESCE(?, note),
+           tags      = COALESCE(?, tags),
+           is_active = COALESCE(?, is_active)
+         WHERE id=?`,
+        [full_name, first_name, last_name, phone, email, note, tags,
+         ([0,1].includes(is_active)? is_active : null), id]
+      );
+      const [[out]] = await db.query(`SELECT * FROM users WHERE id=?`, [id]);
+      log.info('✏️  [Customers] update id=', id);
+      res.json(out);
+    } catch (e) {
+      log.error('❌ [Customers] update', String(e));
+      res.status(500).json({ ok:false, error:'customer_update_error' });
+    }
+  });
+
+  router.put('/:id(\\d+)/disable', async (req, res) => {
+    const id = Number(req.params.id);
+    await db.query(`UPDATE users SET is_active=0 WHERE id=?`, [id]);
+    log.warn('⛔ [Customers] disable id=', id);
+    res.json({ ok:true });
+  });
+
+  router.put('/:id(\\d+)/enable', async (req, res) => {
+    const id = Number(req.params.id);
+    await db.query(`UPDATE users SET is_active=1 WHERE id=?`, [id]);
+    log.info('✅ [Customers] enable id=', id);
+    res.json({ ok:true });
+  });
+
+  router.get('/:id(\\d+)/orders', async (req, res) => {
+    const id = Number(req.params.id);
+    try {
+      const [rows] = await db.query(
+        `SELECT
+           o.id, o.status, o.channel, o.created_at, o.scheduled_at, o.note,
+           o.customer_name, o.phone, o.email,
+           (SELECT SUM(i.qty*i.price) FROM order_items i WHERE i.order_id = o.id) AS total
+         FROM orders o
+         WHERE o.customer_user_id = ?
+         ORDER BY o.created_at DESC
+         LIMIT 500`,
+        [id]
+      );
+      res.json(rows.map(r => ({ ...r, total: r.total!=null ? Number(r.total) : null })));
+    } catch {
+      res.status(500).json({ ok:false, error:'customer_orders_error' });
+    }
+  });
+
+  // ----------------------------------------------------------------------------
+  // DEBUG utili (puoi tenerli)
+  // ----------------------------------------------------------------------------
+  router.get('/_debug/dbinfo', async (_req, res) => {
+    const [[i]]   = await db.query('SELECT DATABASE() AS db, @@hostname AS host, @@version AS version');
+    const [[cnt]] = await db.query('SELECT COUNT(*) AS users FROM users');
+    res.json({ db: i.db, host: i.host, version: i.version, users: cnt.users });
+  });
+
+  router.get('/_debug/sample', async (_req, res) => {
+    const [rows] = await db.query('SELECT id, full_name FROM users ORDER BY id DESC LIMIT 10');
+    res.json(rows);
+  });
+
+  return router;
+};
 ```
 
 ### ./src/api/google.js
@@ -2905,6 +3161,8 @@ app.use('/api/google/people', googlePeople);
 app.use('/api/nfc', require('./api/nfc'));
 // 🆕 NFC Session API (ultimo ordine per sessione)
 app.use('/api/nfc/session', require('./api/nfc-session')); // <— AGGIUNTA
+if (ensureExists('api/customers', 'API /api/customers')) app.use('/api/customers', require('./api/customers')(app));
+
 
 // Health
 if (ensureExists('api/health', 'API /api/health')) app.use('/api/health', require('./api/health'));
@@ -4443,82 +4701,205 @@ function toDayRange(fromYmd, toYmd) {
   if (toYmd)   out.to   = `${toYmd} 23:59:59`;
   return out;
 }
-function isoToMysql(iso) { return iso ? iso.replace('T', ' ').slice(0, 19) : null; }
+
+/**
+ * Converte qualunque input (stringa ISO, Date, oppure 'YYYY-MM-DD HH:mm:ss'
+ * locale) in una stringa MySQL DATETIME "YYYY-MM-DD HH:mm:ss" in **UTC**.
+ *
+ * Pipeline che vogliamo:
+ * - Il FE lavora in ORA LOCALE (Europe/Rome nel tuo caso).
+ *   (logica gemella di toUTCFromLocalDateTimeInput sul FE: src/app/shared/utils.date.ts).
+ * - Quando manda al BE valori tipo "2025-11-15T19:00" o "2025-11-15 19:00:00",
+ *   qui li interpretiamo come locali e li convertiamo in UTC.
+ * - Il DB è configurato con time_zone = '+00:00', quindi il DATETIME salvato
+ *   è già UTC e quando lo rileggiamo/serializziamo va verso il FE come ISO con 'Z'.
+ */
+function isoToMysql(iso) {
+  if (!iso) return null;
+  if (iso instanceof Date) return dateToMysqlUtc(iso);
+  const s = String(iso).trim();
+
+  // Se è già nel formato MySQL "YYYY-MM-DD HH:mm:ss" lo tratto come ORA LOCALE
+  // del ristorante e lo porto in UTC.
+  const mysqlLike = /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/;
+  if (mysqlLike.test(s)) {
+    const [datePart, timePart] = s.split(' ');
+    const [y, m, d] = datePart.split('-').map((n) => parseInt(n, 10));
+    const [hh, mm, ss] = timePart.split(':').map((n) => parseInt(n, 10));
+    const local = new Date(y, m - 1, d, hh, mm, ss); // 👉 locale
+    if (!Number.isNaN(local.getTime())) return dateToMysqlUtc(local);
+  }
+
+  // Per tutto il resto ("YYYY-MM-DDTHH:mm", ISO con 'Z', ecc.) lascio che il
+  // costruttore Date si arrangi. Se è senza 'Z' verrà interpretato come locale,
+  // se ha 'Z' è già UTC.
+  const d = new Date(s);
+  if (!Number.isNaN(d.getTime())) return dateToMysqlUtc(d);
+
+  // Fallback compat per formati strani: mantengo il tuo vecchio comportamento.
+  return s.replace('T', ' ').slice(0, 19);
+}
+
+/**
+ * Helper interno: Date → stringa MySQL DATETIME in UTC.
+ */
+function dateToMysqlUtc(d) {
+  const pad = (n) => String(n).padStart(2, '0');
+  const y = d.getUTCFullYear();
+  const m = pad(d.getUTCMonth() + 1);
+  const day = pad(d.getUTCDate());
+  const hh = pad(d.getUTCHours());
+  const mm = pad(d.getUTCMinutes());
+  const ss = pad(d.getUTCSeconds());
+  return `${y}-${m}-${day} ${hh}:${mm}:${ss}`;
+}
+
+/**
+ * Calcola start_at / end_at a partire da una stringa di input (tipicamente
+ * "YYYY-MM-DDTHH:mm" dalla tua admin PWA) e applica le regole pranzo/cena.
+ *
+ * - L'input viene interpretato come ORA LOCALE del ristorante.
+ * - Decidiamo se è pranzo o cena guardando l'ora locale (<16 ⇒ pranzo).
+ * - Poi convertiamo sia start che end in UTC per salvarli in DB.
+ */
 function computeEndAtFromStart(startAtIso) {
-  const start = new Date(startAtIso);
-  const addMin = (start.getHours() < 16
+  if (!startAtIso) throw new Error('startAtIso mancante per computeEndAtFromStart');
+
+  const raw = String(startAtIso).trim();
+  let localStart = null;
+
+  // Caso 1: "YYYY-MM-DD HH:mm[:ss]" (già con spazio)
+  const spaceLike = /^(\d{4}-\d{2}-\d{2}) (\d{2}):(\d{2})(?::(\d{2}))?/;
+  const spaceMatch = raw.match(spaceLike);
+  if (spaceMatch) {
+    const [, datePart, hhStr, mmStr, ssStr] = spaceMatch;
+    const [y, m, d] = datePart.split('-').map((n) => parseInt(n, 10));
+    const hh = parseInt(hhStr, 10);
+    const mm = parseInt(mmStr, 10);
+    const ss = ssStr ? parseInt(ssStr, 10) : 0;
+    localStart = new Date(y, m - 1, d, hh, mm, ss);
+  } else {
+    // Caso 2: qualunque ISO gestito da Date ("YYYY-MM-DDTHH:mm" o ISO con Z).
+    localStart = new Date(raw);
+  }
+
+  if (Number.isNaN(localStart.getTime())) {
+    throw new Error(`startAtIso non valido: ${startAtIso}`);
+  }
+
+  // Regola pranzo/cena basata sull'ORA LOCALE (getHours).
+  const addMin = (localStart.getHours() < 16
     ? (env.RESV?.defaultLunchMinutes || 90)
     : (env.RESV?.defaultDinnerMinutes || 120));
-  const end = new Date(start.getTime() + addMin * 60 * 1000);
-  const pad = (n) => String(n).padStart(2, '0');
-  const mysql = (d) =>
-    `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}:00`;
-  return { startMysql: mysql(start), endMysql: mysql(end) };
+
+  const localEnd = new Date(localStart.getTime() + addMin * 60 * 1000);
+
+  return {
+    startMysql: dateToMysqlUtc(localStart),
+    endMysql  : dateToMysqlUtc(localEnd),
+  };
 }
 
 // ============================================================================
 // ⚙️ Cambio stato basico (compat): accetta azione o stato
 // ============================================================================
-const ALLOWED = new Set(['accept','accepted','confirm','confirmed','arrive','arrived','reject','rejected','cancel','canceled','cancelled','prepare','preparing','ready','complete','completed','no_show','noshow']);
-const MAP = { accept:'accepted', confirm:'confirmed', arrive:'arrived', cancel:'canceled', cancelled:'canceled', complete:'completed', no_show:'no_show', noshow:'no_show' };
-function toStatus(action) { const a = String(action || '').trim().toLowerCase(); if (!ALLOWED.has(a)) throw new Error('invalid_action'); return MAP[a] || a; }
 
-/** updateStatus: aggiorna lo stato in DB + ritorna la riga completa */
-async function updateStatus({ id, action, reason = null, user_email = 'system' }) {
-  const rid = Number(id);
-  if (!rid || !action) throw new Error('missing_id_or_action');
-  const newStatus = toStatus(action);
-  const SQL = `
-    UPDATE reservations
-       SET status     = ?,
-           reason     = IFNULL(?, reason),
-           updated_at = CURRENT_TIMESTAMP,
-           updated_by = ?
-     WHERE id = ?
-     LIMIT 1`;
-  const res = await query(SQL, [newStatus, reason, user_email, rid]);
-  if (!res?.affectedRows) throw new Error('reservation_not_found');
-  logger.info('🧾 RESV.status ✅ updated', { id: rid, newStatus });
-  const rows = await query('SELECT * FROM reservations WHERE id = ?', [rid]);
-  return rows[0] || null;
+function normalizeStatusAction(actionOrStatus) {
+  if (!actionOrStatus) return { nextStatus: null, note: null };
+  const s = String(actionOrStatus).toLowerCase();
+  if (s === 'accept' || s === 'accepted') return { nextStatus: 'accepted', note: null };
+  if (s === 'reject' || s === 'rejected' || s === 'cancel' || s === 'cancelled' || s === 'canceled') {
+    return { nextStatus: 'cancelled', note: null };
+  }
+  return { nextStatus: s, note: null };
 }
 
-// --- Core queries -------------------------------------------------------------
-async function list(filter = {}) {
-  const wh = [], pr = [];
-  if (filter.status) { wh.push('r.status = ?'); pr.push(String(filter.status)); }
-  const { from, to } = toDayRange(filter.from, filter.to);
-  if (from) { wh.push('r.start_at >= ?'); pr.push(from); }
-  if (to)   { wh.push('r.start_at <= ?'); pr.push(to);   }
-  if (filter.q) {
-    const q = `%${String(filter.q).trim()}%`;
-    wh.push('(u.first_name LIKE ? OR u.last_name LIKE ? OR u.email LIKE ? OR u.phone LIKE ? OR r.customer_first LIKE ? OR r.customer_last LIKE ? OR r.email LIKE ? OR r.phone LIKE ?)');
-    pr.push(q,q,q,q,q,q,q,q);
+// ============================================================================
+// 📋 LIST / GET
+// ============================================================================
+
+async function list({ status, from, to } = {}) {
+  const where = [];
+  const params = [];
+
+  if (status && status !== 'all') {
+    where.push('r.status = ?');
+    params.push(status);
   }
-  const where = wh.length ? ('WHERE ' + wh.join(' AND ')) : '';
+
+  const range = toDayRange(from, to);
+  if (range.from) { where.push('r.start_at >= ?'); params.push(range.from); }
+  if (range.to)   { where.push('r.start_at <= ?'); params.push(range.to);   }
+
   const sql = `
     SELECT
-      r.*,
-      CONCAT_WS(' ', u.first_name, u.last_name) AS display_name,
-      u.email  AS contact_email,
-      u.phone  AS contact_phone,
+      r.id,
+      r.customer_first,
+      r.customer_last,
+      r.phone,
+      r.email,
+      r.user_id,
+      r.party_size,
+      r.start_at,
+      r.end_at,
+      r.room_id,
+      r.notes,
+      r.status,
+      r.created_by,
+      r.updated_by,
+      r.status_note,
+      r.status_changed_at,
+      r.client_token,
+      r.table_id,
+      r.created_at,
+      r.updated_at,
+      r.checkin_at,
+      r.checkout_at,
+      r.dwell_sec,
+      u.first_name   AS user_first_name,
+      u.last_name    AS user_last_name,
+      u.email        AS user_email,
       t.table_number,
       CONCAT('Tavolo ', t.table_number) AS table_name
     FROM reservations r
     LEFT JOIN users  u ON u.id = r.user_id
     LEFT JOIN tables t ON t.id = r.table_id
-    ${where}
-    ORDER BY r.start_at ASC, r.id ASC`;
-  return await query(sql, pr);
+    ${where.length ? 'WHERE ' + where.join(' AND ') : ''}
+    ORDER BY r.start_at ASC, r.id ASC
+  `;
+  const rows = await query(sql, params);
+  return rows;
 }
 
 async function getById(id) {
   const sql = `
     SELECT
-      r.*,
-      CONCAT_WS(' ', u.first_name, u.last_name) AS display_name,
-      u.email  AS contact_email,
-      u.phone  AS contact_phone,
+      r.id,
+      r.customer_first,
+      r.customer_last,
+      r.phone,
+      r.email,
+      r.user_id,
+      r.party_size,
+      r.start_at,
+      r.end_at,
+      r.room_id,
+      r.notes,
+      r.status,
+      r.created_by,
+      r.updated_by,
+      r.status_note,
+      r.status_changed_at,
+      r.client_token,
+      r.table_id,
+      r.created_at,
+      r.updated_at,
+      r.checkin_at,
+      r.checkout_at,
+      r.dwell_sec,
+      u.first_name   AS user_first_name,
+      u.last_name    AS user_last_name,
+      u.email        AS user_email,
       t.table_number,
       CONCAT('Tavolo ', t.table_number) AS table_name
     FROM reservations r
@@ -4531,16 +4912,41 @@ async function getById(id) {
 
 async function ensureUser({ first, last, email, phone }) {
   const e = trimOrNull(email), p = trimOrNull(phone);
-  if (e) { const r = await query('SELECT id FROM users WHERE email = ? LIMIT 1', [e]); if (r.length) return r[0].id; }
-  if (p) { const r = await query('SELECT id FROM users WHERE phone = ? LIMIT 1', [p]); if (r.length) return r[0].id; }
-  const res = await query(`INSERT INTO users (first_name, last_name, email, phone) VALUES (?, ?, ?, ?)`, [trimOrNull(first), trimOrNull(last), e, p]);
+  if (e) {
+    const r = await query('SELECT id FROM users WHERE email = ? LIMIT 1', [e]);
+    if (r.length) return r[0].id;
+  }
+  if (p) {
+    const r = await query('SELECT id FROM users WHERE phone = ? LIMIT 1', [p]);
+    if (r.length) return r[0].id;
+  }
+  const res = await query(
+    `INSERT INTO users (first_name, last_name, email, phone)
+     VALUES (?, ?, ?, ?)`,
+    [trimOrNull(first), trimOrNull(last), e, p]
+  );
   return res.insertId;
 }
 
+// ============================================================================
+// ➕ CREATE
+// ============================================================================
+
 async function create(dto, { user } = {}) {
-  const userId = await ensureUser({ first: dto.customer_first, last: dto.customer_last, email: dto.email, phone: dto.phone });
-  const startIso = dto.start_at, endIso = dto.end_at || null;
-  const { startMysql, endMysql } = endIso ? { startMysql: isoToMysql(startIso), endMysql: isoToMysql(endIso) } : computeEndAtFromStart(startIso);
+  const userId = await ensureUser({
+    first: dto.customer_first,
+    last : dto.customer_last,
+    email: dto.email,
+    phone: dto.phone,
+  });
+
+  const startIso = dto.start_at;
+  const endIso   = dto.end_at || null;
+
+  const { startMysql, endMysql } = endIso
+    ? { startMysql: isoToMysql(startIso), endMysql: isoToMysql(endIso) }
+    : computeEndAtFromStart(startIso);
+
   const res = await query(
     `INSERT INTO reservations
       (customer_first, customer_last, phone, email,
@@ -4559,15 +4965,27 @@ async function create(dto, { user } = {}) {
   return created;
 }
 
+// ============================================================================
+// ✏️ UPDATE
+// ============================================================================
+
 async function update(id, dto, { user } = {}) {
   let userId = null;
-  if (dto.customer_first !== undefined || dto.customer_last !== undefined || dto.email !== undefined || dto.phone !== undefined) {
-    userId = await ensureUser({ first: dto.customer_first, last: dto.customer_last, email: dto.email, phone: dto.phone });
+  if (dto.customer_first !== undefined || dto.customer_last !== undefined
+    || dto.email !== undefined || dto.phone !== undefined) {
+    userId = await ensureUser({
+      first: dto.customer_first,
+      last : dto.customer_last,
+      email: dto.email,
+      phone: dto.phone,
+    });
   }
   let startMysql = null, endMysql = null;
   if (dto.start_at) {
     const endIso = dto.end_at || null;
-    const c = endIso ? { startMysql: isoToMysql(dto.start_at), endMysql: isoToMysql(endIso) } : computeEndAtFromStart(dto.start_at);
+    const c = endIso
+      ? { startMysql: isoToMysql(dto.start_at), endMysql: isoToMysql(endIso) }
+      : computeEndAtFromStart(dto.start_at);
     startMysql = c.startMysql; endMysql = c.endMysql;
   }
   const fields = [], pr = [];
@@ -4576,15 +4994,24 @@ async function update(id, dto, { user } = {}) {
   if (dto.customer_last  !== undefined) { fields.push('customer_last=?');  pr.push(trimOrNull(dto.customer_last));  }
   if (dto.phone          !== undefined) { fields.push('phone=?');          pr.push(trimOrNull(dto.phone));          }
   if (dto.email          !== undefined) { fields.push('email=?');          pr.push(trimOrNull(dto.email));          }
-  if (dto.party_size !== undefined) { fields.push('party_size=?'); pr.push(Number(dto.party_size)||1); }
-  if (startMysql) { fields.push('start_at=?'); pr.push(startMysql); }
-  if (endMysql)   { fields.push('end_at=?');   pr.push(endMysql);   }
+  if (dto.party_size     !== undefined) { fields.push('party_size=?');     pr.push(dto.party_size || 1);           }
+  if (startMysql         !== null)      { fields.push('start_at=?');       pr.push(startMysql);                    }
+  if (endMysql           !== null)      { fields.push('end_at=?');         pr.push(endMysql);                      }
   if (dto.room_id  !== undefined) { fields.push('room_id=?');  pr.push(dto.room_id || null); }
   if (dto.table_id !== undefined) { fields.push('table_id=?'); pr.push(dto.table_id || null); }
   if (dto.notes    !== undefined) { fields.push('notes=?');    pr.push(trimOrNull(dto.notes)); }
-  if (dto.checkin_at  !== undefined) { fields.push('checkin_at=?');  pr.push(dto.checkin_at ? isoToMysql(dto.checkin_at) : null); }
-  if (dto.checkout_at !== undefined) { fields.push('checkout_at=?'); pr.push(dto.checkout_at ? isoToMysql(dto.checkout_at) : null); }
-  if (dto.dwell_sec   !== undefined) { fields.push('dwell_sec=?');   pr.push(dto.dwell_sec == null ? null : Number(dto.dwell_sec)); }
+  if (dto.checkin_at  !== undefined) {
+    fields.push('checkin_at=?');
+    pr.push(dto.checkin_at ? isoToMysql(dto.checkin_at) : null);
+  }
+  if (dto.checkout_at !== undefined) {
+    fields.push('checkout_at=?');
+    pr.push(dto.checkout_at ? isoToMysql(dto.checkout_at) : null);
+  }
+  if (dto.dwell_sec   !== undefined) {
+    fields.push('dwell_sec=?');
+    pr.push(dto.dwell_sec == null ? null : Number(dto.dwell_sec));
+  }
   fields.push('updated_by=?'); pr.push(trimOrNull(user?.email) || null);
 
   if (!fields.length) {
@@ -4598,7 +5025,10 @@ async function update(id, dto, { user } = {}) {
   return updated;
 }
 
-// --- Hard delete con policy ---------------------------------------------------
+// ============================================================================
+// 🗑️ DELETE (hard, con policy) – invariato
+// ============================================================================
+
 async function remove(id, { user, reason } = {}) {
   const existing = await getById(id);
   if (!existing) return false;
@@ -4610,103 +5040,142 @@ async function remove(id, { user, reason } = {}) {
   if (!allowAnyByEnv && !isCancelled) {
     logger.warn('🛡️ hard-delete NEGATO (stato non cancellato)', { id, status: existing.status }); return false;
   }
-  const res = await query('DELETE FROM reservations WHERE id=? LIMIT 1', [id]);
-  const ok  = res.affectedRows > 0;
-  if (ok) logger.info('🗑️ reservation hard-deleted', { id, by: user?.email || null, reason: reason || null });
-  else    logger.error('💥 reservation delete KO', { id });
-  return ok;
+  await query('DELETE FROM reservations WHERE id=? LIMIT 1', [id]);
+  logger.info('🗑️ reservation removed', { id, by: user?.email || null, reason: reason || null });
+  return true;
 }
 
-// --- Supporto UI --------------------------------------------------------------
-async function countByStatus({ from, to }) {
-  const w = [], p = [];
-  const r = toDayRange(from, to);
-  if (r.from) { w.push('start_at >= ?'); p.push(r.from); }
-  if (r.to)   { w.push('start_at <= ?'); p.push(r.to);   }
-  const where = w.length ? ('WHERE ' + w.join(' AND ')) : '';
-  const rows = await query(`SELECT status, COUNT(*) AS count FROM reservations ${where} GROUP BY status`, p);
-  const out = {}; for (const r of rows) out[String(r.status)] = Number(r.count); return out;
-}
+// ============================================================================
+// 📊 COUNT BY STATUS
+// ============================================================================
 
-// --- Sale / Tavoli (supporto UI) ---------------------------------------------
-async function listRooms() {
-  return await query(`
-    SELECT id, name
-    FROM rooms
-    WHERE IFNULL(is_active,1)=1
-    ORDER BY (sort_order IS NULL), sort_order, name`, []);
-}
-async function listTablesByRoom(roomId) {
-  return await query(`
-    SELECT t.id, t.room_id, t.table_number, t.seats, CONCAT('Tavolo ', t.table_number) AS name
-    FROM tables t
-    WHERE t.room_id = ?
-    ORDER BY t.table_number ASC, t.id ASC`, [roomId]);
-}
-
-// === 🆕 Cambia tavolo (usato anche dai socket) ================================
-async function assignReservationTable(id, table_id, { user } = {}) {
-  const updated = await update(id, { table_id }, { user });
-  logger.info('🔀 reservation table changed', { id, table_id });
-  return updated;
-}
-// alias semantico
-const changeTable = assignReservationTable;
-
-// === 🆕 Check-in / Check-out (idempotenti) ====================================
-async function checkIn(id, { at = null, user } = {}) {
-  const r = await getById(id);
-  if (!r) throw new Error('not_found');
-  if (r.checkin_at) { // idempotente
-    logger.info('♻️ check-in idempotente', { id, checkin_at: r.checkin_at });
-    // posso opzionalmente normalizzare stato se era "pending"
-    if (String(r.status).toLowerCase() === 'pending') await updateStatus({ id, action: 'accept', user_email: user?.email || 'system' });
-    return await getById(id);
+async function countByStatus({ from, to } = {}) {
+  const where = [];
+  const params = [];
+  const range = toDayRange(from, to);
+  if (range.from) { where.push('r.start_at >= ?'); params.push(range.from); }
+  if (range.to)   { where.push('r.start_at <= ?'); params.push(range.to);   }
+  const sql = `
+    SELECT r.status, COUNT(*) AS count
+    FROM reservations r
+    ${where.length ? 'WHERE ' + where.join(' AND ') : ''}
+    GROUP BY r.status
+  `;
+  const rows = await query(sql, params);
+  const out = { pending: 0, accepted: 0, cancelled: 0 };
+  for (const r of rows) {
+    const s = String(r.status || '').toLowerCase();
+    if (s === 'pending') out.pending = r.count;
+    else if (s === 'accepted') out.accepted = r.count;
+    else if (s === 'cancelled' || s === 'canceled') out.cancelled = r.count;
   }
-  const checkin_at_mysql = isoToMysql(at) || null;
+  return out;
+}
+
+// ============================================================================
+// 📚 ROOMS / TABLES
+// ============================================================================
+
+async function listRooms() {
+  const sql = `
+    SELECT id, name, description
+    FROM rooms
+    WHERE is_active = 1
+    ORDER BY sort_order ASC, id ASC
+  `;
+  return await query(sql, []);
+}
+
+async function listTablesByRoom(roomId) {
+  const sql = `
+    SELECT id, room_id, table_number, capacity, is_active
+    FROM tables
+    WHERE room_id = ?
+    ORDER BY table_number ASC, id ASC
+  `;
+  return await query(sql, [roomId]);
+}
+
+// ============================================================================
+// 🪑 Assegnazione tavolo
+// ============================================================================
+
+async function assignReservationTable(id, tableId, { user } = {}) {
   await query(
-    `UPDATE reservations SET
-       checkin_at = ${checkin_at_mysql ? '?' : 'CURRENT_TIMESTAMP'},
-       status     = IF(LOWER(IFNULL(status,''))='pending','accepted',status),
-       updated_at = CURRENT_TIMESTAMP,
-       updated_by = ?
-     WHERE id = ? LIMIT 1`,
-    checkin_at_mysql ? [checkin_at_mysql, user?.email || null, id] : [user?.email || null, id]
+    `UPDATE reservations
+        SET table_id = ?, updated_by = ?, updated_at = CURRENT_TIMESTAMP
+      WHERE id = ? LIMIT 1`,
+    [tableId || null, trimOrNull(user?.email) || null, id]
   );
   const updated = await getById(id);
-  logger.info('✅ check-in saved', { id, checkin_at: updated.checkin_at, status: updated.status });
+  logger.info('🪑 reservation table assigned', { id, table_id: tableId, by: user?.email || null });
   return updated;
 }
 
-async function checkOut(id, { at = null, user } = {}) {
-  const r = await getById(id);
-  if (!r) throw new Error('not_found');
+// Alias più leggibile lato chiamante
+const changeTable = assignReservationTable;
 
-  // === Idempotente: già chiuso
-  if (r.checkout_at) {
-    // Backfill dwell_sec se manca e ho checkin_at
-    if (!r.dwell_sec && r.checkin_at) {
-      const start = new Date(r.checkin_at).getTime();
-      const end   = new Date(r.checkout_at).getTime();
-      const dwell_sec = Math.max(0, Math.floor((end - start) / 1000));
-      await query(
-        `UPDATE reservations
-           SET dwell_sec  = ?,
-               updated_at = CURRENT_TIMESTAMP,
-               updated_by = ?
-         WHERE id = ? LIMIT 1`,
-        [dwell_sec, user?.email || null, id]
-      );
-      const updated = await getById(id);
-      logger.info('♻️ checkout idempotente + ⏱️ dwell backfill', { id, checkout_at: updated.checkout_at, dwell_sec: updated.dwell_sec });
-      return updated;
-    }
-    logger.info('♻️ checkout idempotente', { id, checkout_at: r.checkout_at, dwell_sec: r.dwell_sec });
-    return r;
+// ============================================================================
+// ✅ Cambio stato “semplice” (non usa state-machine avanzata)
+// ============================================================================
+
+async function updateStatus(id, actionOrStatus, { user } = {}) {
+  const existing = await getById(id);
+  if (!existing) return null;
+  const { nextStatus } = normalizeStatusAction(actionOrStatus);
+  if (!nextStatus) {
+    logger.warn('⚠️ updateStatus: stato non valido', { id, actionOrStatus });
+    return existing;
   }
+  await query(
+    `UPDATE reservations
+        SET status = ?, status_changed_at = CURRENT_TIMESTAMP, updated_by = ?
+      WHERE id = ? LIMIT 1`,
+    [nextStatus, trimOrNull(user?.email) || null, id]
+  );
+  const updated = await getById(id);
+  logger.info('🔁 reservation status updated', {
+    id,
+    from: existing.status,
+    to  : updated.status,
+    by  : user?.email || null
+  });
+  return updated;
+}
 
-  // === Primo checkout: salvo checkout_at e (se possibile) dwell_sec
-  const checkout_at_mysql = isoToMysql(at) || null;
+// ============================================================================
+// 🕒 Check-in / Check-out
+// ============================================================================
+
+async function checkIn(id, { at, user } = {}) {
+  const existing = await getById(id);
+  if (!existing) return null;
+
+  const checkin_at_mysql = isoToMysql(at || new Date()) || null;
+
+  await query(
+    `UPDATE reservations
+        SET checkin_at = ?, updated_at = CURRENT_TIMESTAMP, updated_by = ?
+      WHERE id = ? LIMIT 1`,
+    [checkin_at_mysql, trimOrNull(user?.email) || null, id]
+  );
+
+  const updated = await getById(id);
+  logger.info('✅ reservation check-in', {
+    id,
+    at     : updated.checkin_at,
+    by     : user?.email || null,
+    status : updated.status,
+  });
+  return updated;
+}
+
+async function checkOut(id, { at, user } = {}) {
+  const existing = await getById(id);
+  if (!existing) return null;
+
+  const checkout_at_mysql = isoToMysql(at || new Date()) || null;
+
   // dwell_sec se ho checkin_at
   let dwell_sec = null;
   if (r.checkin_at) {
@@ -4726,10 +5195,21 @@ async function checkOut(id, { at = null, user } = {}) {
     ? (dwell_sec === null ? [checkout_at_mysql, ...params] : [checkout_at_mysql, dwell_sec, ...params])
     : (dwell_sec === null ? params : [dwell_sec, ...params]);
   await query(SQL, pr);
+
   const updated = await getById(id);
-  logger.info('✅ checkout saved', { id, checkout_at: updated.checkout_at, dwell_sec: updated.dwell_sec });
+  logger.info('✅ reservation check-out', {
+    id,
+    at     : updated.checkout_at,
+    dwell  : updated.dwell_sec,
+    by     : user?.email || null,
+    status : updated.status,
+  });
   return updated;
 }
+
+// ============================================================================
+// EXPORTS
+// ============================================================================
 
 module.exports = {
   list,

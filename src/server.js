@@ -69,6 +69,8 @@ app.use('/api/google/people', googlePeople);
 app.use('/api/nfc', require('./api/nfc'));
 // 🆕 NFC Session API (ultimo ordine per sessione)
 app.use('/api/nfc/session', require('./api/nfc-session')); // <— AGGIUNTA
+if (ensureExists('api/customers', 'API /api/customers')) app.use('/api/customers', require('./api/customers')(app));
+
 
 // Health
 if (ensureExists('api/health', 'API /api/health')) app.use('/api/health', require('./api/health'));
