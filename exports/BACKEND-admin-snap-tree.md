@@ -1,6 +1,6 @@
 # 📁 Project tree (.)
 
-_Generato: Sun, Nov 16, 2025  1:27:26 AM_
+_Generato: Sun, Nov 16, 2025 11:31:38 PM_
 
 ```text
 .
@@ -80,5 +80,6 @@ src/sockets/orders.js
 src/sockets/reservations.js
 src/sse.js
 src/utils
+src/utils/customers.resolve.js
 src/utils/print-order.js
 ```

@@ -1,4 +1,3 @@
-//C:\Users\Endri Azizi\progetti-dev\my_dev\be\src\api\orders.js
 // ============================================================================
 // ORDERS API (root = /api/orders)
 // - GET    /                lista (hours | from/to | status | q)
@@ -18,6 +17,10 @@ const logger  = require('../logger');
 const { query } = require('../db');
 const sse     = require('../sse');
 const { printOrderDual, printOrderForCenter } = require('../utils/print-order'); // 🧾
+
+// === INIZIO MODIFICA: risoluzione cliente da email/phone ====================
+const resolveCustomerUserId = require('../utils/customers.resolve');
+// === FINE MODIFICA ==========================================================
 
 // Monta subito l’endpoint SSE (/api/orders/stream)
 sse.mount(router);
@@ -53,8 +56,7 @@ async function resolveLocationMeta(order) {
 
   const hints = parseLocationHintsFromNote(order.note);
 
-  // ⚠️ FIX: niente t.number / t.label. Usiamo t.table_number e, come "nome",
-  //         riutilizziamo la stessa o "T{id}" come fallback.
+  // ⚠️ FIX: t.number/t.label non esistono → uso table_number/table_name
   const rows = await query(
     `SELECT r.id,
             r.table_id, r.room_id,
@@ -120,15 +122,11 @@ async function getOrderFullById(id) {
 
   return {
     ...o,
-    // campi piatti comodi per la stampante (print-order.js li legge già)
     table_id:      meta.table?.id ?? null,
     table_number:  meta.table?.number ?? null,
-    table_name:    meta.table?.label ?? null,  // label "umano" (qui = table_number se non c'è altro)
-
+    table_name:    meta.table?.label ?? null,
     room_id:       meta.room?.id ?? null,
     room_name:     meta.room?.name ?? null,
-
-    // annidati per completezza/diagnosi
     reservation: meta.reservation ? {
       id: meta.reservation.id,
       table_id: meta.reservation.table_id,
@@ -136,7 +134,6 @@ async function getOrderFullById(id) {
       table: meta.table,
       room : meta.room,
     } : null,
-
     items
   };
 }
@@ -192,14 +189,25 @@ router.post('/', async (req, res) => {
     const scheduled = dto.scheduled_at ? toDate(dto.scheduled_at) : null;
     const items = Array.isArray(dto.items) ? dto.items : [];
 
-    // ✅ FIX: rimosso label "theTotal:" che generava SyntaxError con `const`
+    // Totale ricalcolato lato server
     const total = items.reduce((acc, it) => acc + toNum(it.price) * toNum(it.qty, 1), 0);
 
-    // NB: non assumo colonne extra su "orders" (reservation_id/table_id/room_id)
-    //     → salvo solo ciò che esiste sicuramente; la meta di stampa verrà “risolta”
+    // === INIZIO MODIFICA: risolvo customer_user_id ==========================
+    const email = (dto.email ?? dto.customer?.email ?? null);
+    const phone = (dto.phone ?? dto.customer?.phone ?? null);
+    let customer_user_id = null;
+    try {
+      // qui passo un "db" che implementa .query → uso il wrapper { query }
+      customer_user_id = await resolveCustomerUserId({ query }, { email, phone });
+      logger.info('🧩 [Orders] mapped customer_user_id = %s', customer_user_id, { email, phone });
+    } catch (e) {
+      logger.warn('⚠️ [Orders] resolveCustomerUserId KO: %s', String(e?.message || e));
+    }
+    // === FINE MODIFICA ======================================================
+
     const r = await query(
-      `INSERT INTO orders (customer_name, phone, email, people, scheduled_at, note, channel, status, total)
-       VALUES (?,?,?,?,?,?,?,?,?)`,
+      `INSERT INTO orders (customer_name, phone, email, people, scheduled_at, note, channel, status, total, customer_user_id)
+       VALUES (?,?,?,?,?,?,?,?,?,?)`,
       [
         (dto.customer_name || 'Cliente').toString().trim(),
         dto.phone || null,
@@ -209,7 +217,8 @@ router.post('/', async (req, res) => {
         dto.note || null,
         dto.channel || 'admin',
         'pending',
-        total
+        total,
+        customer_user_id
       ]
     );
     const orderId = r.insertId;
@@ -222,9 +231,7 @@ router.post('/', async (req, res) => {
       );
     }
 
-    // Ritorno già l’oggetto arricchito (serve anche al FE)
     const full = await getOrderFullById(orderId);
-    // Notifica SSE best-effort
     try { sse.emitCreated(full); } catch (e) { logger.warn('🧵 SSE created ⚠️', { e: String(e) }); }
 
     res.status(201).json(full);
@@ -244,9 +251,7 @@ router.patch('/:id(\\d+)/status', async (req, res) => {
 
     await query(`UPDATE orders SET status=?, updated_at=UTC_TIMESTAMP() WHERE id=?`, [status, id]);
 
-    // Ritorno full arricchito (coerente con GET)
     const full = await getOrderFullById(id);
-    // Notifica SSE best-effort
     try { sse.emitStatus({ id, status }); } catch (e) { logger.warn('🧵 SSE status ⚠️', { e: String(e) }); }
 
     res.json(full);
@@ -256,11 +261,11 @@ router.patch('/:id(\\d+)/status', async (req, res) => {
   }
 });
 
-// Stampa (best-effort, non blocca) — CONTO / DUAL
+// Stampa (best-effort) — CONTO / DUAL
 router.post('/:id(\\d+)/print', async (req, res) => {
   try {
     const id = toNum(req.params.id);
-    const full = await getOrderFullById(id); // 👈 con meta sala/tavolo
+    const full = await getOrderFullById(id);
     if (!full) return res.status(404).json({ ok: false, error: 'not_found' });
 
     try {
@@ -280,7 +285,7 @@ router.post('/:id(\\d+)/print', async (req, res) => {
 router.post('/:id(\\d+)/print/comanda', async (req, res) => {
   try {
     const id = toNum(req.params.id);
-    const full = await getOrderFullById(id); // 👈 con meta sala/tavolo
+    const full = await getOrderFullById(id);
     if (!full) return res.status(404).json({ ok: false, error: 'not_found' });
 
     const centerRaw = (req.body?.center || req.query?.center || 'pizzeria').toString().toUpperCase();
@@ -289,7 +294,7 @@ router.post('/:id(\\d+)/print/comanda', async (req, res) => {
 
     try {
       for (let i = 0; i < copies; i++) {
-        await printOrderForCenter(full, center); // single copy per iter
+        await printOrderForCenter(full, center);
       }
       logger.info('🧾 comanda OK', { id, center, copies });
       return res.json({ ok: true, center, copies });
