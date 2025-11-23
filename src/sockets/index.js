@@ -9,18 +9,27 @@
  */
 
 const logger = require('../logger');
+
 let _io = null;
 
-/** @param {import('socket.io').Server} io */
-function init(io) {
+/**
+ * Inizializza socket.io una sola volta e monta i canali modulari.
+ *
+ * @param {import('socket.io').Server} ioInstance
+ * @returns {import('socket.io').Server}
+ */
+function init(ioInstance) {
   if (_io) {
-    logger.warn('🔌 SOCKET init chiamato più volte — uso il singleton esistente');
+    logger.warn(
+      '🔌 SOCKET init chiamato più volte — uso il singleton esistente',
+    );
     return _io;
   }
-  _io = io;
+
+  _io = ioInstance;
 
   // === HANDLER BASE =========================================================
-  io.on('connection', (socket) => {
+  ioInstance.on('connection', (socket) => {
     logger.info('🔌 SOCKET connected', { id: socket.id });
 
     socket.on('ping', () => {
@@ -34,29 +43,70 @@ function init(io) {
   });
 
   // === CANALI MODULARI ======================================================
+  // ORDERS: canale + bus per broadcast "order-created"/"order-updated"
   try {
-    require('./orders.channel')(io);
-    logger.info('📡 SOCKET channel mounted: orders');
+    const ordersMod = require('./orders');
+    if (ordersMod && typeof ordersMod.mount === 'function') {
+      ordersMod.mount(ioInstance);
+      logger.info('📡 SOCKET channel mounted: orders');
+    } else if (typeof ordersMod === 'function') {
+      // compat vecchia versione: module.exports = (io) => { ... }
+      ordersMod(ioInstance);
+      logger.info('📡 SOCKET channel mounted (legacy fn): orders');
+    } else {
+      logger.warn(
+        '📡 SOCKET channel orders non montato (export inatteso, manca mount(io))',
+      );
+    }
   } catch (err) {
-    logger.warn('📡 SOCKET channel orders non disponibile', { error: String(err) });
+    logger.warn('📡 SOCKET channel orders non disponibile', {
+      error: String(err),
+    });
   }
 
   // 🆕 canale NFC session (join/leave stanza session:<SID>)
   try {
-    require('./nfc.session')(io);
-    logger.info('📡 SOCKET channel mounted: nfc.session');
+    const nfcMod = require('./nfc.session');
+    if (nfcMod && typeof nfcMod.mount === 'function') {
+      nfcMod.mount(ioInstance);
+      logger.info('📡 SOCKET channel mounted: nfc.session');
+    } else if (typeof nfcMod === 'function') {
+      nfcMod(ioInstance);
+      logger.info('📡 SOCKET channel mounted (legacy fn): nfc.session');
+    } else {
+      logger.warn(
+        '📡 SOCKET channel nfc.session non montato (export inatteso, manca mount(io))',
+      );
+    }
   } catch (err) {
-    logger.warn('📡 SOCKET channel nfc.session non disponibile', { error: String(err) });
+    logger.warn('📡 SOCKET channel nfc.session non disponibile', {
+      error: String(err),
+    });
   }
 
   logger.info('🔌 SOCKET bootstrap completato ✅');
   return _io;
 }
 
-function io() {
+/**
+ * Restituisce il singleton io() per i router/service BE.
+ *
+ * @returns {import('socket.io').Server}
+ */
+function getIo() {
   if (!_io) throw new Error('socket.io non inizializzato');
   return _io;
 }
 
-module.exports = (serverOrIo) => init(serverOrIo);
-module.exports.io = io;
+// Funzione principale esportata (compat con require('./sockets/index')(io))
+function socketsEntry(serverOrIo) {
+  return init(serverOrIo);
+}
+
+// Espongo anche metodi nominati
+socketsEntry.init = init;
+socketsEntry.io = getIo;
+
+module.exports = socketsEntry;
+module.exports.io = getIo;
+module.exports.init = init;

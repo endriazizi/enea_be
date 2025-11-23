@@ -2,17 +2,17 @@
 'use strict';
 
 const path = require('path');
-const fs   = require('fs');
+const fs = require('fs');
 const http = require('http');
 const express = require('express');
-const cors    = require('cors');
+const cors = require('cors');
 
-const env    = require('./env');
+const env = require('./env');
 const logger = require('./logger');
-const dbmod  = require('./db');
+const dbmod = require('./db');
 
 // === GOOGLE: nuovi router puliti ============================================
-const googleOauth  = require('./api/google/oauth');
+const googleOauth = require('./api/google/oauth');
 const googlePeople = require('./api/google/people');
 
 const app = express();
@@ -33,7 +33,7 @@ function ensureExists(relPath, friendlyName) {
     fs.existsSync(abs + '.js') ||
     fs.existsSync(path.join(abs, 'index.js'));
   if (!ok) logger.error(`❌ Manca il file ${friendlyName}:`, { expected: abs });
-  else     logger.info(`✅ Trovato ${friendlyName}`, { file: abs });
+  else logger.info(`✅ Trovato ${friendlyName}`, { file: abs });
   return ok;
 }
 
@@ -44,17 +44,29 @@ app.get('/api/ping', (_req, res) => {
 });
 
 // API core (tue)
-if (ensureExists('api/auth', 'API /api/auth')) app.use('/api/auth', require('./api/auth'));
-if (ensureExists('api/reservations', 'API /api/reservations')) app.use('/api/reservations', require('./api/reservations'));
-if (ensureExists('api/products', 'API /api/products')) app.use('/api/products', require('./api/products'));
-if (ensureExists('api/orders', 'API /api/orders')) app.use('/api/orders', require('./api/orders'));
-if (ensureExists('api/tables', 'API /api/tables')) app.use('/api/tables', require('./api/tables'));
-if (ensureExists('api/rooms', 'API /api/rooms')) app.use('/api/rooms', require('./api/rooms'));
-if (ensureExists('api/notifications', 'API /api/notifications')) app.use('/api/notifications', require('./api/notifications'));
+if (ensureExists('api/auth', 'API /api/auth'))
+  app.use('/api/auth', require('./api/auth'));
+if (ensureExists('api/reservations', 'API /api/reservations'))
+  app.use('/api/reservations', require('./api/reservations'));
+if (ensureExists('api/products', 'API /api/products'))
+  app.use('/api/products', require('./api/products'));
+if (ensureExists('api/orders', 'API /api/orders'))
+  app.use('/api/orders', require('./api/orders'));
+if (ensureExists('api/tables', 'API /api/tables'))
+  app.use('/api/tables', require('./api/tables'));
+if (ensureExists('api/rooms', 'API /api/rooms'))
+  app.use('/api/rooms', require('./api/rooms'));
+if (ensureExists('api/notifications', 'API /api/notifications'))
+  app.use('/api/notifications', require('./api/notifications'));
 
 // ✅ INGREDIENTI (già presenti)
-if (ensureExists('api/ingredients', 'API /api/ingredients')) app.use('/api/ingredients', require('./api/ingredients'));
-if (ensureExists('api/product_ingredients', 'API /api/product-ingredients')) app.use('/api/product-ingredients', require('./api/product_ingredients'));
+if (ensureExists('api/ingredients', 'API /api/ingredients'))
+  app.use('/api/ingredients', require('./api/ingredients'));
+if (ensureExists('api/product_ingredients', 'API /api/product-ingredients'))
+  app.use(
+    '/api/product-ingredients',
+    require('./api/product_ingredients'),
+  );
 
 /**
  * 🧹 GOOGLE – MOUNT PULITI
@@ -66,35 +78,57 @@ app.use('/api/google/oauth', googleOauth);
 app.use('/api/google/people', googlePeople);
 
 // 🆕 NFC API
-app.use('/api/nfc', require('./api/nfc'));
-// 🆕 NFC Session API (ultimo ordine per sessione)
-app.use('/api/nfc/session', require('./api/nfc-session')); // <— AGGIUNTA
-if (ensureExists('api/customers', 'API /api/customers')) app.use('/api/customers', require('./api/customers')(app));
+if (ensureExists('api/nfc', 'API /api/nfc'))
+  app.use('/api/nfc', require('./api/nfc'));
 
+// 🆕 NFC Session API (ultimo ordine per sessione + chiusura by id)
+if (ensureExists('api/nfc-session', 'API /api/nfc-session')) {
+  // NB: path REST: /api/nfc/session/...
+  app.use('/api/nfc/session', require('./api/nfc-session'));
+}
+
+if (ensureExists('api/customers', 'API /api/customers'))
+  app.use('/api/customers', require('./api/customers')(app));
 
 // Health
-if (ensureExists('api/health', 'API /api/health')) app.use('/api/health', require('./api/health'));
+if (ensureExists('api/health', 'API /api/health'))
+  app.use('/api/health', require('./api/health'));
 
 // (Eventuali) Socket.IO
 const { Server } = require('socket.io');
-const io = new Server(server, { path: '/socket.io', cors: { origin: true, credentials: true } });
+const io = new Server(server, {
+  path: '/socket.io',
+  cors: { origin: true, credentials: true },
+});
 if (ensureExists('sockets/index', 'Sockets entry')) {
   require('./sockets/index')(io);
 } else {
-  logger.warn('⚠️ sockets/index non trovato: i socket non saranno gestiti');
-  io.on('connection', (s) => logger.info('🔌 socket connected (fallback)', { id: s.id }));
+  logger.warn(
+    '⚠️ sockets/index non trovato: i socket non saranno gestiti',
+  );
+  io.on('connection', (s) =>
+    logger.info('🔌 socket connected (fallback)', { id: s.id }),
+  );
 }
 
 // (Facoltativi) Schema check / Migrations
 if (ensureExists('db/schema-check', 'Schema checker')) {
   const { runSchemaCheck } = require('./db/schema-check');
-  runSchemaCheck().catch(err => logger.error('❌ Schema check failed', { error: String(err) }));
+  runSchemaCheck().catch((err) =>
+    logger.error('❌ Schema check failed', { error: String(err) }),
+  );
 }
 if (ensureExists('db/migrator', 'DB migrator')) {
   const { runMigrations } = require('./db/migrator');
   runMigrations()
     .then(() => logger.info('🧰 MIGRATIONS ✅ all applied'))
-    .catch((e) => logger.error('❌ Startup failed (migrations)', { error: String(e) }));
+    .catch((e) =>
+      logger.error('❌ Startup failed (migrations)', {
+        error: String(e),
+      }),
+    );
 }
 
-server.listen(env.PORT, () => logger.info(`🚀 HTTP listening on :${env.PORT}`));
+server.listen(env.PORT, () =>
+  logger.info(`🚀 HTTP listening on :${env.PORT}`),
+);

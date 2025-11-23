@@ -1,6 +1,6 @@
 # 🧩 Project code (file ammessi in .)
 
-_Generato: Sun, Nov 16, 2025 11:31:39 PM_
+_Generato: Sat, Nov 22, 2025  2:10:25 PM_
 
 ### ./package.json
 ```
@@ -1113,41 +1113,133 @@ module.exports = router;
 
 ### ./src/api/orders.js
 ```
+// src/api/orders.js
 // ============================================================================
-// ORDERS API (root = /api/orders)
-// - GET    /                lista (hours | from/to | status | q)
-// - GET    /:id(\d+)        dettaglio full con items (+ meta sala/tavolo ⚙️)
-// - POST   /                crea ordine (header + items) → 201 + full
-// - PATCH  /:id(\d+)/status cambio stato
-// - POST   /:id(\d+)/print               stampa CONTO (DUAL Pizzeria/Cucina)
-// - POST   /:id(\d+)/print/comanda       🆕 stampa SOLO un centro (PIZZERIA|CUCINA)
-// - GET    /stream          SSE (montato qui)
-// Stile: commenti lunghi, log con emoji
+// /api/orders — gestione ordini (lista, dettaglio, creazione, stato, stampa)
+//
+// Allineato con:
+// - OrderBuilderPage (creazione ordini da tavolo + prenotazione)
+// - TablesListPage (preview ordini per tavolo + stampa conto/comanda)
+//
+// Caratteristiche principali:
+// - LIST: filtro per hours/from/to/status/q/table_id
+//   - se passi ?table_id=XX ⇒ restituisce ordini "full" con righe e meta tavolo/sala
+// - GET /:id     ⇒ dettaglio ordine completo (righe + meta tavolo/sala/prenotazione)
+// - POST /       ⇒ crea ordine, ricalcola totale lato server, valorizza table_id
+// - PATCH /:id/status ⇒ cambio stato semplice (pending/confirmed/preparing/...)
+// - POST /:id/print           ⇒ stampa CONTO (printOrderDual, best-effort)
+// - POST /:id/print/comanda   ⇒ stampa comanda PIZZERIA/CUCINA
+// - POST /:id/print-comanda   ⇒ alias compat
+//
+// Tutte le integrazioni extra (SSE, Socket.IO, stampa, customers.resolve) sono
+// opzionali: se i moduli non ci sono, logghiamo un warning e continuiamo.
 // ============================================================================
+
 'use strict';
 
 const express = require('express');
 const router  = express.Router();
-const logger  = require('../logger');
+
+const logger = require('../logger');
 const { query } = require('../db');
-const sse     = require('../sse');
-const { printOrderDual, printOrderForCenter } = require('../utils/print-order'); // 🧾
 
-// === INIZIO MODIFICA: risoluzione cliente da email/phone ====================
-const resolveCustomerUserId = require('../utils/customers.resolve');
-// === FINE MODIFICA ==========================================================
+// ============================================================================
+// Moduli opzionali: SSE, Socket.IO, stampa, customers.resolve
+// ============================================================================
 
-// Monta subito l’endpoint SSE (/api/orders/stream)
-sse.mount(router);
+// SSE (best-effort)
+let sse = {
+  mount      : () => {},
+  emitCreated: () => {},
+  emitStatus : () => {},
+};
+try {
+  const mod = require('../sse');
+  if (mod && typeof mod === 'object') {
+    if (typeof mod.mount === 'function')       sse.mount       = mod.mount;
+    if (typeof mod.emitCreated === 'function') sse.emitCreated = mod.emitCreated;
+    if (typeof mod.emitStatus === 'function')  sse.emitStatus  = mod.emitStatus;
+  }
+} catch (e) {
+  logger.warn('ℹ️ [orders] SSE non disponibile (../sse mancante o non valido)', {
+    error: String(e && e.message || e),
+  });
+}
 
-// Helpers ---------------------------------------------------------------------
+// Socket.IO broadcast (best-effort)
+let socketBus = {
+  broadcastCreated: () => {},
+  broadcastUpdated: () => {},
+};
+try {
+  const s = require('../sockets/orders');
+  if (s && typeof s === 'object') {
+    if (typeof s.broadcastOrderCreated === 'function') {
+      socketBus.broadcastCreated = s.broadcastOrderCreated;
+    }
+    if (typeof s.broadcastOrderUpdated === 'function') {
+      socketBus.broadcastUpdated = s.broadcastOrderUpdated;
+    }
+  }
+} catch (e) {
+  logger.warn('ℹ️ [orders] sockets non disponibili (../sockets/orders)', {
+    error: String(e && e.message || e),
+  });
+}
+
+// Stampa (best-effort)
+let printOrderDual = async (order) => {
+  logger.info('🖨️ [orders] printOrderDual stub (nessun modulo ../utils/print-order)', {
+    id: order && order.id,
+  });
+};
+let printOrderForCenter = async (order, center) => {
+  logger.info('🧾 [orders] printOrderForCenter stub (nessun modulo ../utils/print-order)', {
+    id    : order && order.id,
+    center: center,
+  });
+};
+try {
+  const p = require('../utils/print-order');
+  if (p && typeof p === 'object') {
+    if (typeof p.printOrderDual === 'function') {
+      printOrderDual = p.printOrderDual;
+    }
+    if (typeof p.printOrderForCenter === 'function') {
+      printOrderForCenter = p.printOrderForCenter;
+    }
+  }
+} catch (e) {
+  logger.warn('ℹ️ [orders] print-order non disponibile (../utils/print-order mancante o non valido)', {
+    error: String(e && e.message || e),
+  });
+}
+
+// customers.resolve (best-effort) → mappa email/telefono su customer_user_id
+let resolveCustomerUserId = async (_db, _payload) => null;
+try {
+  const r = require('../utils/customers.resolve');
+  if (typeof r === 'function') {
+    resolveCustomerUserId = r;
+  }
+} catch (e) {
+  logger.warn('ℹ️ [orders] customers.resolve non disponibile (../utils/customers.resolve mancante)', {
+    error: String(e && e.message || e),
+  });
+}
+
+// ============================================================================
+// Helpers
+// ============================================================================
+
 const toNum = (v, def = 0) => {
   const n = Number(v);
   return Number.isFinite(n) ? n : def;
 };
-const toDate = (v) => v ? new Date(v) : null;
 
-// 🧠 Util: parsing rapido da eventuali note "Tavolo X — Sala Y"
+const toDate = (v) => (v ? new Date(v) : null);
+
+// 🧠 Util: estrai eventuali hint "Tavolo X" / "Sala Y" dalle note
 function parseLocationHintsFromNote(noteRaw) {
   const note = (noteRaw || '').toString();
   const mT = note.match(/Tavolo\s+([A-Za-z0-9\-_]+)/i);
@@ -1159,25 +1251,69 @@ function parseLocationHintsFromNote(noteRaw) {
 }
 
 /**
- * 🔍 Risolve meta "location" per la stampa:
- * - tenta un match con la prenotazione del GIORNO di `scheduled_at`
- * - ordina per vicinanza temporale a `scheduled_at` (± minuti)
- * - JOIN su `tables` (usa SOLO colonne esistenti: id, table_number) e `rooms` (name)
+ * 🔍 Risolve meta "location" per stampa / preview:
  *
- * Non richiede colonne extra su `orders`.
+ * 1) Se l'ordine ha già table_id → JOIN diretta su tables/rooms.
+ * 2) Altrimenti, se ha scheduled_at, prova a inferire la prenotazione più vicina
+ *    nello stesso giorno (stile "vecchia" logica).
  */
 async function resolveLocationMeta(order) {
-  if (!order?.scheduled_at) return { reservation: null, table: null, room: null };
+  if (!order) return { reservation: null, table: null, room: null };
+
+  // 1) Caso semplice: ho già table_id sull'ordine
+  if (order.table_id) {
+    const rows = await query(
+      `SELECT
+         t.id AS table_id,
+         t.table_number,
+         COALESCE(NULLIF(t.table_number, ''), CONCAT('T', t.id)) AS table_name,
+         rm.id   AS room_id,
+         rm.name AS room_name
+       FROM tables t
+       LEFT JOIN rooms rm ON rm.id = t.room_id
+       WHERE t.id = ?
+       LIMIT 1`,
+      [order.table_id],
+    );
+
+    const best = rows && rows[0] ? rows[0] : null;
+
+    logger.info('🧭 orders.resolveLocationMeta(table)', {
+      id          : order.id,
+      table_id    : order.table_id,
+      match_table : best && best.table_id,
+      room_id     : best && best.room_id,
+      room_name   : best && best.room_name,
+    });
+
+    if (!best) return { reservation: null, table: null, room: null };
+
+    const table = {
+      id    : best.table_id,
+      number: best.table_number,
+      label : best.table_name,
+    };
+    const room = best.room_id
+      ? { id: best.room_id, name: best.room_name }
+      : null;
+
+    return { reservation: null, table, room };
+  }
+
+  // 2) Fallback: deduco da reservations usando scheduled_at
+  if (!order.scheduled_at) {
+    return { reservation: null, table: null, room: null };
+  }
 
   const hints = parseLocationHintsFromNote(order.note);
 
-  // ⚠️ FIX: t.number/t.label non esistono → uso table_number/table_name
   const rows = await query(
     `SELECT r.id,
-            r.table_id, r.room_id,
-            t.table_number                         AS table_number,
-            COALESCE(NULLIF(t.table_number,''), CONCAT('T', t.id)) AS table_name,
-            rm.name                                AS room_name,
+            r.table_id,
+            r.room_id,
+            t.table_number,
+            COALESCE(NULLIF(t.table_number, ''), CONCAT('T', t.id)) AS table_name,
+            rm.name AS room_name,
             ABS(TIMESTAMPDIFF(MINUTE, r.start_at, ?)) AS delta_min
      FROM reservations r
      LEFT JOIN tables t ON t.id = r.table_id
@@ -1186,110 +1322,226 @@ async function resolveLocationMeta(order) {
        AND r.table_id IS NOT NULL
      ORDER BY delta_min ASC, r.id DESC
      LIMIT 1`,
-    [ order.scheduled_at, order.scheduled_at ]
+    [order.scheduled_at, order.scheduled_at],
   );
 
   const best = rows && rows[0] ? rows[0] : null;
 
-  logger.info('🧭 orders.resolveLocationMeta', {
-    id: order.id,
+  logger.info('🧭 orders.resolveLocationMeta(reservation)', {
+    id          : order.id,
     hasScheduled: !!order.scheduled_at,
-    table_hint: hints.table_hint || null,
-    room_hint : hints.room_hint  || null,
-    match_id  : best?.id || null,
-    match_delta_min: best?.delta_min ?? null,
-    table_id  : best?.table_id ?? null,
-    table_num : best?.table_number ?? null,
-    table_lbl : best?.table_name ?? null,
-    room_id   : best?.room_id ?? null,
-    room_name : best?.room_name ?? null,
+    table_hint  : hints.table_hint || null,
+    room_hint   : hints.room_hint || null,
+    match_id    : best && best.id,
+    match_delta : best && best.delta_min,
+    table_id    : best && best.table_id,
+    table_num   : best && best.table_number,
+    table_lbl   : best && best.table_name,
+    room_id     : best && best.room_id,
+    room_name   : best && best.room_name,
   });
 
-  const reservation = best ? { id: best.id, table_id: best.table_id, room_id: best.room_id } : null;
-  const table = best ? { id: best.table_id, number: best.table_number, label: best.table_name } : null;
-  const room  = best ? { id: best.room_id, name: best.room_name } : null;
+  if (!best) {
+    return { reservation: null, table: null, room: null };
+  }
+
+  const reservation = {
+    id      : best.id,
+    table_id: best.table_id,
+    room_id : best.room_id,
+  };
+  const table = {
+    id    : best.table_id,
+    number: best.table_number,
+    label : best.table_name,
+  };
+  const room = best.room_id
+    ? { id: best.room_id, name: best.room_name }
+    : null;
 
   return { reservation, table, room };
 }
 
+/**
+ * Carica un ordine "full" (testata + righe + meta tavolo/sala/prenotazione)
+ */
 async function getOrderFullById(id) {
-  // Header base (come prima)
-  const [o] = await query(
-    `SELECT id, customer_name, phone, email, people, scheduled_at, status,
-            total, channel, note, created_at, updated_at
-     FROM orders WHERE id=?`, [id]
+  // Testata ordine
+  const rows = await query(
+    `SELECT
+       o.id,
+       o.customer_name,
+       o.phone,
+       o.email,
+       o.people,
+       o.scheduled_at,
+       o.status,
+       o.total,
+       o.channel,
+       o.table_id,    -- 🆕 colonna aggiunta da 007_add_table_id_to_orders.sql
+       o.note,
+       o.created_at,
+       o.updated_at,
+       o.customer_user_id
+     FROM orders o
+     WHERE o.id = ?`,
+    [id],
   );
+
+  const o = rows && rows[0];
   if (!o) return null;
 
   // Righe con categoria risolta
   const items = await query(
-    `SELECT i.id, i.order_id, i.product_id, i.name, i.qty, i.price, i.notes, i.created_at,
-            COALESCE(c.name,'Altro') AS category
+    `SELECT i.id,
+            i.order_id,
+            i.product_id,
+            i.name,
+            i.qty,
+            i.price,
+            i.notes,
+            i.created_at,
+            COALESCE(c.name, 'Altro') AS category
      FROM order_items i
      LEFT JOIN products   p ON p.id = i.product_id
      LEFT JOIN categories c ON c.id = p.category_id
-     WHERE i.order_id=?
-     ORDER BY i.id ASC`, [id]
+     WHERE i.order_id = ?
+     ORDER BY i.id ASC`,
+    [id],
   );
 
-  // 🆕 Arricchisco con meta SALA/TAVOLO inferita dal calendario prenotazioni
+  // Meta tavolo/sala
   const meta = await resolveLocationMeta(o);
+  const resolvedTableId = (meta.table && meta.table.id) || o.table_id || null;
 
   return {
     ...o,
-    table_id:      meta.table?.id ?? null,
-    table_number:  meta.table?.number ?? null,
-    table_name:    meta.table?.label ?? null,
-    room_id:       meta.room?.id ?? null,
-    room_name:     meta.room?.name ?? null,
-    reservation: meta.reservation ? {
-      id: meta.reservation.id,
-      table_id: meta.reservation.table_id,
-      room_id : meta.reservation.room_id,
-      table: meta.table,
-      room : meta.room,
-    } : null,
-    items
+    table_id    : resolvedTableId,
+    table_number: meta.table ? meta.table.number : null,
+    table_name  : meta.table ? meta.table.label  : null,
+    room_id     : meta.room ? meta.room.id       : null,
+    room_name   : meta.room ? meta.room.name     : null,
+    reservation : meta.reservation
+      ? {
+          id      : meta.reservation.id,
+          table_id: meta.reservation.table_id,
+          room_id : meta.reservation.room_id,
+          table   : meta.table,
+          room    : meta.room,
+        }
+      : null,
+    items,
   };
 }
 
-// ROUTES ----------------------------------------------------------------------
+// ============================================================================
+// Montiamo eventuale endpoint SSE /api/orders/stream
+// ============================================================================
 
-// Lista
+try {
+  if (typeof sse.mount === 'function') {
+    sse.mount(router);
+  }
+} catch (e) {
+  logger.warn('ℹ️ [orders] sse.mount KO (continuo senza SSE)', {
+    error: String(e && e.message || e),
+  });
+}
+
+// ============================================================================
+// ROUTES
+// ============================================================================
+
+// Lista ordini (leggera o full per tavolo)
 router.get('/', async (req, res) => {
   try {
-    const { hours, from, to, status, q } = req.query;
+    const { hours, from, to, status, q, table_id } = req.query;
+
     const conds = [];
     const params = [];
 
-    if (hours) { conds.push(`created_at >= (UTC_TIMESTAMP() - INTERVAL ? HOUR)`); params.push(toNum(hours)); }
-    if (from)  { conds.push(`created_at >= ?`); params.push(new Date(from)); }
-    if (to)    { conds.push(`created_at <= ?`); params.push(new Date(to)); }
-    if (status && status !== 'all') { conds.push(`status = ?`); params.push(status); }
-    if (q)     { conds.push(`(customer_name LIKE ? OR phone LIKE ?)`); params.push(`%${q}%`, `%${q}%`); }
+    if (hours) {
+      conds.push('o.created_at >= (UTC_TIMESTAMP() - INTERVAL ? HOUR)');
+      params.push(toNum(hours));
+    }
+    if (from) {
+      conds.push('o.created_at >= ?');
+      params.push(toDate(from));
+    }
+    if (to) {
+      conds.push('o.created_at <= ?');
+      params.push(toDate(to));
+    }
+    if (status && status !== 'all') {
+      conds.push('o.status = ?');
+      params.push(String(status));
+    }
+    if (q) {
+      conds.push('(o.customer_name LIKE ? OR o.phone LIKE ?)');
+      params.push(`%${q}%`, `%${q}%`);
+    }
+    if (table_id) {
+      conds.push('o.table_id = ?');
+      params.push(toNum(table_id));
+    }
 
-    const where = conds.length ? `WHERE ${conds.join(' AND ')}` : '';
+    const where = conds.length ? 'WHERE ' + conds.join(' AND ') : '';
+
+    // Lista "base" con join tavolo/sala (utile anche per board ordini)
     const rows = await query(
-      `SELECT id, customer_name, phone, email, people, scheduled_at, status,
-              total, channel, note, created_at, updated_at
-       FROM orders
+      `SELECT
+         o.id,
+         o.customer_name,
+         o.phone,
+         o.email,
+         o.people,
+         o.scheduled_at,
+         o.status,
+         o.total,
+         o.channel,
+         o.table_id,
+         o.note,
+         o.created_at,
+         o.updated_at,
+         t.table_number,
+         COALESCE(NULLIF(t.table_number, ''), CONCAT('T', t.id)) AS table_name,
+         rm.id   AS room_id,
+         rm.name AS room_name
+       FROM orders o
+       LEFT JOIN tables t ON t.id = o.table_id
+       LEFT JOIN rooms  rm ON rm.id = t.room_id
        ${where}
-       ORDER BY id DESC
-       LIMIT 300`, params
+       ORDER BY o.id DESC
+       LIMIT 300`,
+      params,
     );
-    res.json(rows);
+
+    // Caso: preview da lista tavoli → vogliamo ordini "full" con items/meta
+    if (table_id) {
+      const fullList = [];
+      for (const r of rows) {
+        const full = await getOrderFullById(r.id);
+        if (full) fullList.push(full);
+      }
+      return res.json(fullList);
+    }
+
+    // Caso generico: ritorno lista compatta ma già arricchita con tavolo/sala
+    return res.json(rows);
   } catch (e) {
     logger.error('📄 orders list ❌', { error: String(e) });
     res.status(500).json({ ok: false, error: 'orders_list_error' });
   }
 });
 
-// Dettaglio
+// Dettaglio ordine "full"
 router.get('/:id(\\d+)', async (req, res) => {
   try {
     const id = toNum(req.params.id);
     const full = await getOrderFullById(id);
-    if (!full) return res.status(404).json({ error: 'not_found' });
+    if (!full) {
+      return res.status(404).json({ error: 'not_found' });
+    }
     res.json(full);
   } catch (e) {
     logger.error('📄 orders get ❌', { error: String(e) });
@@ -1297,7 +1549,7 @@ router.get('/:id(\\d+)', async (req, res) => {
   }
 });
 
-// Crea
+// Crea ordine
 router.post('/', async (req, res) => {
   const dto = req.body || {};
   try {
@@ -1305,69 +1557,181 @@ router.post('/', async (req, res) => {
     const items = Array.isArray(dto.items) ? dto.items : [];
 
     // Totale ricalcolato lato server
-    const total = items.reduce((acc, it) => acc + toNum(it.price) * toNum(it.qty, 1), 0);
+    const total = items.reduce(
+      (acc, it) => acc + toNum(it.price) * toNum(it.qty, 1),
+      0,
+    );
 
-    // === INIZIO MODIFICA: risolvo customer_user_id ==========================
-    const email = (dto.email ?? dto.customer?.email ?? null);
-    const phone = (dto.phone ?? dto.customer?.phone ?? null);
+    // customer_user_id opzionale via helper (se disponibile)
+    const email = dto.email || (dto.customer && dto.customer.email) || null;
+    const phone = dto.phone || (dto.customer && dto.customer.phone) || null;
     let customer_user_id = null;
     try {
-      // qui passo un "db" che implementa .query → uso il wrapper { query }
-      customer_user_id = await resolveCustomerUserId({ query }, { email, phone });
-      logger.info('🧩 [Orders] mapped customer_user_id = %s', customer_user_id, { email, phone });
+      customer_user_id = await resolveCustomerUserId(
+        { query },
+        { email, phone },
+      );
+      if (customer_user_id) {
+        logger.info('🧩 [Orders] mapped customer_user_id', {
+          email,
+          phone,
+          customer_user_id,
+        });
+      }
     } catch (e) {
-      logger.warn('⚠️ [Orders] resolveCustomerUserId KO: %s', String(e?.message || e));
+      logger.warn('⚠️ [Orders] resolveCustomerUserId KO', {
+        error: String(e && e.message || e),
+      });
     }
-    // === FINE MODIFICA ======================================================
+
+    // table_id dal payload, con fallback su reservation_id → reservations.table_id
+    let tableIdFinal =
+      dto.table_id ||
+      dto.tableId ||
+      (dto.table && dto.table.id) ||
+      null;
+
+    const reservationId =
+      dto.reservation_id ||
+      dto.reservationId ||
+      (dto.reservation && dto.reservation.id) ||
+      null;
+
+    if (!tableIdFinal && reservationId) {
+      try {
+        const rows = await query(
+          'SELECT table_id FROM reservations WHERE id = ? LIMIT 1',
+          [reservationId],
+        );
+        if (rows[0] && rows[0].table_id) {
+          tableIdFinal = rows[0].table_id;
+        }
+      } catch (e) {
+        logger.warn(
+          '⚠️ [Orders] resolve table_id from reservation_id KO',
+          { error: String(e && e.message || e) },
+        );
+      }
+    }
 
     const r = await query(
-      `INSERT INTO orders (customer_name, phone, email, people, scheduled_at, note, channel, status, total, customer_user_id)
-       VALUES (?,?,?,?,?,?,?,?,?,?)`,
+      `INSERT INTO orders (
+         customer_name,
+         phone,
+         email,
+         people,
+         scheduled_at,
+         table_id,
+         note,
+         channel,
+         status,
+         total,
+         customer_user_id
+       )
+       VALUES (?,?,?,?,?,?,?,?,?,?,?)`,
       [
         (dto.customer_name || 'Cliente').toString().trim(),
-        dto.phone || null,
-        dto.email || null,
+        phone || null,
+        email || null,
         dto.people || null,
         scheduled,
+        tableIdFinal || null,
         dto.note || null,
         dto.channel || 'admin',
         'pending',
         total,
-        customer_user_id
-      ]
+        customer_user_id,
+      ],
     );
+
     const orderId = r.insertId;
 
     for (const it of items) {
       await query(
-        `INSERT INTO order_items (order_id, product_id, name, qty, price, notes)
+        `INSERT INTO order_items (
+           order_id,
+           product_id,
+           name,
+           qty,
+           price,
+           notes
+         )
          VALUES (?,?,?,?,?,?)`,
-        [ orderId, (it.product_id ?? null), it.name, toNum(it.qty,1), toNum(it.price), (it.notes ?? null) ]
+        [
+          orderId,
+          it.product_id != null ? it.product_id : null,
+          it.name,
+          toNum(it.qty, 1),
+          toNum(it.price),
+          it.notes || null,
+        ],
       );
     }
 
     const full = await getOrderFullById(orderId);
-    try { sse.emitCreated(full); } catch (e) { logger.warn('🧵 SSE created ⚠️', { e: String(e) }); }
+
+    // Notifiche SSE / Socket.IO (best-effort)
+    try {
+      sse.emitCreated(full);
+    } catch (e) {
+      logger.warn('🧵 SSE emitCreated ⚠️', { error: String(e) });
+    }
+    try {
+      socketBus.broadcastCreated(full);
+    } catch (e) {
+      logger.warn('📡 socket broadcastCreated ⚠️', { error: String(e) });
+    }
 
     res.status(201).json(full);
   } catch (e) {
-    logger.error('🆕 orders create ❌', { service: 'server', reason: String(e) });
-    res.status(500).json({ ok: false, error: 'orders_create_error', reason: String(e) });
+    logger.error('🆕 orders create ❌', {
+      error: String(e),
+      dto,
+    });
+    res.status(500).json({
+      ok    : false,
+      error : 'orders_create_error',
+      reason: String(e),
+    });
   }
 });
 
-// Cambio stato
+// Cambio stato ordine
 router.patch('/:id(\\d+)/status', async (req, res) => {
   try {
     const id = toNum(req.params.id);
-    const status = String(req.body?.status || '').toLowerCase();
-    const allowed = new Set(['pending','confirmed','preparing','ready','completed','cancelled']);
-    if (!allowed.has(status)) return res.status(400).json({ error: 'invalid_status' });
+    const status = String((req.body && req.body.status) || '').toLowerCase();
+    const allowed = new Set([
+      'pending',
+      'confirmed',
+      'preparing',
+      'ready',
+      'completed',
+      'cancelled',
+    ]);
+    if (!allowed.has(status)) {
+      return res.status(400).json({ error: 'invalid_status' });
+    }
 
-    await query(`UPDATE orders SET status=?, updated_at=UTC_TIMESTAMP() WHERE id=?`, [status, id]);
+    await query(
+      `UPDATE orders
+         SET status = ?, updated_at = UTC_TIMESTAMP()
+       WHERE id = ?`,
+      [status, id],
+    );
 
     const full = await getOrderFullById(id);
-    try { sse.emitStatus({ id, status }); } catch (e) { logger.warn('🧵 SSE status ⚠️', { e: String(e) }); }
+
+    try {
+      sse.emitStatus({ id, status });
+    } catch (e) {
+      logger.warn('🧵 SSE emitStatus ⚠️', { error: String(e) });
+    }
+    try {
+      socketBus.broadcastUpdated(full);
+    } catch (e) {
+      logger.warn('📡 socket broadcastUpdated ⚠️', { error: String(e) });
+    }
 
     res.json(full);
   } catch (e) {
@@ -1376,19 +1740,29 @@ router.patch('/:id(\\d+)/status', async (req, res) => {
   }
 });
 
-// Stampa (best-effort) — CONTO / DUAL
+// Stampa CONTO (best-effort)
 router.post('/:id(\\d+)/print', async (req, res) => {
   try {
     const id = toNum(req.params.id);
     const full = await getOrderFullById(id);
-    if (!full) return res.status(404).json({ ok: false, error: 'not_found' });
+    if (!full) {
+      return res.status(404).json({ ok: false, error: 'not_found' });
+    }
 
     try {
       await printOrderDual(full);
+      logger.info('🖨️ orders print OK', { id });
       return res.json({ ok: true });
     } catch (e) {
-      logger.warn('🖨️ orders print ⚠️', { id, error: String(e) });
-      return res.status(502).json({ ok: false, error: 'printer_error', reason: String(e) });
+      logger.warn('🖨️ orders print ⚠️', {
+        id,
+        error: String(e),
+      });
+      return res.status(502).json({
+        ok    : false,
+        error : 'printer_error',
+        reason: String(e),
+      });
     }
   } catch (e) {
     logger.error('🖨️ orders print ❌', { error: String(e) });
@@ -1396,32 +1770,64 @@ router.post('/:id(\\d+)/print', async (req, res) => {
   }
 });
 
-// 🆕 Stampa COMANDA SOLO per un centro (PIZZERIA | CUCINA)
-router.post('/:id(\\d+)/print/comanda', async (req, res) => {
+// Handler condiviso per COMANDA (PIZZERIA | CUCINA)
+async function handlePrintComanda(req, res) {
   try {
     const id = toNum(req.params.id);
     const full = await getOrderFullById(id);
-    if (!full) return res.status(404).json({ ok: false, error: 'not_found' });
+    if (!full) {
+      return res.status(404).json({ ok: false, error: 'not_found' });
+    }
 
-    const centerRaw = (req.body?.center || req.query?.center || 'pizzeria').toString().toUpperCase();
+    const centerRaw = (
+      (req.body && req.body.center) ||
+      (req.query && req.query.center) ||
+      'pizzeria'
+    )
+      .toString()
+      .toUpperCase();
+
     const center = centerRaw === 'CUCINA' ? 'CUCINA' : 'PIZZERIA';
-    const copies = Math.max(1, toNum(req.body?.copies || req.query?.copies, 1));
+    const copies = Math.max(
+      1,
+      toNum(
+        (req.body && req.body.copies) ||
+          (req.query && req.query.copies),
+        1,
+      ),
+    );
 
     try {
-      for (let i = 0; i < copies; i++) {
+      for (let i = 0; i < copies; i += 1) {
         await printOrderForCenter(full, center);
       }
       logger.info('🧾 comanda OK', { id, center, copies });
       return res.json({ ok: true, center, copies });
     } catch (e) {
-      logger.warn('🧾 comanda ⚠️', { id, center, error: String(e) });
-      return res.status(502).json({ ok: false, error: 'printer_error', reason: String(e) });
+      logger.warn('🧾 comanda ⚠️', {
+        id,
+        center,
+        error: String(e),
+      });
+      return res.status(502).json({
+        ok    : false,
+        error : 'printer_error',
+        reason: String(e),
+      });
     }
   } catch (e) {
     logger.error('🧾 comanda ❌', { error: String(e) });
     res.status(500).json({ ok: false, error: 'orders_comanda_error' });
   }
-});
+}
+
+// Alias: /print/comanda (nuovo) e /print-comanda (compat)
+router.post('/:id(\\d+)/print/comanda', handlePrintComanda);
+router.post('/:id(\\d+)/print-comanda', handlePrintComanda);
+
+// ============================================================================
+// EXPORT
+// ============================================================================
 
 module.exports = router;
 ```
@@ -4080,3 +4486,3049 @@ async function printOrderSplitByCategory(orderFull, { PIZZERIA_CATEGORIES = ['PI
 }
 
 module.exports = { printOrderSplitByCategory };
+```
+
+### ./src/services/orders.service.js
+```
+// ============================================================================
+// ORDERS API (REST + SSE) — stile Endri: commenti lunghi, log con emoji
+// Rotte:
+//   GET    /api/orders                         → lista (filtri: status|hours|from|to|q)
+//   GET    /api/orders/:id                     → dettaglio (header + items + categoria)
+//   POST   /api/orders                         → crea ordine + items
+//   PATCH  /api/orders/:id/status              → cambio stato (emette SSE "status")
+//   POST   /api/orders/:id/print               → stampa comande (PIZZERIA/CUCINA)
+//   POST   /api/orders/print                   → compat: body { id }
+//   GET    /api/orders/count-by-status         → counts per status (range)
+//   GET    /api/orders/stream                  → Server-Sent Events (created/status)
+// Note DB: tabelle `orders` e `order_items`; categoria item via JOIN categories
+// ============================================================================
+
+const express = require('express');
+const router = express.Router();
+const { EventEmitter } = require('events');
+
+const pool = require('../db');
+const log  = require('../logger') || console;
+const { format } = require('date-fns');
+const { it } = require('date-fns/locale');
+
+// === INIZIO MODIFICA: risoluzione cliente da email/phone ====================
+const resolveCustomerUserId = require('../utils/customers.resolve');
+// === FINE MODIFICA ==========================================================
+
+// --- Event Bus per SSE -------------------------------------------------------
+const bus = new EventEmitter();
+bus.setMaxListeners(200);
+
+// UTIL -----------------------------------------------------------------------
+
+function resolveRange(query) {
+  const now = new Date();
+  if (query.from && query.to) return { from: query.from, to: query.to };
+  const h = Number(query.hours ?? 6);
+  const from = new Date(now.getTime() - Math.max(1, h) * 3600 * 1000);
+  return {
+    from: require('date-fns/format')(from, 'yyyy-MM-dd HH:mm:ss'),
+    to:   require('date-fns/format')(now,  'yyyy-MM-dd HH:mm:ss'),
+  };
+}
+function statusWhere(status) { if (!status || status === 'all') return '1=1'; return 'o.status = ?'; }
+function statusParams(status) { if (!status || status === 'all') return []; return [String(status)]; }
+
+async function loadItems(orderId, conn) {
+  const sql = `
+    SELECT i.id, i.order_id, i.product_id, i.name, i.qty, i.price, i.notes, i.created_at,
+           COALESCE(c.name, 'Altro') AS category
+    FROM order_items i
+    LEFT JOIN products   p ON p.id = i.product_id
+    LEFT JOIN categories c ON c.id = p.category_id
+    WHERE i.order_id = ?
+    ORDER BY i.id ASC
+  `;
+  const [rows] = await (conn || pool).query(sql, [orderId]);
+  return rows.map(r => ({ ...r, price: Number(r.price) }));
+}
+
+async function loadHeader(orderId, conn) {
+  const sql = `
+    SELECT o.id, o.customer_name, o.phone, o.email, o.people, o.scheduled_at,
+           o.note, o.channel, o.status, o.created_at, o.updated_at,
+           (SELECT SUM(ii.qty * ii.price) FROM order_items ii WHERE ii.order_id=o.id) AS total
+    FROM orders o
+    WHERE o.id = ?
+  `;
+  const [rows] = await (conn || pool).query(sql, [orderId]);
+  if (!rows.length) return null;
+  const h = rows[0];
+  return { ...h, total: h.total != null ? Number(h.total) : null };
+}
+
+/** Stampa via TCP 9100 (ESC/POS) */
+async function printComande(order, opts = {}) {
+  try {
+    const enabled = String(process.env.PRINTER_ENABLED || 'false') === 'true';
+    if (!enabled) {
+      log.warn('🖨️  PRINTER_DISABLED — niente stampa', { service: 'server' });
+      return { ok: true, skipped: true };
+    }
+    const pizHost = process.env.PIZZERIA_PRINTER_IP || process.env.PRINTER_IP;
+    const pizPort = Number(process.env.PIZZERIA_PRINTER_PORT || process.env.PRINTER_PORT || 9100);
+    const kitHost = process.env.KITCHEN_PRINTER_IP  || process.env.PRINTER_IP;
+    const kitPort = Number(process.env.KITCHEN_PRINTER_PORT  || process.env.PRINTER_PORT || 9100);
+
+    const PIZZERIA_CATEGORIES = (process.env.PIZZERIA_CATEGORIES || 'PIZZE,PIZZE ROSSE,PIZZE BIANCHE')
+      .split(',').map(s => s.trim().toUpperCase());
+    const KITCHEN_CATEGORIES  = (process.env.KITCHEN_CATEGORIES  || 'BEVANDE,ANTIPASTI')
+      .split(',').map(s => s.trim().toUpperCase());
+
+    const pizItems = order.items.filter(i => PIZZERIA_CATEGORIES.includes(String(i.category || '').toUpperCase()));
+    const kitItems = order.items.filter(i => KITCHEN_CATEGORIES.includes(String(i.category || '').toUpperCase()));
+
+    const { createConnection } = require('net');
+    const sendRaw = (host, port, text) => new Promise((resolve, reject) => {
+      const sock = createConnection({ host, port }, () => { sock.write(text, () => sock.end()); });
+      sock.on('error', reject); sock.on('close', () => resolve(true));
+    });
+    const buildTextCopy = (title, items) => {
+      const brand = process.env.BRAND_NAME || 'Pizzeria';
+      const now   = format(new Date(), "dd/MM/yyyy HH:mm", { locale: it });
+      let out = '';
+      out += '\x1B!\x38'; out += `${brand}\n`; out += '\x1B!\x00';
+      out += `${title}  #${order.id}\n`;
+      out += `Cliente: ${order.customer_name || '-'}  Tel: ${order.phone || '-'}\n`;
+      out += `Quando: ${order.scheduled_at || now}\n`;
+      out += '------------------------------\n';
+      for (const it of items) { out += ` ${it.qty} x ${it.name}\n`; if (it.notes) out += `  * ${it.notes}\n`; }
+      out += '------------------------------\n\n\n\x1DVA\x00';
+      return out;
+    };
+
+    if (pizItems.length) await sendRaw(pizHost, pizPort, buildTextCopy('PIZZERIA', pizItems));
+    if (kitItems.length) await sendRaw(kitHost, kitPort, buildTextCopy('CUCINA',   kitItems));
+    log.info('🖨️  Comande stampate', { service: 'server', id: order.id });
+    return { ok: true };
+  } catch (err) {
+    log.error('🖨️  orders_print_error ❌', { service: 'server', error: String(err) });
+    return { ok: false, error: 'orders_print_error', reason: String(err) };
+  }
+}
+
+// ROUTES ----------------------------------------------------------------------
+
+// Lista ordini
+router.get('/', async (req, res) => {
+  try {
+    const { from, to } = resolveRange(req.query);
+    const whereStatus = statusWhere(req.query.status);
+    const params = [from, to, ...statusParams(req.query.status)];
+    const sql = `
+      SELECT o.id, o.customer_name, o.phone, o.email, o.people, o.scheduled_at,
+             o.note, o.channel, o.status, o.created_at, o.updated_at,
+             (SELECT SUM(i.qty*i.price) FROM order_items i WHERE i.order_id=o.id) AS total
+      FROM orders o
+      WHERE o.created_at BETWEEN ? AND ?
+        AND ${whereStatus}
+      ORDER BY o.id DESC
+      LIMIT 500
+    `;
+    const [rows] = await pool.query(sql, params);
+    const mapped = rows.map(r => ({ ...r, total: r.total != null ? Number(r.total) : null }));
+    res.json(mapped);
+  } catch (err) {
+    log.error('📦 ORDERS.list ❌', { service: 'server', error: String(err) });
+    res.status(500).json({ ok: false, error: 'orders_list_error', reason: String(err) });
+  }
+});
+
+// Dati aggregati per badge
+router.get('/count-by-status', async (req, res) => {
+  try {
+    const { from, to } = resolveRange(req.query);
+    const sql = `
+      SELECT o.status, COUNT(*) AS n
+      FROM orders o
+      WHERE o.created_at BETWEEN ? AND ?
+      GROUP BY o.status
+    `;
+    const [rows] = await pool.query(sql, [from, to]);
+    const out = rows.reduce((acc, r) => { acc[r.status] = Number(r.n); return acc; }, {});
+    res.json(out);
+  } catch (err) {
+    log.error('📦 ORDERS.countByStatus ❌', { service: 'server', error: String(err) });
+    res.status(500).json({ ok: false, error: 'orders_count_error', reason: String(err) });
+  }
+});
+
+// Dettaglio
+router.get('/:id(\\d+)', async (req, res) => {
+  try {
+    const id = Number(req.params.id);
+    const header = await loadHeader(id);
+    if (!header) return res.status(404).json({ ok: false, error: 'not_found' });
+    const items = await loadItems(id);
+    res.json({ ...header, items });
+  } catch (err) {
+    log.error('📦 ORDERS.get ❌', { service: 'server', error: String(err) });
+    res.status(500).json({ ok: false, error: 'orders_get_error', reason: String(err) });
+  }
+});
+
+// Crea ordine
+router.post('/', async (req, res) => {
+  const body = req.body || {};
+  const conn = await pool.getConnection();
+  try {
+    await conn.beginTransaction();
+
+    // === INIZIO MODIFICA: resolve users.id dal payload ======================
+    const email = body.email ?? body.customer?.email ?? null;
+    const phone = body.phone ?? body.customer?.phone ?? null;
+    let customer_user_id = null;
+    try {
+      customer_user_id = await resolveCustomerUserId(conn, { email, phone });
+      log.info('🧩 ORDERS.create → customer_user_id = %s', customer_user_id, { email, phone });
+    } catch (e) {
+      log.warn('⚠️ ORDERS.create resolveCustomerUserId KO: %s', String(e?.message || e));
+    }
+    // === FINE MODIFICA ======================================================
+
+    const [r] = await conn.query(
+      `INSERT INTO orders
+         (customer_name, phone, email, people, scheduled_at, note, channel, status, created_at, updated_at, customer_user_id)
+       VALUES (?,?,?,?,?,?,?,?,NOW(),NOW(),?)`,
+      [
+        body.customer_name || null,
+        body.phone ?? null,
+        body.email ?? null,
+        body.people ?? null,
+        body.scheduled_at ?? null,
+        body.note ?? null,
+        body.channel || 'admin',
+        'pending',
+        customer_user_id
+      ]
+    );
+    const orderId = r.insertId;
+
+    const items = Array.isArray(body.items) ? body.items : [];
+    for (const it of items) {
+      await conn.query(
+        `INSERT INTO order_items (order_id, product_id, name, qty, price, notes, created_at)
+         VALUES (?,?,?,?,?,?,NOW())`,
+        [orderId, it.product_id ?? null, it.name, it.qty, it.price, it.notes ?? null]
+      );
+    }
+
+    await conn.commit();
+
+    const full = { ...(await loadHeader(orderId, conn)), items: await loadItems(orderId, conn) };
+    bus.emit('created', { id: full.id, status: full.status });
+
+    log.info('🧾 ORDERS.create ✅', { service: 'server', id: orderId, items: items.length });
+    res.status(201).json(full);
+  } catch (err) {
+    await conn.rollback();
+    log.error('🧾 ORDERS.create ❌', { service: 'server', error: String(err) });
+    res.status(500).json({ ok: false, error: 'orders_create_error', reason: String(err) });
+  } finally {
+    conn.release();
+  }
+});
+
+// Cambio stato
+router.patch('/:id(\\d+)/status', async (req, res) => {
+  try {
+    const id = Number(req.params.id);
+    const next = String(req.body?.status || '').toLowerCase();
+    await pool.query(`UPDATE orders SET status=?, updated_at=NOW() WHERE id=?`, [next, id]);
+
+    const full = { ...(await loadHeader(id)), items: await loadItems(id) };
+    bus.emit('status', { id, status: next });
+
+    log.info('🔁 ORDERS.status ✅', { service: 'server', id, next });
+    res.json(full);
+  } catch (err) {
+    log.error('🔁 ORDERS.status ❌', { service: 'server', error: String(err) });
+    res.status(500).json({ ok: false, error: 'orders_status_error', reason: String(err) });
+  }
+});
+
+// Stampa (compat 1): /orders/:id/print
+router.post('/:id(\\d+)/print', async (req, res) => {
+  try {
+    const id = Number(req.params.id);
+    const full = { ...(await loadHeader(id)), items: await loadItems(id) };
+    if (!full) return res.status(404).json({ ok: false, error: 'not_found' });
+    const out = await printComande(full, req.body || {});
+    if (!out.ok) return res.status(502).json(out);
+    res.json({ ok: true });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: 'orders_print_error', reason: String(err) });
+  }
+});
+
+// Stampa (compat 2): POST /orders/print { id }
+router.post('/print', async (req, res) => {
+  const id = Number(req.body?.id);
+  if (!id) return res.status(400).json({ ok: false, error: 'invalid_id' });
+  try {
+    const full = { ...(await loadHeader(id)), items: await loadItems(id) };
+    if (!full) return res.status(404).json({ ok: false, error: 'not_found' });
+    const out = await printComande(full, req.body || {});
+    if (!out.ok) return res.status(502).json(out);
+    res.json({ ok: true });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: 'orders_print_error', reason: String(err) });
+  }
+});
+
+// SSE stream
+router.get('/stream', (req, res) => {
+  res.setHeader('Content-Type',  'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('Connection',    'keep-alive');
+  res.flushHeaders?.();
+
+  log.info('🧵 ORDERS.stream ▶️ open', { service: 'server', ip: req.ip });
+
+  const ping = setInterval(() => {
+    res.write(`event: ping\n`);
+    res.write(`data: "ok"\n\n`);
+  }, 25000);
+
+  const onCreated = (payload) => { res.write(`event: created\n`); res.write(`data: ${JSON.stringify(payload)}\n\n`); };
+  const onStatus  = (payload) => { res.write(`event: status\n`);  res.write(`data: ${JSON.stringify(payload)}\n\n`); };
+
+  bus.on('created', onCreated);
+  bus.on('status',  onStatus);
+
+  req.on('close', () => {
+    clearInterval(ping);
+    bus.off('created', onCreated);
+    bus.off('status',  onStatus);
+    log.info('🧵 ORDERS.stream ⏹ close', { service: 'server', ip: req.ip });
+  });
+});
+
+module.exports = router;
+```
+
+### ./src/services/orders.sse.js
+```
+// server/src/services/orders.sse.js
+// ============================================================================
+// SSE (Server-Sent Events) per ORDERS
+// - mount(router)    → aggiunge GET /stream (connessione SSE)
+// - emitCreated(o)   → invia evento "created" { order }
+// - emitStatus(p)    → invia evento "status"  { id, status }
+// Stile: commenti lunghi, log con emoji
+// ============================================================================
+
+'use strict';
+
+const logger = require('../logger');
+
+// ID progressivo per i client connessi
+let nextClientId = 1;
+// Registry: id → { res }
+const clients = new Map();
+
+function sseHeaders() {
+  return {
+    'Content-Type': 'text/event-stream',
+    'Cache-Control': 'no-cache, no-transform',
+    'Connection': 'keep-alive',
+  };
+}
+
+function write(res, type, data) {
+  try {
+    res.write(`event: ${type}\n`);
+    res.write(`data: ${JSON.stringify(data)}\n\n`);
+  } catch {
+    // se ha chiuso, verrà ripulito su 'close'
+  }
+}
+
+/** Attacca la rotta GET /stream al router passato (root: /api/orders) */
+function mount(router) {
+  router.get('/stream', (req, res) => {
+    const id = nextClientId++;
+    res.writeHead(200, sseHeaders());
+    // comment line (utile in debug)
+    res.write(`: connected ${id}\n\n`);
+
+    clients.set(id, { res });
+    logger.info('🧵 SSE client connected', { id, total: clients.size });
+
+    req.on('close', () => {
+      clients.delete(id);
+      logger.info('🧵 SSE client disconnected', { id, total: clients.size });
+    });
+  });
+}
+
+// ---- Broadcasters -----------------------------------------------------------
+
+function emitCreated(order) {
+  logger.info('🧵 SSE emit created', { id: order?.id });
+  for (const { res } of clients.values()) write(res, 'created', { order });
+}
+
+function emitStatus(payload) {
+  logger.info('🧵 SSE emit status', { id: payload?.id, status: payload?.status });
+  for (const { res } of clients.values()) write(res, 'status', payload);
+}
+
+module.exports = { mount, emitCreated, emitStatus };
+```
+
+### ./src/services/product.service.js
+```
+'use strict';
+
+/**
+ * Product Service
+ * ----------------
+ * - Query centralizzate su `products` (+ join categorie)
+ * - Restituisce SEMPRE array "puliti" (query wrapper torna already rows)
+ * - Log verbosi con emoji, in linea con il tuo stile
+ */
+
+const logger = require('../logger');
+
+// ✅ Importa la funzione `query` già "wrapped" dal nostro db/index.js
+//    (evita di usare `const db = require('../db')` → poi `db.query(...)`,
+//     perché se il require fallisce `db` diventa undefined e scoppia)
+const { query } = require('../db');
+
+module.exports = {
+  getAll,
+  getById,
+  create,
+  update,
+  remove,
+};
+
+// GET all (opz. solo attivi)
+async function getAll({ active = false } = {}) {
+  logger.debug('🧾 products.getAll', { active });
+
+  const sql = `
+    SELECT
+      p.id, p.name, p.description, p.price, p.is_active, p.sort_order,
+      p.category_id, c.name AS category
+    FROM products p
+    LEFT JOIN categories c ON c.id = p.category_id
+    ${active ? 'WHERE p.is_active = 1' : ''}
+    ORDER BY c.name, p.sort_order, p.id
+  `;
+  // il nostro wrapper ritorna direttamente `rows`
+  const rows = await query(sql, []);
+  return rows || [];
+}
+
+// GET by id
+async function getById(id) {
+  logger.debug('🧾 products.getById', { id });
+  const rows = await query(
+    `SELECT p.id, p.name, p.description, p.price, p.is_active, p.sort_order,
+            p.category_id, c.name AS category
+     FROM products p
+     LEFT JOIN categories c ON c.id = p.category_id
+     WHERE p.id = ?`,
+    [id]
+  );
+  return rows?.[0] || null;
+}
+
+// CREATE (campi minimi)
+async function create(payload) {
+  logger.debug('🧾 products.create', { payload });
+
+  const {
+    name,
+    description = null,
+    price = 0,
+    is_active = 1,
+    sort_order = 100,
+    category_id = null,
+  } = payload || {};
+
+  if (!name) throw new Error('name_required');
+
+  const result = await query(
+    `INSERT INTO products
+       (name, description, price, is_active, sort_order, category_id)
+     VALUES (?,?,?,?,?,?)`,
+    [name, description, price, is_active ? 1 : 0, sort_order, category_id]
+  );
+
+  // mysql2.execute() nel nostro wrapper torna rows, ma per INSERT usiamo affectedRows/insertId
+  // il wrapper già restituisce rows, quindi per coerenza facciamo una GET by id
+  // (così garantiamo stesso shape della read)
+  const rows = await query('SELECT LAST_INSERT_ID() AS id');
+  const id = rows?.[0]?.id;
+  return getById(id);
+}
+
+// UPDATE
+async function update(id, payload) {
+  logger.debug('🧾 products.update', { id, payload });
+
+  const cur = await getById(id);
+  if (!cur) return null;
+
+  const next = {
+    name: payload?.name ?? cur.name,
+    description: payload?.description ?? cur.description,
+    price: payload?.price ?? cur.price,
+    is_active: (payload?.is_active ?? cur.is_active) ? 1 : 0,
+    sort_order: payload?.sort_order ?? cur.sort_order,
+    category_id: payload?.category_id ?? cur.category_id,
+  };
+
+  await query(
+    `UPDATE products
+       SET name=?, description=?, price=?, is_active=?, sort_order=?, category_id=?
+     WHERE id=?`,
+    [
+      next.name, next.description, next.price, next.is_active,
+      next.sort_order, next.category_id, id
+    ]
+  );
+
+  return getById(id);
+}
+
+// DELETE
+async function remove(id) {
+  logger.debug('🧾 products.remove', { id });
+  const rows = await query(`DELETE FROM products WHERE id = ?`, [id]);
+  // Se il wrapper ritorna oggetto "OkPacket", potremmo non avere affectedRows qui;
+  // in ogni caso, una seconda read conferma la rimozione.
+  const check = await getById(id);
+  return !check;
+}
+```
+
+### ./src/services/reservations.service.js
+```
+// src/services/reservations.service.js 
+// ============================================================================
+// Service “Reservations” — query DB per prenotazioni
+// Stile: commenti lunghi, log con emoji, diagnostica chiara.
+// NOTA: questo è un *service module* (esporta funzioni). La tua API/Router
+//       /api/reservations importerà da qui.
+// - 🆕 checkIn / checkOut idempotenti (persistono checkin_at / checkout_at / dwell_sec)
+// - 🆕 assignReservationTable (usato dai sockets) + changeTable alias
+// ============================================================================
+
+'use strict';
+
+const { query } = require('../db');
+const logger = require('../logger');
+const env    = require('../env');
+
+// --- Helpers -----------------------------------------------------------------
+function trimOrNull(s) { const v = (s ?? '').toString().trim(); return v ? v : null; }
+function toDayRange(fromYmd, toYmd) {
+  const out = { from: null, to: null };
+  if (fromYmd) out.from = `${fromYmd} 00:00:00`;
+  if (toYmd)   out.to   = `${toYmd} 23:59:59`;
+  return out;
+}
+
+/**
+ * Converte qualunque input (stringa ISO, Date, oppure 'YYYY-MM-DD HH:mm:ss'
+ * locale) in una stringa MySQL DATETIME "YYYY-MM-DD HH:mm:ss" in **UTC**.
+ *
+ * Pipeline che vogliamo:
+ * - Il FE lavora in ORA LOCALE (Europe/Rome nel tuo caso).
+ *   (logica gemella di toUTCFromLocalDateTimeInput sul FE: src/app/shared/utils.date.ts).
+ * - Quando manda al BE valori tipo "2025-11-15T19:00" o "2025-11-15 19:00:00",
+ *   qui li interpretiamo come locali e li convertiamo in UTC.
+ * - Il DB è configurato con time_zone = '+00:00', quindi il DATETIME salvato
+ *   è già UTC e quando lo rileggiamo/serializziamo va verso il FE come ISO con 'Z'.
+ */
+function isoToMysql(iso) {
+  if (!iso) return null;
+  if (iso instanceof Date) return dateToMysqlUtc(iso);
+  const s = String(iso).trim();
+
+  // Se è già nel formato MySQL "YYYY-MM-DD HH:mm:ss" lo tratto come ORA LOCALE
+  // del ristorante e lo porto in UTC.
+  const mysqlLike = /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/;
+  if (mysqlLike.test(s)) {
+    const [datePart, timePart] = s.split(' ');
+    const [y, m, d] = datePart.split('-').map((n) => parseInt(n, 10));
+    const [hh, mm, ss] = timePart.split(':').map((n) => parseInt(n, 10));
+    const local = new Date(y, m - 1, d, hh, mm, ss); // 👉 locale
+    if (!Number.isNaN(local.getTime())) return dateToMysqlUtc(local);
+  }
+
+  // Per tutto il resto ("YYYY-MM-DDTHH:mm", ISO con 'Z', ecc.) lascio che il
+  // costruttore Date si arrangi. Se è senza 'Z' verrà interpretato come locale,
+  // se ha 'Z' è già UTC.
+  const d = new Date(s);
+  if (!Number.isNaN(d.getTime())) return dateToMysqlUtc(d);
+
+  // Fallback compat per formati strani: mantengo il tuo vecchio comportamento.
+  return s.replace('T', ' ').slice(0, 19);
+}
+
+/**
+ * Helper interno: Date → stringa MySQL DATETIME in UTC.
+ */
+function dateToMysqlUtc(d) {
+  const pad = (n) => String(n).padStart(2, '0');
+  const y = d.getUTCFullYear();
+  const m = pad(d.getUTCMonth() + 1);
+  const day = pad(d.getUTCDate());
+  const hh = pad(d.getUTCHours());
+  const mm = pad(d.getUTCMinutes());
+  const ss = pad(d.getUTCSeconds());
+  return `${y}-${m}-${day} ${hh}:${mm}:${ss}`;
+}
+
+/**
+ * Calcola start_at / end_at a partire da una stringa di input (tipicamente
+ * "YYYY-MM-DDTHH:mm" dalla tua admin PWA) e applica le regole pranzo/cena.
+ *
+ * - L'input viene interpretato come ORA LOCALE del ristorante.
+ * - Decidiamo se è pranzo o cena guardando l'ora locale (<16 ⇒ pranzo).
+ * - Poi convertiamo sia start che end in UTC per salvarli in DB.
+ */
+function computeEndAtFromStart(startAtIso) {
+  if (!startAtIso) throw new Error('startAtIso mancante per computeEndAtFromStart');
+
+  const raw = String(startAtIso).trim();
+  let localStart = null;
+
+  // Caso 1: "YYYY-MM-DD HH:mm[:ss]" (già con spazio)
+  const spaceLike = /^(\d{4}-\d{2}-\d{2}) (\d{2}):(\d{2})(?::(\d{2}))?/;
+  const spaceMatch = raw.match(spaceLike);
+  if (spaceMatch) {
+    const [, datePart, hhStr, mmStr, ssStr] = spaceMatch;
+    const [y, m, d] = datePart.split('-').map((n) => parseInt(n, 10));
+    const hh = parseInt(hhStr, 10);
+    const mm = parseInt(mmStr, 10);
+    const ss = ssStr ? parseInt(ssStr, 10) : 0;
+    localStart = new Date(y, m - 1, d, hh, mm, ss);
+  } else {
+    // Caso 2: qualunque ISO gestito da Date ("YYYY-MM-DDTHH:mm" o ISO con Z).
+    localStart = new Date(raw);
+  }
+
+  if (Number.isNaN(localStart.getTime())) {
+    throw new Error(`startAtIso non valido: ${startAtIso}`);
+  }
+
+  // Regola pranzo/cena basata sull'ORA LOCALE (getHours).
+  const addMin = (localStart.getHours() < 16
+    ? (env.RESV?.defaultLunchMinutes || 90)
+    : (env.RESV?.defaultDinnerMinutes || 120));
+
+  const localEnd = new Date(localStart.getTime() + addMin * 60 * 1000);
+
+  return {
+    startMysql: dateToMysqlUtc(localStart),
+    endMysql  : dateToMysqlUtc(localEnd),
+  };
+}
+
+// ============================================================================
+// ⚙️ Cambio stato basico (compat): accetta azione o stato
+// ============================================================================
+
+function normalizeStatusAction(actionOrStatus) {
+  if (!actionOrStatus) return { nextStatus: null, note: null };
+  const s = String(actionOrStatus).toLowerCase();
+  if (s === 'accept' || s === 'accepted') return { nextStatus: 'accepted', note: null };
+  if (s === 'reject' || s === 'rejected' || s === 'cancel' || s === 'cancelled' || s === 'canceled') {
+    return { nextStatus: 'cancelled', note: null };
+  }
+  return { nextStatus: s, note: null };
+}
+
+// ============================================================================
+// 📋 LIST / GET
+// ============================================================================
+
+async function list({ status, from, to } = {}) {
+  const where = [];
+  const params = [];
+
+  if (status && status !== 'all') {
+    where.push('r.status = ?');
+    params.push(status);
+  }
+
+  const range = toDayRange(from, to);
+  if (range.from) { where.push('r.start_at >= ?'); params.push(range.from); }
+  if (range.to)   { where.push('r.start_at <= ?'); params.push(range.to);   }
+
+  const sql = `
+    SELECT
+      r.id,
+      r.customer_first,
+      r.customer_last,
+      r.phone,
+      r.email,
+      r.user_id,
+      r.party_size,
+      r.start_at,
+      r.end_at,
+      r.room_id,
+      r.notes,
+      r.status,
+      r.created_by,
+      r.updated_by,
+      r.status_note,
+      r.status_changed_at,
+      r.client_token,
+      r.table_id,
+      r.created_at,
+      r.updated_at,
+      r.checkin_at,
+      r.checkout_at,
+      r.dwell_sec,
+      u.first_name   AS user_first_name,
+      u.last_name    AS user_last_name,
+      u.email        AS user_email,
+      t.table_number,
+      CONCAT('Tavolo ', t.table_number) AS table_name
+    FROM reservations r
+    LEFT JOIN users  u ON u.id = r.user_id
+    LEFT JOIN tables t ON t.id = r.table_id
+    ${where.length ? 'WHERE ' + where.join(' AND ') : ''}
+    ORDER BY r.start_at ASC, r.id ASC
+  `;
+  const rows = await query(sql, params);
+  return rows;
+}
+
+async function getById(id) {
+  const sql = `
+    SELECT
+      r.id,
+      r.customer_first,
+      r.customer_last,
+      r.phone,
+      r.email,
+      r.user_id,
+      r.party_size,
+      r.start_at,
+      r.end_at,
+      r.room_id,
+      r.notes,
+      r.status,
+      r.created_by,
+      r.updated_by,
+      r.status_note,
+      r.status_changed_at,
+      r.client_token,
+      r.table_id,
+      r.created_at,
+      r.updated_at,
+      r.checkin_at,
+      r.checkout_at,
+      r.dwell_sec,
+      u.first_name   AS user_first_name,
+      u.last_name    AS user_last_name,
+      u.email        AS user_email,
+      t.table_number,
+      CONCAT('Tavolo ', t.table_number) AS table_name
+    FROM reservations r
+    LEFT JOIN users  u ON u.id = r.user_id
+    LEFT JOIN tables t ON t.id = r.table_id
+    WHERE r.id = ?
+    LIMIT 1`;
+  const rows = await query(sql, [id]); return rows[0] || null;
+}
+
+async function ensureUser({ first, last, email, phone }) {
+  const e = trimOrNull(email), p = trimOrNull(phone);
+  if (e) {
+    const r = await query('SELECT id FROM users WHERE email = ? LIMIT 1', [e]);
+    if (r.length) return r[0].id;
+  }
+  if (p) {
+    const r = await query('SELECT id FROM users WHERE phone = ? LIMIT 1', [p]);
+    if (r.length) return r[0].id;
+  }
+  const res = await query(
+    `INSERT INTO users (first_name, last_name, email, phone)
+     VALUES (?, ?, ?, ?)`,
+    [trimOrNull(first), trimOrNull(last), e, p]
+  );
+  return res.insertId;
+}
+
+// ============================================================================
+// ➕ CREATE
+// ============================================================================
+
+async function create(dto, { user } = {}) {
+  const userId = await ensureUser({
+    first: dto.customer_first,
+    last : dto.customer_last,
+    email: dto.email,
+    phone: dto.phone,
+  });
+
+  const startIso = dto.start_at;
+  const endIso   = dto.end_at || null;
+
+  const { startMysql, endMysql } = endIso
+    ? { startMysql: isoToMysql(startIso), endMysql: isoToMysql(endIso) }
+    : computeEndAtFromStart(startIso);
+
+  const res = await query(
+    `INSERT INTO reservations
+      (customer_first, customer_last, phone, email,
+       user_id, party_size, start_at, end_at, room_id, table_id,
+       notes, status, created_by)
+     VALUES (?,?,?,?,?,?,?,?,?,?,?, 'pending', ?)`,
+    [
+      trimOrNull(dto.customer_first), trimOrNull(dto.customer_last),
+      trimOrNull(dto.phone), trimOrNull(dto.email),
+      userId, Number(dto.party_size) || 1, startMysql, endMysql,
+      dto.room_id || null, dto.table_id || null,
+      trimOrNull(dto.notes), trimOrNull(user?.email) || null
+    ]);
+  const created = await getById(res.insertId);
+  logger.info('🆕 reservation created', { id: created.id, by: user?.email || null });
+  return created;
+}
+
+// ============================================================================
+// ✏️ UPDATE
+// ============================================================================
+
+async function update(id, dto, { user } = {}) {
+  let userId = null;
+  if (dto.customer_first !== undefined || dto.customer_last !== undefined
+    || dto.email !== undefined || dto.phone !== undefined) {
+    userId = await ensureUser({
+      first: dto.customer_first,
+      last : dto.customer_last,
+      email: dto.email,
+      phone: dto.phone,
+    });
+  }
+  let startMysql = null, endMysql = null;
+  if (dto.start_at) {
+    const endIso = dto.end_at || null;
+    const c = endIso
+      ? { startMysql: isoToMysql(dto.start_at), endMysql: isoToMysql(endIso) }
+      : computeEndAtFromStart(dto.start_at);
+    startMysql = c.startMysql; endMysql = c.endMysql;
+  }
+  const fields = [], pr = [];
+  if (userId !== null) { fields.push('user_id=?'); pr.push(userId); }
+  if (dto.customer_first !== undefined) { fields.push('customer_first=?'); pr.push(trimOrNull(dto.customer_first)); }
+  if (dto.customer_last  !== undefined) { fields.push('customer_last=?');  pr.push(trimOrNull(dto.customer_last));  }
+  if (dto.phone          !== undefined) { fields.push('phone=?');          pr.push(trimOrNull(dto.phone));          }
+  if (dto.email          !== undefined) { fields.push('email=?');          pr.push(trimOrNull(dto.email));          }
+  if (dto.party_size     !== undefined) { fields.push('party_size=?');     pr.push(dto.party_size || 1);           }
+  if (startMysql         !== null)      { fields.push('start_at=?');       pr.push(startMysql);                    }
+  if (endMysql           !== null)      { fields.push('end_at=?');         pr.push(endMysql);                      }
+  if (dto.room_id  !== undefined) { fields.push('room_id=?');  pr.push(dto.room_id || null); }
+  if (dto.table_id !== undefined) { fields.push('table_id=?'); pr.push(dto.table_id || null); }
+  if (dto.notes    !== undefined) { fields.push('notes=?');    pr.push(trimOrNull(dto.notes)); }
+  if (dto.checkin_at  !== undefined) {
+    fields.push('checkin_at=?');
+    pr.push(dto.checkin_at ? isoToMysql(dto.checkin_at) : null);
+  }
+  if (dto.checkout_at !== undefined) {
+    fields.push('checkout_at=?');
+    pr.push(dto.checkout_at ? isoToMysql(dto.checkout_at) : null);
+  }
+  if (dto.dwell_sec   !== undefined) {
+    fields.push('dwell_sec=?');
+    pr.push(dto.dwell_sec == null ? null : Number(dto.dwell_sec));
+  }
+  fields.push('updated_by=?'); pr.push(trimOrNull(user?.email) || null);
+
+  if (!fields.length) {
+    logger.info('✏️ update: nessun campo da aggiornare', { id });
+    return await getById(id);
+  }
+  pr.push(id);
+  await query(`UPDATE reservations SET ${fields.join(', ')} WHERE id=?`, pr);
+  const updated = await getById(id);
+  logger.info('✏️ reservation updated', { id, by: user?.email || null });
+  return updated;
+}
+
+// ============================================================================
+// 🗑️ DELETE (hard, con policy) – invariato
+// ============================================================================
+
+async function remove(id, { user, reason } = {}) {
+  const existing = await getById(id);
+  if (!existing) return false;
+  const allowAnyByEnv =
+    (env.RESV && env.RESV.allowDeleteAnyStatus === true) ||
+    (String(process.env.RESV_ALLOW_DELETE_ANY_STATUS || '').toLowerCase() === 'true');
+  const statusNorm = String(existing.status || '').toLowerCase();
+  const isCancelled = (statusNorm === 'cancelled' || statusNorm === 'canceled');
+  if (!allowAnyByEnv && !isCancelled) {
+    logger.warn('🛡️ hard-delete NEGATO (stato non cancellato)', { id, status: existing.status }); return false;
+  }
+  await query('DELETE FROM reservations WHERE id=? LIMIT 1', [id]);
+  logger.info('🗑️ reservation removed', { id, by: user?.email || null, reason: reason || null });
+  return true;
+}
+
+// ============================================================================
+// 📊 COUNT BY STATUS
+// ============================================================================
+
+async function countByStatus({ from, to } = {}) {
+  const where = [];
+  const params = [];
+  const range = toDayRange(from, to);
+  if (range.from) { where.push('r.start_at >= ?'); params.push(range.from); }
+  if (range.to)   { where.push('r.start_at <= ?'); params.push(range.to);   }
+  const sql = `
+    SELECT r.status, COUNT(*) AS count
+    FROM reservations r
+    ${where.length ? 'WHERE ' + where.join(' AND ') : ''}
+    GROUP BY r.status
+  `;
+  const rows = await query(sql, params);
+  const out = { pending: 0, accepted: 0, cancelled: 0 };
+  for (const r of rows) {
+    const s = String(r.status || '').toLowerCase();
+    if (s === 'pending') out.pending = r.count;
+    else if (s === 'accepted') out.accepted = r.count;
+    else if (s === 'cancelled' || s === 'canceled') out.cancelled = r.count;
+  }
+  return out;
+}
+
+// ============================================================================
+// 📚 ROOMS / TABLES
+// ============================================================================
+
+async function listRooms() {
+  const sql = `
+    SELECT id, name, description
+    FROM rooms
+    WHERE is_active = 1
+    ORDER BY sort_order ASC, id ASC
+  `;
+  return await query(sql, []);
+}
+
+async function listTablesByRoom(roomId) {
+  const sql = `
+    SELECT id, room_id, table_number, capacity, is_active
+    FROM tables
+    WHERE room_id = ?
+    ORDER BY table_number ASC, id ASC
+  `;
+  return await query(sql, [roomId]);
+}
+
+// ============================================================================
+// 🪑 Assegnazione tavolo
+// ============================================================================
+
+async function assignReservationTable(id, tableId, { user } = {}) {
+  await query(
+    `UPDATE reservations
+        SET table_id = ?, updated_by = ?, updated_at = CURRENT_TIMESTAMP
+      WHERE id = ? LIMIT 1`,
+    [tableId || null, trimOrNull(user?.email) || null, id]
+  );
+  const updated = await getById(id);
+  logger.info('🪑 reservation table assigned', { id, table_id: tableId, by: user?.email || null });
+  return updated;
+}
+
+// Alias più leggibile lato chiamante
+const changeTable = assignReservationTable;
+
+// ============================================================================
+// ✅ Cambio stato “semplice” (non usa state-machine avanzata)
+// ============================================================================
+
+async function updateStatus(id, actionOrStatus, { user } = {}) {
+  const existing = await getById(id);
+  if (!existing) return null;
+  const { nextStatus } = normalizeStatusAction(actionOrStatus);
+  if (!nextStatus) {
+    logger.warn('⚠️ updateStatus: stato non valido', { id, actionOrStatus });
+    return existing;
+  }
+  await query(
+    `UPDATE reservations
+        SET status = ?, status_changed_at = CURRENT_TIMESTAMP, updated_by = ?
+      WHERE id = ? LIMIT 1`,
+    [nextStatus, trimOrNull(user?.email) || null, id]
+  );
+  const updated = await getById(id);
+  logger.info('🔁 reservation status updated', {
+    id,
+    from: existing.status,
+    to  : updated.status,
+    by  : user?.email || null
+  });
+  return updated;
+}
+
+// ============================================================================
+// 🕒 Check-in / Check-out
+// ============================================================================
+
+async function checkIn(id, { at, user } = {}) {
+  const existing = await getById(id);
+  if (!existing) return null;
+
+  const checkin_at_mysql = isoToMysql(at || new Date()) || null;
+
+  await query(
+    `UPDATE reservations
+        SET checkin_at = ?, updated_at = CURRENT_TIMESTAMP, updated_by = ?
+      WHERE id = ? LIMIT 1`,
+    [checkin_at_mysql, trimOrNull(user?.email) || null, id]
+  );
+
+  const updated = await getById(id);
+  logger.info('✅ reservation check-in', {
+    id,
+    at     : updated.checkin_at,
+    by     : user?.email || null,
+    status : updated.status,
+  });
+  return updated;
+}
+
+async function checkOut(id, { at, user } = {}) {
+  const existing = await getById(id);
+  if (!existing) return null;
+
+  // Orario di checkout: se non passo nulla → adesso
+  const checkoutDate = at ? new Date(at) : new Date();
+  const checkout_at_mysql = isoToMysql(checkoutDate) || null;
+
+  // dwell_sec (in secondi) se ho un checkin_at valido
+  let dwell_sec = null;
+  if (existing.checkin_at) {
+    const startMs = new Date(existing.checkin_at).getTime();
+    const endMs   = checkoutDate.getTime();
+    if (!Number.isNaN(startMs) && !Number.isNaN(endMs)) {
+      dwell_sec = Math.max(0, Math.floor((endMs - startMs) / 1000));
+    }
+  }
+
+  // Costruisco SQL + parametri mantenendo il tuo stile
+  const params = [checkout_at_mysql, trimOrNull(user?.email) || null];
+  let SQL = `
+    UPDATE reservations
+       SET checkout_at = ?,
+           updated_at  = CURRENT_TIMESTAMP,
+           updated_by  = ?`;
+
+  if (dwell_sec !== null) {
+    SQL += `,
+           dwell_sec   = ?`;
+    params.push(dwell_sec);
+  }
+
+  SQL += `
+     WHERE id = ? LIMIT 1`;
+  params.push(id);
+
+  await query(SQL, params);
+
+  const updated = await getById(id);
+  logger.info('✅ reservation check-out', {
+    id,
+    at     : updated.checkout_at,
+    dwell  : updated.dwell_sec,
+    by     : user?.email || null,
+    status : updated.status,
+  });
+  return updated;
+}
+
+// ============================================================================
+// EXPORTS
+// ============================================================================
+
+module.exports = {
+  list,
+  getById,
+  create,
+  update,
+  updateStatus,
+  remove,
+  countByStatus,
+  listRooms,
+  listTablesByRoom,
+  // 🆕
+  assignReservationTable,
+  changeTable,
+  checkIn,
+  checkOut,
+};
+```
+
+### ./src/services/reservations-status.service.js
+```
+// src/services/reservations-status.service.js
+// ----------------------------------------------------------------------------
+// State machine per le prenotazioni + persistenza su DB.
+// - Interfaccia: updateStatus({ id, action, reason?, user_email? })
+// - Compat FE: confirm/confirmed → accepted (badge verde); cancel/* → cancelled (badge visibile)
+// - UPDATE dinamica solo su colonne realmente presenti (status_note / reason, status_changed_at, updated_*)
+// - Alias compat: updateReservationStatus(...) → updateStatus(...)
+// ----------------------------------------------------------------------------
+
+'use strict';
+
+const { query } = require('../db');
+const logger    = require('../logger');
+
+// Azioni consentite (accettiamo sia verbi sia stati finali)
+const ALLOWED = new Set([
+  'accept','accepted',
+  'confirm','confirmed',       // → accepted
+  'arrive','arrived',
+  'reject','rejected',
+  'cancel','canceled','cancelled', // → cancelled (UK) per compat FE badge
+  'prepare','preparing',
+  'ready',
+  'complete','completed',
+  'no_show','noshow'
+]);
+
+// Normalizzazione: azione → stato DB
+const MAP = {
+  accept     : 'accepted',
+  confirm    : 'accepted',
+  confirmed  : 'accepted',
+  arrive     : 'arrived',
+  reject     : 'rejected',
+  cancel     : 'cancelled',
+  cancelled  : 'cancelled',
+  canceled   : 'cancelled',
+  prepare    : 'preparing',
+  complete   : 'completed',
+  no_show    : 'no_show',
+  noshow     : 'no_show'
+};
+
+function toStatus(action) {
+  const a = String(action || '').trim().toLowerCase();
+  if (!ALLOWED.has(a)) throw new Error('invalid_action');
+  return MAP[a] || a;
+}
+
+// Cache colonne
+const _colsCache = new Map();
+async function columnsOf(table = 'reservations') {
+  if (_colsCache.has(table)) return _colsCache.get(table);
+  const rows = await query(
+    `SELECT COLUMN_NAME AS name
+       FROM information_schema.columns
+      WHERE table_schema = DATABASE() AND table_name = ?`,
+    [table]
+  );
+  const set = new Set(rows.map(r => r.name));
+  _colsCache.set(table, set);
+  return set;
+}
+
+/**
+ * Aggiorna lo stato e ritorna la riga aggiornata.
+ * - Scrive status_note (se esiste) o reason (fallback) solo se reason è valorizzato.
+ * - Aggiorna status_changed_at/updated_* solo se esistono.
+ */
+async function updateStatus({ id, action, reason = null, user_email = 'system' }) {
+  const rid = Number(id);
+  if (!rid || !action) throw new Error('missing_id_or_action');
+
+  const newStatus = toStatus(action);
+  const cols = await columnsOf('reservations');
+
+  const set = [];
+  const pr  = [];
+
+  set.push('status = ?'); pr.push(newStatus);
+
+  const hasReason = reason !== null && reason !== undefined && String(reason).trim() !== '';
+  if (hasReason) {
+    if (cols.has('status_note')) {
+      set.push('status_note = COALESCE(?, status_note)'); pr.push(reason);
+    } else if (cols.has('reason')) {
+      set.push('reason = COALESCE(?, reason)');           pr.push(reason);
+    }
+  }
+
+  if (cols.has('status_changed_at')) set.push('status_changed_at = CURRENT_TIMESTAMP');
+  if (cols.has('updated_at'))        set.push('updated_at = CURRENT_TIMESTAMP');
+  if (cols.has('updated_by'))       { set.push('updated_by = ?'); pr.push(user_email); }
+
+  if (!set.length) throw new Error('no_fields_to_update');
+
+  pr.push(rid);
+  const sql = `UPDATE reservations SET ${set.join(', ')} WHERE id = ? LIMIT 1`;
+  const res = await query(sql, pr);
+  if (!res?.affectedRows) throw new Error('reservation_not_found');
+
+  logger.info('🧾 RESV.status ✅ updated', { id: rid, newStatus, usedCols: set.map(s => s.split('=')[0].trim()) });
+
+  const rows = await query('SELECT * FROM reservations WHERE id = ?', [rid]);
+  return rows[0] || null;
+}
+
+// Alias compat per vecchi import
+const updateReservationStatus = (args) => updateStatus(args);
+
+module.exports = { updateStatus, updateReservationStatus };
+```
+
+### ./src/services/thermal-printer.service.js
+```
+// server/src/services/thermal-printer.service.js
+// Stampa termica: daily, placecards multipli e singolo segnaposto.
+// Mantengo lo stile e NON sovrascrivo la tua logica ordini: provo le API esistenti
+// e, se mancano i metodi “placecard”, uso un fallback ESC/POS in solo testo
+// (niente QR/immagini → massima compatibilità). Formattazione tipo utils/print.js.
+// 🆕 Opzioni compatibili (ENV): PRINTER_CODEPAGE, PRINTER_WIDTH_MM / PRINTER_COLS,
+// PRINTER_DAILY_GROUPED, PRINTER_LOGO_PATH (PNG), BIZ_TZ, DB_TIME_IS_UTC,
+// PRINTER_QR_SIZE, PRINTER_QR_ECC, PRINTER_TOP_PAD_LINES, PRINTER_BOTTOM_PAD_LINES,
+// PRINTER_HEADER_FEED_BEFORE, PRINTER_FOOTER_FEED_AFTER, PRINTER_DEBUG_HEX,
+// PRINTER_QR_MODE (auto|escpos|raster), PRINTER_QR_SCALE, PRINTER_TIME_DATE_SEP.
+
+'use strict';
+
+const fs     = require('fs');
+const path   = require('path');
+const net    = require('net');
+const logger = require('../logger');
+const env    = require('../env');
+
+// opzionali: codepage + PNG (fallback automatici se non installati)
+let iconv;
+try { iconv = require('iconv-lite'); } catch { iconv = null; }
+let PNGjs;
+try { ({ PNG: PNGjs } = require('pngjs')); } catch (e) { PNGjs = null; }
+// opzionale per QR raster
+let QRLib;
+try { QRLib = require('qrcode'); } catch (e) { QRLib = null; }
+
+// Se hai già un order-printer service, lo riuso:
+let orderPrinter;
+try { orderPrinter = require('./order-printer.service'); }
+catch { orderPrinter = null; }
+
+/* ───────────────────────────────── Helpers ───────────────────────────────── */
+
+function toISO(x) {
+  if (!x) return '';
+  if (x instanceof Date) return x.toISOString();
+  if (typeof x === 'string') return x;
+  if (typeof x === 'number') { const d = new Date(x); return isNaN(d) ? '' : d.toISOString(); }
+  const s = x?.date || x?.day || x?.ymd || '';
+  return typeof s === 'string' ? s : '';
+}
+function toYMD(x) {
+  const iso = toISO(x) || new Date().toISOString();
+  return String(iso).slice(0, 10); // YYYY-MM-DD
+}
+function timeHM(iso) {
+  if (!iso) return '--:--';
+  const d = new Date(iso);
+  const hh = String(d.getHours()).padStart(2,'0');
+  const mm = String(d.getMinutes()).padStart(2,'0');
+  return `${hh}:${mm}`;
+}
+
+// ASCII “safe”: rimpiazza caratteri fuori 0x20..0x7E (evita problemi codepage)
+function asciiSafe(s) { return String(s || '').replace(/[^\x20-\x7E]/g, '?'); }
+
+// Colonne: 80mm≈48, 58mm≈42/32 — override con PRINTER_COLS se vuoi forzare
+const WIDTH_MM = Number(process.env.PRINTER_WIDTH_MM || 80);
+const COLS = Number(process.env.PRINTER_COLS || (WIDTH_MM >= 70 ? 48 : 42));
+
+// Padding a larghezza fissa (default 42/48 colonne)
+function padLine(left, right, width = COLS) {
+  let L = asciiSafe(String(left || ''));
+  let R = asciiSafe(String(right || ''));
+  const maxLeft = Math.max(0, width - (R.length + 1));
+  if (L.length > maxLeft) {
+    L = (maxLeft > 3) ? (L.slice(0, maxLeft - 3) + '...') : L.slice(0, maxLeft);
+  }
+  const spaces = Math.max(1, width - (L.length + R.length));
+  return L + ' '.repeat(spaces) + R;
+}
+
+const ESC = 0x1b, GS = 0x1d;
+function cmdInit()         { return Buffer.from([ESC, 0x40]); }            // ESC @
+function cmdAlign(n=0)     { return Buffer.from([ESC, 0x61, n]); }         // 0=left 1=center 2=right
+function cmdMode(n=0)      { return Buffer.from([ESC, 0x21, n]); }         // bitmask stile testo
+function cmdLF(n=1)        { return Buffer.from(Array(n).fill(0x0a)); }
+function cmdCut(full=true) { return Buffer.from([GS, 0x56, full ? 0x00 : 0x01]); }
+
+// feed n righe (padding preciso)
+function cmdFeed(n = 0) {
+  const nn = Math.max(0, Math.min(255, Number(n)||0));
+  return Buffer.from([ESC, 0x64, nn]);
+}
+
+// dimensione h/w 1..8 (GS ! v) — compat ampiezza/altezza
+function cmdSize(w = 1, h = 1) {
+  const W = Math.max(1, Math.min(8, w));
+  const H = Math.max(1, Math.min(8, h));
+  const v = ((W - 1) << 4) | (H - 1);
+  return Buffer.from([GS, 0x21, v]);
+}
+
+// Codepage (default cp858) + encode
+const CODEPAGE = (process.env.PRINTER_CODEPAGE || 'cp858').toLowerCase();
+function selectCodepageBuffer() {
+  const map = { cp437:0, cp850:2, cp852:18, cp858:19, cp1252:16 };
+  const n = map[CODEPAGE] ?? 19;
+  return Buffer.from([ESC, 0x74, n]);
+}
+function encodeText(s) {
+  const plain = String(s || '').replace(/\r/g, '');
+  // ➜ fallback latin1: così caratteri base restano stampabili (niente bullet)
+  if (!iconv) return Buffer.from(plain, 'latin1');
+  try { return iconv.encode(plain, CODEPAGE, { addBOM:false }); }
+  catch { return Buffer.from(plain, 'latin1'); }
+}
+function line(s='') { return Buffer.concat([ encodeText(s), Buffer.from([0x0a]) ]); }
+// testo senza newline (per comporre righe miste con grandezze diverse)
+function text(s='') { return encodeText(s); }
+
+// Intestazioni/piedi da ENV o env.PRINTER
+function readHeaderLines() {
+  const raw = env.PRINTER?.header ?? process.env.PRINTER_HEADER ?? '';
+  return String(raw).split('|').filter(Boolean);
+}
+function readFooterLines() {
+  const raw = env.PRINTER?.footer ?? process.env.PRINTER_FOOTER ?? '';
+  return String(raw).split('|').filter(Boolean);
+}
+
+function socketWrite(sock, chunk) {
+  return new Promise((res, rej) => sock.write(chunk, (err) => err ? rej(err) : res()));
+}
+
+/**
+ * withPrinter: gestisce connessione + header/footer + cut.
+ * NB: header/footer via ENV; imposta anche codepage se disponibile.
+ * 🆕: feed configurabili prima dell'header e dopo il footer (prima del cut).
+ */
+async function withPrinter(io, fn) {
+  if (!env.PRINTER?.enabled && String(process.env.PRINTER_ENABLED).toLowerCase()!=='true') {
+    logger.warn('🖨️ PRINTER disabled by env'); return { jobId:`noop-${Date.now()}`, printedCount:0 };
+  }
+  const ip   = env.PRINTER?.ip   || process.env.PRINTER_IP;
+  const port = Number(env.PRINTER?.port || process.env.PRINTER_PORT || 9100);
+  if (!ip || !port) { logger.warn('🖨️ PRINTER not configured'); return { jobId:`noop-${Date.now()}`, printedCount:0 }; }
+
+  const sock = new net.Socket();
+  await new Promise((res, rej) => {
+    sock.once('error', rej);
+    sock.connect(port, ip, () => { sock.off('error', rej); res(); });
+  });
+
+  const HEADER_FEED_BEFORE = Number(process.env.PRINTER_HEADER_FEED_BEFORE || 0);
+  const FOOTER_FEED_AFTER  = Number(process.env.PRINTER_FOOTER_FEED_AFTER  || 4);
+
+  try {
+    await socketWrite(sock, cmdInit());
+    await socketWrite(sock, selectCodepageBuffer());
+
+    // Header (centrato)
+    const headerLines = readHeaderLines();
+    if (headerLines.length) {
+      if (HEADER_FEED_BEFORE > 0) await socketWrite(sock, cmdFeed(HEADER_FEED_BEFORE));
+      await socketWrite(sock, cmdAlign(1));
+      for (const l of headerLines) { await socketWrite(sock, line(l)); }
+      await socketWrite(sock, cmdLF(1));
+      await socketWrite(sock, cmdAlign(0));
+    }
+
+    const out = await fn(sock);
+
+    // Footer (centrato)
+    const footerLines = readFooterLines();
+    if (footerLines.length) {
+      await socketWrite(sock, cmdLF(1));
+      await socketWrite(sock, cmdAlign(1));
+      for (const l of footerLines) { await socketWrite(sock, line(l)); }
+      await socketWrite(sock, cmdAlign(0));
+    }
+
+    // 🆕 extra feed sotto il footer prima del taglio (evita che "salga" sul successivo)
+    if (FOOTER_FEED_AFTER > 0) await socketWrite(sock, cmdFeed(FOOTER_FEED_AFTER));
+
+    const doCut = (env.PRINTER?.cut ?? String(process.env.PRINTER_CUT||'true').toLowerCase()==='true');
+    if (doCut) { await socketWrite(sock, cmdCut(true)); }
+    sock.end();
+    return out || { jobId:`job-${Date.now()}`, printedCount:0 };
+  } catch (e) {
+    try { sock.end(); } catch {}
+    throw e;
+  }
+}
+
+/* ─────────────── Opzioni avanzate opzionali (TZ, QR, PNG) ─────────────── */
+
+const DISPLAY_TZ     = process.env.BIZ_TZ || 'Europe/Rome';
+const DB_TIME_IS_UTC = String(process.env.DB_TIME_IS_UTC || 'false') === 'true';
+const DAILY_GROUPED  = String(process.env.PRINTER_DAILY_GROUPED ?? 'true') !== 'false'; // default true
+
+const TOP_PAD_LINES    = Number(process.env.PRINTER_TOP_PAD_LINES || 2);
+const BOTTOM_PAD_LINES = Number(process.env.PRINTER_BOTTOM_PAD_LINES || 4);
+
+// QR
+const QR_BASE_URL     = (process.env.QR_BASE_URL || '').trim();
+const QR_SIZE_ENV     = Number(process.env.PRINTER_QR_SIZE || 5);
+// ✅ ECC corretto: L=48, M=49, Q=50, H=51
+const QR_ECC_ENV      = String(process.env.PRINTER_QR_ECC || 'H').toUpperCase();
+const QR_CAPTION_GAP  = Number(process.env.PRINTER_QR_CAPTION_GAP_LINES || 1);
+const DEBUG_HEX       = String(process.env.PRINTER_DEBUG_HEX || '').toLowerCase() === 'true';
+// 🆕: di default imposto raster (più compatibile sulle stampanti economiche)
+const QR_MODE         = String(process.env.PRINTER_QR_MODE || 'raster').toLowerCase(); // auto|escpos|raster
+const QR_SCALE        = Math.max(1, Math.min(12, Number(process.env.PRINTER_QR_SCALE || 4)));
+const TIME_DATE_SEP   = (process.env.PRINTER_TIME_DATE_SEP ?? '  -  '); // ← niente bullet ‘•’
+
+const MAX_DOTS = WIDTH_MM >= 70 ? 576 : 384; // raster approx
+
+function parseDbDate(s) {
+  const str = String(s || '').trim();
+  if (!str) return new Date(NaN);
+  if (str.includes('T')) return new Date(str);
+  const base = str.replace(' ', 'T');
+  return DB_TIME_IS_UTC ? new Date(base + 'Z') : new Date(base);
+}
+function formatTimeHHmm(start_at) {
+  const d = parseDbDate(start_at);
+  return new Intl.DateTimeFormat('it-IT', {
+    hour: '2-digit', minute: '2-digit', hour12: false, timeZone: DISPLAY_TZ,
+  }).format(d);
+}
+function formatDateHuman(d) {
+  return new Intl.DateTimeFormat('it-IT', {
+    weekday:'long', day:'2-digit', month:'2-digit', year:'numeric', timeZone: DISPLAY_TZ,
+  }).format(d);
+}
+function formatYmdHuman(ymd) {
+  const d = DB_TIME_IS_UTC
+    ? new Date(String(ymd||'').trim() + 'T00:00:00Z')
+    : new Date(String(ymd||'').trim() + 'T00:00:00');
+  return formatDateHuman(d);
+}
+function up(s) { return (s || '').toString().toUpperCase(); }
+
+// Raster PNG (opzionale)
+function buildRasterFromPNG(png, maxWidthDots = MAX_DOTS, threshold = 200) {
+  const targetW = Math.min(maxWidthDots, png.width);
+  const ratio   = targetW / png.width;
+  const targetH = Math.max(1, Math.round(png.height * ratio));
+  const bytesPerRow = Math.ceil(targetW / 8);
+  const bmp = Buffer.alloc(bytesPerRow * targetH, 0x00);
+
+  for (let y = 0; y < targetH; y++) {
+    for (let x = 0; x < targetW; x++) {
+      const sx = Math.min(png.width - 1, Math.round(x / ratio));
+      const sy = Math.min(png.height - 1, Math.round(y / ratio));
+      const idx = (sy * png.width + sx) << 2;
+      const r = png.data[idx], g = png.data[idx+1], b = png.data[idx+2], a = png.data[idx+3];
+      const gray = a === 0 ? 255 : Math.round(0.2126*r + 0.7152*g + 0.0722*b);
+      const bit = gray < threshold ? 1 : 0;
+      if (bit) bmp[y * bytesPerRow + (x >> 3)] |= (0x80 >> (x & 7));
+    }
+  }
+  const m  = 0;
+  const xL = bytesPerRow & 0xff, xH = (bytesPerRow >> 8) & 0xff;
+  const yL = targetH & 0xff,      yH = (targetH >> 8) & 0xff;
+  return Buffer.concat([Buffer.from([GS, 0x76, 0x30, m, xL, xH, yL, yH]), bmp, Buffer.from([0x0a])]);
+}
+
+let LOGO_RASTER = null;
+(function preloadLogo() {
+  try {
+    const logoPath = process.env.PRINTER_LOGO_PATH || 'assets/logo.png';
+    const abs = path.resolve(process.cwd(), logoPath);
+    if (PNGjs && fs.existsSync(abs)) {
+      const buf = fs.readFileSync(abs);
+      const png = PNGjs.sync.read(buf);
+      const raster = buildRasterFromPNG(png, Math.floor(MAX_DOTS * 0.85), 190);
+      LOGO_RASTER = Buffer.concat([cmdAlign(1), raster, cmdLF(1)]);
+      logger.info(`🖼️ Logo caricato: ${abs}`);
+    }
+  } catch (e) {
+    logger.warn('Logo PNG non caricabile', { msg: String(e?.message || e) });
+  }
+})();
+
+// ──────────────────────── QR ESC/POS (Model 2) ──────────────────────────────
+function qrSelectModel2() { return Buffer.from([GS, 0x28, 0x6B, 0x04, 0x00, 0x31, 0x41, 0x32, 0x00]); }
+function qrStoreData(data) {
+  const payload = Buffer.from(String(data || ''), 'ascii'); // URL → ASCII puro
+  const len = payload.length + 3;
+  const pL = len & 0xff, pH = (len >> 8) & 0xff;
+  return Buffer.from([GS, 0x28, 0x6B, pL, pH, 0x31, 0x50, 0x30, ...payload]);
+}
+function qrSetModuleSize(size = 6) {
+  const s = Math.max(1, Math.min(16, size));
+  return Buffer.from([GS, 0x28, 0x6B, 0x03, 0x00, 0x31, 0x43, s]);
+}
+function qrSetECCFromEnv() {
+  const map = { L: 48, M: 49, Q: 50, H: 51 };
+  const lv = map[QR_ECC_ENV] ?? 51;
+  return Buffer.from([GS, 0x28, 0x6B, 0x03, 0x00, 0x31, 0x45, lv]);
+}
+function qrPrint() { return Buffer.from([GS, 0x28, 0x6B, 0x03, 0x00, 0x31, 0x51, 0x30]); }
+
+// Nome adattivo su una riga (cartellini)
+function printAdaptiveName(buffers, name, maxCols = COLS) {
+  const txt = up(name || '');
+  const widths = [3, 2, 1]; // prova 3x → 2x → 1x (altezza fissa 2)
+  const H = 2;
+  let chosenW = 1;
+  for (const w of widths) {
+    const maxLen = Math.floor(maxCols / w);
+    if (txt.length <= maxLen) { chosenW = w; break; }
+  }
+  const maxLenAtChosen = Math.floor(maxCols / chosenW);
+  const shown = txt.length > maxLenAtChosen
+    ? txt.slice(0, Math.max(0, maxLenAtChosen - 1)) + '…'
+    : txt;
+  buffers.push(cmdSize(chosenW, H), cmdAlign(1), line(shown), cmdAlign(0), cmdSize(1,1));
+}
+
+/* ─────────────── FUNZIONI ADEGUATE ALLO STILE “VECCHIO” ─────────────── */
+
+/**
+ * 🗒️ Stampa giornaliera prenotazioni (formato testo tipo print.js)
+ * - intestazione "Prenotazioni <giorno umano>"
+ * - separatori a COLS colonne
+ * - modalità:
+ *   • grouped (default): blocchi per HH:mm con titolo grande centrato
+ *   • flat: tabellare con ORA/TAV/PAX/NOME (+ phone/notes su righe successive)
+ * - niente simbolo euro (compat codepage)
+ */
+async function printDailyReservations(args) {
+  // (1) Riuso modulo esterno se disponibile (non tocco la tua logica)
+  if (orderPrinter?.printDailyReservations) {
+    return await orderPrinter.printDailyReservations(args);
+  }
+
+  const date = toYMD(args?.date);
+  const rows = Array.isArray(args?.rows) ? args.rows : [];
+
+  return await withPrinter({}, async (sock) => {
+    const sep = '-'.repeat(COLS);
+
+    // Titolo
+    await socketWrite(sock, cmdAlign(1));
+    await socketWrite(sock, cmdMode(0x08)); // bold
+    await socketWrite(sock, line('PRENOTAZIONI'));
+    await socketWrite(sock, cmdMode(0x00));
+    await socketWrite(sock, line(formatYmdHuman(date).toUpperCase()));
+    await socketWrite(sock, cmdAlign(0));
+    await socketWrite(sock, line(sep));
+
+    let printed = 0;
+
+    if (DAILY_GROUPED) {
+      // Raggruppo per orario (nel fuso DISPLAY_TZ)
+      const groups = new Map();
+      for (const r of rows) {
+        const t = formatTimeHHmm(r.start_at);
+        if (!groups.has(t)) groups.set(t, []);
+        groups.get(t).push(r);
+      }
+      const keys = Array.from(groups.keys()).sort((a,b) => a.localeCompare(b));
+
+      for (const k of keys) {
+        const list = groups.get(k) || [];
+        await socketWrite(sock, cmdAlign(1));
+        await socketWrite(sock, cmdSize(2,2));
+        await socketWrite(sock, line(k));
+        await socketWrite(sock, cmdSize(1,1));
+        await socketWrite(sock, cmdAlign(0));
+        await socketWrite(sock, line(sep));
+
+        list.sort((a,b) => (a.table_number ?? a.table_id ?? 0) - (b.table_number ?? b.table_id ?? 0));
+
+        for (const r of list) {
+          const tavNum = (r.table_number ?? r.table_id ?? '').toString();
+          const pax    = (r.party_size || '-').toString();
+          const name   = ((r.customer_first || '') + ' ' + (r.customer_last || '')).trim() || '—';
+
+          // Blocco sinistro: "T" normale + numero grande (2x2 bold) + due spazi
+          const leftVisualCols = 2 /*"T "*/ + 2 /*num 2x width*/ + 2 /*gap*/;
+
+          // Prima riga: T + numero grande + prima parte nome
+          await socketWrite(sock, text('T '));
+          await socketWrite(sock, cmdMode(0x08));
+          await socketWrite(sock, cmdSize(2,2));
+          await socketWrite(sock, text(tavNum || '-'));
+          await socketWrite(sock, cmdSize(1,1));
+          await socketWrite(sock, cmdMode(0x00));
+          await socketWrite(sock, text('  ')); // gap visivo
+
+          const w1 = Math.max(1, COLS - leftVisualCols);
+          const first = name.slice(0, w1);
+          await socketWrite(sock, line(first));
+
+          // Seconda riga: rientro e resto del nome / info
+          const remain = name.slice(w1).trim();
+          if (remain) await socketWrite(sock, line(' '.repeat(leftVisualCols) + remain));
+          if (r.phone) await socketWrite(sock, line(' '.repeat(leftVisualCols) + String(r.phone)));
+          if (r.notes) await socketWrite(sock, line(' '.repeat(leftVisualCols) + ('NOTE: ' + r.notes)));
+          await socketWrite(sock, cmdLF(1));
+          printed++;
+        }
+        await socketWrite(sock, line(sep));
+      }
+    } else {
+      // Flat tabellare
+      const head =
+        'ORA  ' + 'TAV  ' + 'PAX ' + 'NOME'.padEnd(Math.max(4, COLS - ('ORA  TAV  PAX '.length)));
+      await socketWrite(sock, cmdMode(0x08));
+      await socketWrite(sock, line(head));
+      await socketWrite(sock, cmdMode(0x00));
+      await socketWrite(sock, line(sep));
+
+      rows.sort((a,b) => String(a.start_at).localeCompare(String(b.start_at)));
+
+      for (const r of rows) {
+        const time = formatTimeHHmm(r.start_at);
+        const tav  = (r.table_number ?? r.table_id ?? '-').toString().padEnd(4, ' ');
+        const pax  = (r.party_size || '-').toString().padEnd(3, ' ');
+        const name = ((r.customer_first || '') + ' ' + (r.customer_last || '')).trim() || '—';
+
+        const left = `${time}  ${tav} ${pax}`;
+        const width = Math.max(1, COLS - left.length - 1);
+        const first = name.slice(0, width);
+        await socketWrite(sock, line(left + ' ' + first));
+
+        const remain = name.slice(width).trim();
+        if (remain) await socketWrite(sock, line(' '.repeat(left.length + 1) + remain));
+        if (r.phone) await socketWrite(sock, line(' '.repeat(left.length + 1) + String(r.phone)));
+        if (r.notes) await socketWrite(sock, line(' '.repeat(left.length + 1) + ('NOTE: ' + r.notes)));
+        await socketWrite(sock, cmdLF(1));
+        printed++;
+      }
+      await socketWrite(sock, line(sep));
+    }
+
+    await socketWrite(sock, cmdAlign(1));
+    await socketWrite(sock, line(`Operatore: ${args?.user?.email || 'sistema'}`));
+    await socketWrite(sock, cmdAlign(0));
+    return { jobId: `daily-${Date.now()}`, printedCount: printed };
+  });
+}
+
+/**
+ * 🪪 Stampa segnaposti in batch (formato testo vecchio)
+ * - Prova riuso modulo esterno; se non c'è, chiama printSinglePlaceCard per ogni riga
+ * - Ritorna jobId di batch + printedCount
+ */
+async function printPlaceCards(args) {
+  // (1) Riuso modulo esterno, se presente
+  if (orderPrinter?.printPlaceCards) {
+    return await orderPrinter.printPlaceCards(args);
+  }
+
+  // (2) Se esiste solo il “singolo”, vado in batch manuale
+  if (orderPrinter?.printSinglePlaceCard || orderPrinter?.printPlacecardOne || orderPrinter?.printPlaceCardOne) {
+    const rows = Array.isArray(args?.rows) ? args.rows : [];
+    let count = 0;
+    for (const r of rows) {
+      await printSinglePlaceCard({ reservation: r, user: args?.user, logoText: args?.logoText, qrBaseUrl: args?.qrBaseUrl });
+      count++;
+    }
+    return { jobId: `placecards-${Date.now()}`, printedCount: count };
+  }
+
+  // (3) Fallback: batch tramite singolo “nostro”
+  const rows = Array.isArray(args?.rows) ? args.rows : [];
+  let count = 0;
+  for (const r of rows) {
+    await printSinglePlaceCard({ reservation: r, user: args?.user, logoText: args?.logoText, qrBaseUrl: args?.qrBaseUrl });
+    count++;
+  }
+  return { jobId: `placecards-${Date.now()}`, printedCount: count };
+}
+
+/**
+ * 🎴 Singolo segnaposto (fallback stile vecchio)
+ * - Nome centrato in grande (doppia altezza, adattivo 3x/2x/1x + ellissi)
+ * - Riga sotto: "(coperti)  Sala" se presente
+ * - Logo PNG centrato (se PRINTER_LOGO_PATH presente e pngjs disponibile)
+ * - QR opzionale: usa qrBaseUrl oppure QR_BASE_URL (ENV)
+ * - Usa top/bottom pad da env: PRINTER_TOP_PAD_LINES / PRINTER_BOTTOM_PAD_LINES
+ * - 🆕 Log di debug delle variabili interpolate (tavolo/qr/etc.)
+ */
+async function printSinglePlaceCard({ reservation, user, logoText, qrBaseUrl }) {
+  // (1) Metodi nativi esistenti: non tocco la tua logica
+  if (orderPrinter?.printSinglePlaceCard) {
+    const out = await orderPrinter.printSinglePlaceCard({ reservation, user, logoText, qrBaseUrl });
+    return { jobId: out?.jobId || `placecard-${reservation?.id}-${Date.now()}` };
+  }
+  if (orderPrinter?.printPlacecardOne) {
+    const out = await orderPrinter.printPlacecardOne({ reservation, user, logoText, qrBaseUrl });
+    return { jobId: out?.jobId || `placecard-${reservation?.id}-${Date.now()}` };
+  }
+  if (orderPrinter?.printPlaceCardOne) {
+    const out = await orderPrinter.printPlaceCardOne({ reservation, user, logoText, qrBaseUrl });
+    return { jobId: out?.jobId || `placecard-${reservation?.id}-${Date.now()}` };
+  }
+
+  // (2) Fallback testuale con formattazione tipo utils/print.js
+  const name = (reservation?.display_name || `${reservation?.customer_first||''} ${reservation?.customer_last||''}` || 'Cliente').trim();
+  const cov  = Number(reservation?.party_size || reservation?.covers || 0) || 1;
+
+  // Tavolo robusto: primo definito
+  const tableNum  = (reservation?.table_number ?? reservation?.table_id ?? null);
+  const tableName = reservation?.table_name || null;
+  const tavNumberOnly = (tableNum !== null && tableNum !== '') ? String(tableNum) : (tableName || '');
+
+  const sala = reservation?.room_name || reservation?.room || reservation?.room_id || '';
+
+  // Log dettagliato dei valori interpolati
+  logger.info('🧩 placecard vars', {
+    id: reservation?.id || null,
+    name, cov,
+    table_number: reservation?.table_number ?? null,
+    table_id: reservation?.table_id ?? null,
+    table_name: reservation?.table_name ?? null,
+    tavNumberOnly: tavNumberOnly,
+    room_name: reservation?.room_name ?? null,
+    qr_base_env: QR_BASE_URL || '',
+    qr_base_arg: qrBaseUrl || '',
+    cols: COLS
+  });
+
+  return await withPrinter({}, async (sock) => {
+    await socketWrite(sock, cmdAlign(1));
+    if (TOP_PAD_LINES > 0) await socketWrite(sock, cmdFeed(TOP_PAD_LINES));
+
+    if (LOGO_RASTER) { await socketWrite(sock, LOGO_RASTER); }
+
+    // 🆕 SOLO NUMERO TAVOLO — enorme e bold (8x8). Se non c'è, non stampo nulla qui.
+    if (tavNumberOnly) {
+      await socketWrite(sock, cmdMode(0x08));       // bold
+      await socketWrite(sock, cmdSize(8,8));        // enorme
+      await socketWrite(sock, line(up(String(tavNumberOnly))));
+      await socketWrite(sock, cmdSize(1,1));
+      await socketWrite(sock, cmdMode(0x00));
+    }
+
+    // Nome grande adattivo
+    const buffers = [];
+    printAdaptiveName(buffers, name, COLS);
+    for (const b of buffers) await socketWrite(sock, b);
+
+    // Sotto-riga informativa
+    const infoParts = [`(${cov})`];
+    if (sala) infoParts.push(`SALA ${sala}`);
+    await socketWrite(sock, line(infoParts.join('  ')));
+
+    // Data/ora (in TZ)  — separatore ASCII, niente “•”
+    const startAt = String(reservation?.start_at || '');
+    const d = parseDbDate(startAt);
+    await socketWrite(sock, line(formatTimeHHmm(startAt) + TIME_DATE_SEP + formatDateHuman(d)));
+
+    // QR opzionale
+    const base = (qrBaseUrl || QR_BASE_URL || '').replace(/\/+$/,'');
+    if (!base) {
+      logger.warn('🔳 QR skipped: base URL vuota (QR_BASE_URL o qrBaseUrl non impostati)');
+    } else {
+      const url = base + '/';
+      logger.info('🔳 QR params', { mode: QR_MODE, size: QR_SIZE_ENV, scale: QR_SCALE, ecc: QR_ECC_ENV, url });
+
+      const wantRaster = (QR_MODE === 'raster') || (QR_MODE === 'auto' && QRLib && PNGjs);
+      let didRaster = false;
+
+      if (wantRaster) didRaster = await tryPrintQrAsRaster(sock, url);
+
+      if (!didRaster && QR_MODE !== 'raster') {
+        // Provo ESC/POS model 2 (alcune stampanti non lo supportano)
+        const seq = [
+          cmdAlign(1),
+          (QR_CAPTION_GAP > 0 ? cmdFeed(QR_CAPTION_GAP) : Buffer.alloc(0)),
+          qrSelectModel2(),
+          qrSetModuleSize(QR_SIZE_ENV),
+          qrSetECCFromEnv(),
+          qrStoreData(url),
+          qrPrint(),
+          cmdAlign(0),
+          cmdLF(1),
+        ];
+        if (DEBUG_HEX) {
+          const hex = Buffer.concat(seq).toString('hex').slice(0, 200);
+          logger.info('🔬 QR bytes (head)', { hex });
+        }
+        for (const part of seq) await socketWrite(sock, part);
+      }
+
+      if (!didRaster && QR_MODE === 'raster') {
+        // raster richiesto ma non disponibile
+        logger.warn('🔳 QR raster non disponibile: installa "qrcode" (npm i qrcode)');
+        await socketWrite(sock, line(url)); // almeno l’URL in chiaro
+      } else if (didRaster) {
+        await socketWrite(sock, cmdLF(1));
+      }
+    }
+
+    if (BOTTOM_PAD_LINES > 0) await socketWrite(sock, cmdFeed(BOTTOM_PAD_LINES));
+    return { jobId: `placecard-${reservation?.id || 'na'}-${Date.now()}` };
+  });
+}
+
+// Rasterizza un QR usando la lib "qrcode" + stampa come immagine (ESC/POS raster).
+async function tryPrintQrAsRaster(sock, url) {
+  if (!QRLib || !PNGjs) return false;
+  try {
+    const eccMap = { L:'L', M:'M', Q:'Q', H:'H' };
+    const ecc = eccMap[QR_ECC_ENV] || 'H';
+    const pngBuf = await QRLib.toBuffer(url, {
+      errorCorrectionLevel: ecc,
+      margin: 0,
+      scale: QR_SCALE, // dimensione modulare
+      type: 'png',
+    });
+    const png = PNGjs.sync.read(pngBuf);
+    const raster = buildRasterFromPNG(png, Math.floor(MAX_DOTS * 0.7), 160);
+    await socketWrite(sock, cmdAlign(1));
+    await socketWrite(sock, raster);
+    await socketWrite(sock, cmdAlign(0));
+    return true;
+  } catch (e) {
+    logger.warn('🔳 QR raster generation failed', { msg: String(e?.message || e) });
+    return false;
+  }
+}
+
+/* ─────────────────────────────── EXPORTS ─────────────────────────────── */
+
+module.exports = {
+  printDailyReservations,
+  printPlaceCards,
+  printSinglePlaceCard,
+};
+```
+
+### ./src/services/whatsapp.service.js
+```
+'use strict';
+
+/**
+ * WhatsApp service (Twilio) — invio messaggi di stato prenotazione.
+ * - Usa template (se WA_TEMPLATE_STATUS_CHANGE_SID è impostato) oppure messaggio libero entro 24h.
+ * - Normalizza numero in E.164 con prefisso di default (IT) se manca '+'.
+ * - Log verbosi con emoji come il resto del progetto.
+ */
+
+const twilio = require('twilio');
+const logger = require('../logger');
+const env    = require('../env');
+
+let client = null;
+function getClient() {
+  if (!env.WA?.enabled) return null;
+  if (!client) {
+    client = twilio(env.WA.accountSid, env.WA.authToken);
+    logger.info('📳 WA client inizializzato', { service: 'server', wa_env: env._debugWaConfig?.() });
+  }
+  return client;
+}
+
+/** Grezza normalizzazione in E.164 (default IT): +39 + numero senza spazi */
+function normalizeToE164(phone) {
+  if (!phone) return null;
+  let p = String(phone).trim();
+  p = p.replace(/[^\d+]/g, '');
+  if (p.startsWith('+')) return p;
+  if (p.startsWith('00')) return '+' + p.slice(2);
+  return (env.WA.defaultCc || '+39') + p.replace(/^0+/, '');
+}
+
+/** Corpo testo semplice (IT) */
+function buildStatusText({ status, dateYmd, timeHm, partySize, name, tableName }) {
+  const S = String(status || '').toUpperCase();
+  const n = name ? ` ${name}` : '';
+  const when = (dateYmd && timeHm) ? ` per il ${dateYmd} alle ${timeHm}` : '';
+  const pax = partySize ? ` (persone: ${partySize})` : '';
+  const tbl = tableName ? ` • ${tableName}` : '';
+  return `🟢 Aggiornamento prenotazione${n}:\nStato: ${S}${when}${pax}${tbl}\n— ${env.MAIL?.bizName || 'La tua attività'}`;
+}
+
+/**
+ * Invia la notifica di cambio stato su WhatsApp.
+ * options: { to, reservation, status, reason?, mediaLogo? }
+ */
+async function sendStatusChange({ to, reservation, status, reason, mediaLogo }) {
+  if (!env.WA?.enabled) {
+    logger.warn('📲 WA SKIPPED (disabled)', { id: reservation?.id });
+    return { skipped: true, reason: 'disabled' };
+  }
+
+  const client = getClient();
+  if (!client) {
+    logger.error('📲 WA KO: client non inizializzato');
+    throw new Error('WA client not initialized');
+  }
+
+  const phone = normalizeToE164(to || reservation?.contact_phone || reservation?.phone);
+  if (!phone) {
+    logger.warn('📲 WA SKIPPED (no phone)', { id: reservation?.id });
+    return { skipped: true, reason: 'no_phone' };
+  }
+
+  // Dati testo
+  const start = reservation?.start_at ? new Date(reservation.start_at) : null;
+  const ymd = start ? `${start.getFullYear()}-${String(start.getMonth()+1).padStart(2,'0')}-${String(start.getDate()).padStart(2,'0')}` : null;
+  const hm  = start ? `${String(start.getHours()).padStart(2,'0')}:${String(start.getMinutes()).padStart(2,'0')}` : null;
+  const name = reservation?.display_name || [reservation?.customer_first, reservation?.customer_last].filter(Boolean).join(' ');
+  const body = buildStatusText({
+    status,
+    dateYmd: ymd,
+    timeHm : hm,
+    partySize: reservation?.party_size,
+    name,
+    tableName: reservation?.table_name
+  });
+
+  // Template (Content API) se disponibile
+  if (env.WA.templateSid) {
+    const vars = {
+      '1': name || 'Cliente',
+      '2': String(status || '').toUpperCase(),
+      '3': `${ymd || ''} ${hm || ''}`.trim(),
+      '4': String(reservation?.party_size || ''),
+      '5': reservation?.table_name || '',
+      '6': reason || ''
+    };
+
+    logger.info('📲 WA template send ▶️', { to: phone, templateSid: env.WA.templateSid, vars });
+    const msg = await client.messages.create({
+      from: env.WA.from,
+      to  : `whatsapp:${phone}`,
+      contentSid: env.WA.templateSid,
+      contentVariables: JSON.stringify(vars),
+    });
+    logger.info('📲 WA template OK', { sid: msg.sid, to: phone });
+    return { ok: true, sid: msg.sid, template: true };
+  }
+
+  // Freeform (entro 24h)
+  const payload = { from: env.WA.from, to: `whatsapp:${phone}`, body };
+  const media = mediaLogo || env.WA.mediaLogo;
+  if (media) payload.mediaUrl = [media];
+
+  logger.info('📲 WA freeform send ▶️', { to: phone, media: !!media });
+  const msg = await client.messages.create(payload);
+  logger.info('📲 WA freeform OK', { sid: msg.sid, to: phone });
+  return { ok: true, sid: msg.sid, template: false };
+}
+
+module.exports = {
+  sendStatusChange,
+  _normalizeToE164: normalizeToE164,
+};
+```
+
+### ./src/services/whatsapp-twilio.service.js
+```
+'use strict';
+
+/**
+ * WhatsApp service (Twilio) — invio messaggi di stato prenotazione.
+ * - Usa template (se WA_TEMPLATE_STATUS_CHANGE_SID è impostato) oppure messaggio libero entro 24h.
+ * - Normalizza numero in E.164 con prefisso di default (IT) se manca '+'.
+ * - Log verbosi con emoji come il resto del progetto.
+ */
+
+const twilio = require('twilio');
+const logger = require('../logger');
+const env = require('../env');
+
+let client = null;
+function getClient() {
+  if (!env.WA.enabled) {
+    return null;
+  }
+  if (!client) {
+    client = twilio(env.WA.accountSid, env.WA.authToken);
+    logger.info('📳 WA client inizializzato', { service: 'server', wa_env: env._debugWaConfig() });
+  }
+  return client;
+}
+
+/** Grezza normalizzazione in E.164 (default IT): +39 + numero senza spazi */
+function normalizeToE164(phone) {
+  if (!phone) return null;
+  let p = String(phone).trim();
+  // rimuovo spazi e non cifre (tranne +)
+  p = p.replace(/[^\d+]/g, '');
+  if (p.startsWith('+')) return p;
+  // se inizia con 00, converto in +
+  if (p.startsWith('00')) return '+' + p.slice(2);
+  // fallback: aggiungo prefisso di default
+  return (env.WA.defaultCc || '+39') + p.replace(/^0+/, '');
+}
+
+/**
+ * buildStatusText: corpo del messaggio in IT
+ */
+function buildStatusText({ status, dateYmd, timeHm, partySize, name, tableName }) {
+  const S = String(status || '').toUpperCase();
+  const n = name ? ` ${name}` : '';
+  const when = (dateYmd && timeHm) ? ` per il ${dateYmd} alle ${timeHm}` : '';
+  const pax = partySize ? ` (persone: ${partySize})` : '';
+  const tbl = tableName ? ` • ${tableName}` : '';
+  return `🟢 Aggiornamento prenotazione${n}:\nStato: ${S}${when}${pax}${tbl}\n— ${env.MAIL.bizName}`;
+}
+
+/**
+ * Invia la notifica di cambio stato su WhatsApp.
+ * options:
+ *  - to (telefono cliente)
+ *  - reservation (oggetto prenotazione: per testo)
+ *  - status (nuovo stato)
+ *  - reason (opzionale)
+ *  - mediaLogo (URL immagine da allegare — opzionale; se non passato usa env.WA.mediaLogo)
+ */
+async function sendStatusChange({ to, reservation, status, reason, mediaLogo }) {
+  if (!env.WA.enabled) {
+    logger.warn('📲 WA SKIPPED (disabled)', { service: 'server', id: reservation?.id });
+    return { skipped: true, reason: 'disabled' };
+  }
+
+  const client = getClient();
+  if (!client) {
+    logger.error('📲 WA KO: client non inizializzato', { service: 'server' });
+    throw new Error('WA client not initialized');
+  }
+
+  const phone = normalizeToE164(to || reservation?.contact_phone || reservation?.phone);
+  if (!phone) {
+    logger.warn('📲 WA SKIPPED (no phone)', { service: 'server', id: reservation?.id });
+    return { skipped: true, reason: 'no_phone' };
+  }
+
+  // Dati testo
+  const start = reservation?.start_at ? new Date(reservation.start_at) : null;
+  const ymd = start ? `${start.getFullYear()}-${String(start.getMonth()+1).padStart(2,'0')}-${String(start.getDate()).padStart(2,'0')}` : null;
+  const hm  = start ? `${String(start.getHours()).padStart(2,'0')}:${String(start.getMinutes()).padStart(2,'0')}` : null;
+  const name = reservation?.display_name || [reservation?.customer_first, reservation?.customer_last].filter(Boolean).join(' ');
+  const body = buildStatusText({
+    status,
+    dateYmd: ymd,
+    timeHm: hm,
+    partySize: reservation?.party_size,
+    name,
+    tableName: reservation?.table_name
+  });
+
+  // Se ho un template SID uso Content API (consigliato per fuori 24h)
+  if (env.WA.templateSid) {
+    const vars = {
+      // es: nel template puoi usare {{1}}, {{2}}, ... (dipende dal tuo template approvato)
+      '1': name || 'Cliente',
+      '2': String(status || '').toUpperCase(),
+      '3': `${ymd || ''} ${hm || ''}`.trim(),
+      '4': String(reservation?.party_size || ''),
+      '5': reservation?.table_name || '',
+      '6': reason || ''
+    };
+    logger.info('📲 WA template send ▶️', { service: 'server', to: phone, templateSid: env.WA.templateSid, vars });
+
+    const msg = await client.messages.create({
+      from: env.WA.from,                 // 'whatsapp:+1XXXX' (tuo numero approvato)
+      to:   `whatsapp:${phone}`,
+      contentSid: env.WA.templateSid,    // template approvato su WhatsApp Manager
+      contentVariables: JSON.stringify(vars),
+    });
+
+    logger.info('📲 WA template OK', { service: 'server', sid: msg.sid, to: phone });
+    return { ok: true, sid: msg.sid, template: true };
+  }
+
+  // Altrimenti messaggio libero (vale solo entro 24h di sessione)
+  const payload = {
+    from: env.WA.from,
+    to  : `whatsapp:${phone}`,
+    body
+  };
+  const media = mediaLogo || env.WA.mediaLogo;
+  if (media) payload.mediaUrl = [media];
+
+  logger.info('📲 WA freeform send ▶️', { service: 'server', to: phone, media: !!media });
+  const msg = await client.messages.create(payload);
+
+  logger.info('📲 WA freeform OK', { service: 'server', sid: msg.sid, to: phone });
+  return { ok: true, sid: msg.sid, template: false };
+}
+
+module.exports = {
+  sendStatusChange,
+  _normalizeToE164: normalizeToE164,
+};
+```
+
+### ./src/services/whatsender.service.js
+```
+'use strict';
+
+// services/whatsender.service.js — adapter stile api2.whatsender.it (stub sicuro)
+// Qui non chiamiamo nulla in esterno: forniamo le stesse funzioni di Twilio
+// per permettere il wiring BE → se deciderai il vero endpoint, basta
+// rimpiazzare l'HTTP client qui dentro.
+
+const logger = require('../logger');
+
+async function sendOrder({ to, order }) {
+  logger.info('🟧 [Whatsender] sendOrder (stub)', { to, orderId: order?.id });
+  return { ok: true, sid: 'stub-' + order?.id };
+}
+
+async function sendOrderStatus({ to, order, status }) {
+  logger.info('🟧 [Whatsender] sendOrderStatus (stub)', { to, orderId: order?.id, status });
+  return { ok: true, sid: 'stub-status-' + order?.id };
+}
+
+module.exports = { sendOrder, sendOrderStatus };
+```
+
+### ./src/sockets/index.js
+```
+'use strict';
+/**
+ * Socket entry — singleton + bootstrap canali
+ * -------------------------------------------------------------
+ * - Mantiene i tuoi log di connessione/disconnessione
+ * - Mantiene il ping/pong ("🏓") per diagnostica rapida
+ * - Espone un singleton io() richiamabile dai router/service
+ * - Monta i canali modulari (orders, nfc.session)
+ */
+
+const logger = require('../logger');
+
+let _io = null;
+
+/**
+ * Inizializza socket.io una sola volta e monta i canali modulari.
+ *
+ * @param {import('socket.io').Server} ioInstance
+ * @returns {import('socket.io').Server}
+ */
+function init(ioInstance) {
+  if (_io) {
+    logger.warn(
+      '🔌 SOCKET init chiamato più volte — uso il singleton esistente',
+    );
+    return _io;
+  }
+
+  _io = ioInstance;
+
+  // === HANDLER BASE =========================================================
+  ioInstance.on('connection', (socket) => {
+    logger.info('🔌 SOCKET connected', { id: socket.id });
+
+    socket.on('ping', () => {
+      logger.info('🏓 ping from', { id: socket.id });
+      socket.emit('pong');
+    });
+
+    socket.on('disconnect', (reason) => {
+      logger.info('🔌 SOCKET disconnected', { id: socket.id, reason });
+    });
+  });
+
+  // === CANALI MODULARI ======================================================
+  // ORDERS: canale + bus per broadcast "order-created"/"order-updated"
+  try {
+    const ordersMod = require('./orders');
+    if (ordersMod && typeof ordersMod.mount === 'function') {
+      ordersMod.mount(ioInstance);
+      logger.info('📡 SOCKET channel mounted: orders');
+    } else if (typeof ordersMod === 'function') {
+      // compat vecchia versione: module.exports = (io) => { ... }
+      ordersMod(ioInstance);
+      logger.info('📡 SOCKET channel mounted (legacy fn): orders');
+    } else {
+      logger.warn(
+        '📡 SOCKET channel orders non montato (export inatteso, manca mount(io))',
+      );
+    }
+  } catch (err) {
+    logger.warn('📡 SOCKET channel orders non disponibile', {
+      error: String(err),
+    });
+  }
+
+  // 🆕 canale NFC session (join/leave stanza session:<SID>)
+  try {
+    const nfcMod = require('./nfc.session');
+    if (nfcMod && typeof nfcMod.mount === 'function') {
+      nfcMod.mount(ioInstance);
+      logger.info('📡 SOCKET channel mounted: nfc.session');
+    } else if (typeof nfcMod === 'function') {
+      nfcMod(ioInstance);
+      logger.info('📡 SOCKET channel mounted (legacy fn): nfc.session');
+    } else {
+      logger.warn(
+        '📡 SOCKET channel nfc.session non montato (export inatteso, manca mount(io))',
+      );
+    }
+  } catch (err) {
+    logger.warn('📡 SOCKET channel nfc.session non disponibile', {
+      error: String(err),
+    });
+  }
+
+  logger.info('🔌 SOCKET bootstrap completato ✅');
+  return _io;
+}
+
+/**
+ * Restituisce il singleton io() per i router/service BE.
+ *
+ * @returns {import('socket.io').Server}
+ */
+function getIo() {
+  if (!_io) throw new Error('socket.io non inizializzato');
+  return _io;
+}
+
+// Funzione principale esportata (compat con require('./sockets/index')(io))
+function socketsEntry(serverOrIo) {
+  return init(serverOrIo);
+}
+
+// Espongo anche metodi nominati
+socketsEntry.init = init;
+socketsEntry.io = getIo;
+
+module.exports = socketsEntry;
+module.exports.io = getIo;
+module.exports.init = init;
+```
+
+### ./src/sockets/nfc.session.js
+```
+'use strict';
+/**
+ * Canale Socket — NFC Session
+ * - join_session { session_id }
+ * - leave_session { session_id }
+ * Stanza: "session:<SID>"
+ */
+
+const logger = require('../logger');
+
+/** @param {import('socket.io').Server} io */
+module.exports = function(io) {
+  io.on('connection', (socket) => {
+
+    socket.on('join_session', (p) => {
+      try{
+        const sid = Number(p?.session_id || 0) || 0;
+        if (!sid) return;
+        const room = `session:${sid}`;
+        socket.join(room);
+        logger.info('🔗 [SOCKET] join_session', { sid, socket: socket.id });
+      }catch(e){
+        logger.warn('⚠️ [SOCKET] join_session KO', { error: String(e) });
+      }
+    });
+
+    socket.on('leave_session', (p) => {
+      try{
+        const sid = Number(p?.session_id || 0) || 0;
+        if (!sid) return;
+        const room = `session:${sid}`;
+        socket.leave(room);
+        logger.info('🔗 [SOCKET] leave_session', { sid, socket: socket.id });
+      }catch(e){
+        logger.warn('⚠️ [SOCKET] leave_session KO', { error: String(e) });
+      }
+    });
+
+  });
+};
+```
+
+### ./src/sockets/orders.channel.js
+```
+'use strict';
+
+/**
+ * sockets/orders.channel.js
+ * -----------------------------------------------------------------------------
+ * Canale Socket.IO per “orders”.
+ * - Solo ping e join di stanze per futuri filtri (per ora broadcast generale).
+ */
+
+const logger = require('../logger');
+
+module.exports = (io) => {
+  io.on('connection', (socket) => {
+    logger.info('🔌 [SOCKET] orders: connection', { id: socket.id });
+
+    socket.on('orders:ping', () => {
+      logger.info('🏓 [SOCKET] orders:ping', { id: socket.id });
+      socket.emit('orders:pong', { t: Date.now() });
+    });
+
+    socket.on('disconnect', (reason) => {
+      logger.info('🔌 [SOCKET] orders: disconnect', { id: socket.id, reason });
+    });
+  });
+};
+```
+
+### ./src/sockets/orders.js
+```
+'use strict';
+
+// 📡 Socket.IO: canale "orders" + bus per broadcast da backend
+// -------------------------------------------------------------
+// - mount(io): registra i listener di connessione/disconnessione
+// - broadcastOrderCreated(order): emette "order-created" a tutti gli admin
+// - broadcastOrderUpdated(order): emette "order-updated" (status change)
+// -------------------------------------------------------------
+
+const logger = require('../logger');
+const sockets = require('./index'); // per usare il singleton io()
+
+/**
+ * Monta il canale "orders" sul namespace di default.
+ *
+ * @param {import('socket.io').Server} io
+ */
+function mount(io) {
+  io.of('/').on('connection', (socket) => {
+    logger.info('🔌 socket orders ▶️ connected', { id: socket.id });
+
+    socket.on('disconnect', () => {
+      logger.info('🔌 socket orders ⏹ disconnected', { id: socket.id });
+    });
+
+    // (eventuali) azioni client → server in futuro
+    // es: socket.on('orders:subscribe', () => ...)
+  });
+}
+
+/**
+ * Broadcast "order-created" — usato da /api/orders POST
+ *
+ * @param {object} order
+ */
+function broadcastOrderCreated(order) {
+  try {
+    const io = sockets.io(); // prende il singleton da sockets/index
+    io.of('/').emit('order-created', order);
+
+    logger.info('📡 order-created ▶️ broadcast', {
+      id      : order && order.id,
+      table_id: order && order.table_id,
+      room_id : order && order.room_id,
+    });
+  } catch (err) {
+    logger.warn('📡 order-created broadcast KO', { error: String(err) });
+  }
+}
+
+/**
+ * Broadcast "order-updated" — usato da PATCH /api/orders/:id/status
+ *
+ * @param {object} order
+ */
+function broadcastOrderUpdated(order) {
+  try {
+    const io = sockets.io();
+    io.of('/').emit('order-updated', {
+      id    : order && order.id,
+      status: order && order.status,
+    });
+
+    logger.info('📡 order-updated ▶️ broadcast', {
+      id    : order && order.id,
+      status: order && order.status,
+    });
+  } catch (err) {
+    logger.warn('📡 order-updated broadcast KO', { error: String(err) });
+  }
+}
+
+module.exports = {
+  mount,
+  broadcastOrderCreated,
+  broadcastOrderUpdated,
+};
+```
+
+### ./src/sockets/reservations.js
+```
+// C:\Users\Endri Azizi\progetti-dev\my_dev\be\src\sockets\reservations.js
+// 📡 Socket.IO — Prenotazioni tavolo (realtime) + creazione anche da Admin
+// - Mantiene i canali esistenti (reservations-get/new/update-status/assign-table)
+// - 🆕 Eventi di comodo per check-in / check-out (opzionali dal client)
+//   • 'reservation-checkin'  { id, at? }   → svc.checkIn(...)
+//   • 'reservation-checkout' { id, at? }   → svc.checkOut(...)
+// - 🧼 Al check-out, emette anche { table_id, cleaning_until } per attivare la “Pulizia 5:00” sui FE passivi.
+
+'use strict';
+
+const logger = require('../logger');
+const env    = require('../env');
+
+const {
+  create: createReservation,
+  updateStatus: updateReservationStatus,
+  assignReservationTable,          // ✅ c'è già nel service
+  list: listReservations,
+  checkIn,                         // ✅ nomi reali dal service
+  checkOut                         // ✅ nomi reali dal service
+} = require('../services/reservations.service');
+
+// finestra pulizia (default 5 minuti) → configurabile via ENV
+const CLEAN_SEC =
+  Number(process.env.CLEAN_SECONDS || (env.RESV && env.RESV.cleanSeconds) || 300);
+
+module.exports = (io) => {
+  io.on('connection', (socket) => {
+    logger.info('📡 [RES] SOCKET connected', { id: socket.id });
+
+    // registrazione canali
+    socket.on('register-admin',   () => socket.join('admins'));
+    socket.on('register-customer', (token) => token && socket.join(`c:${token}`));
+
+    // LIST
+    socket.on('reservations-get', async (filter = {}) => {
+      logger.info('📡 [RES] reservations-get ▶️', { from: socket.id, filter });
+      const rows = await listReservations(filter);
+      socket.emit('reservations-list', rows);
+    });
+
+    // CREATE (cliente)
+    socket.on('reservation-new', async (dto) => {
+      logger.info('📡 [RES] reservation-new ▶️', { origin: 'customer', body: dto });
+      const r = await createReservation(dto);
+      io.to('admins').emit('reservation-created', r);
+      if (r.client_token) io.to(`c:${r.client_token}`).emit('reservation-created', r);
+      logger.info('📡 [RES] reservation-created ✅ broadcast', { id: r.id });
+    });
+
+    // CREATE (admin)
+    socket.on('reservation-admin-new', async (dto) => {
+      logger.info('📡 [RES] reservation-admin-new ▶️', { origin: 'admin', body: dto });
+      const r = await createReservation(dto);
+      io.to('admins').emit('reservation-created', r);
+      if (r.client_token) io.to(`c:${r.client_token}`).emit('reservation-created', r);
+      logger.info('📡 [RES] reservation-created ✅ (admin)', { id: r.id });
+    });
+
+    // CAMBIO STATO (compat con FE storico)
+    socket.on('reservation-update-status', async ({ id, status }) => {
+      logger.info('📡 [RES] reservation-update-status ▶️', { id, status });
+      const r = await updateReservationStatus({ id, action: status });
+      io.to('admins').emit('reservation-updated', r);
+      if (r.client_token) io.to(`c:${r.client_token}`).emit('reservation-updated', r);
+    });
+
+    // ASSEGNAZIONE TAVOLO
+    socket.on('reservation-assign-table', async ({ id, table_id }) => {
+      logger.info('📡 [RES] reservation-assign-table ▶️', { id, table_id });
+      const r = await assignReservationTable(id, table_id);
+      io.to('admins').emit('reservation-updated', r);
+      if (r.client_token) io.to(`c:${r.client_token}`).emit('reservation-updated', r);
+    });
+
+    // 🆕 CHECK-IN
+    socket.on('reservation-checkin', async ({ id, at = null }) => {
+      logger.info('📡 [RES] reservation-checkin ▶️', { id, at });
+      const r = await checkIn(id, { at, user: { email: 'socket@server' } });
+      io.to('admins').emit('reservation-checkin', { id: r.id, checkin_at: r.checkin_at, table_id: r.table_id || null });
+      io.to('admins').emit('reservation-updated', r);
+      if (r.client_token) io.to(`c:${r.client_token}`).emit('reservation-updated', r);
+      logger.info('📡 [RES] reservation-checkin ✅ broadcast', { id: r.id });
+    });
+
+    // 🆕 CHECK-OUT
+    socket.on('reservation-checkout', async ({ id, at = null }) => {
+      logger.info('📡 [RES] reservation-checkout ▶️', { id, at });
+      const r = await checkOut(id, { at, user: { email: 'socket@server' } });
+
+      // calcolo in uscita una cleaning window lato socket (non blocca il BE)
+      const base = at ? new Date(at).getTime() : Date.now();
+      const cleaning_until = new Date(base + CLEAN_SEC * 1000).toISOString();
+
+      io.to('admins').emit('reservation-checkout', {
+        id         : r.id,
+        table_id   : r.table_id || null,
+        checkout_at: r.checkout_at,
+        dwell_sec  : r.dwell_sec || null,
+        cleaning_until
+      });
+      io.to('admins').emit('reservation-updated', r);
+      if (r.client_token) io.to(`c:${r.client_token}`).emit('reservation-updated', r);
+      logger.info('📡 [RES] reservation-checkout ✅ broadcast', { id: r.id, cleaning_until });
+    });
+
+    socket.on('disconnect', (reason) => {
+      logger.info('📡 [RES] SOCKET disconnected', { id: socket.id, reason });
+    });
+  });
+};
+```
+
+### ./src/sse.js
+```
+// src/sse.js
+// ============================================================================
+// SSE per ORDERS (Server-Sent Events).
+// - mount(router) → GET /stream
+// - emitCreated(order), emitStatus({id,status})
+// ============================================================================
+'use strict';
+const logger = require('./logger');
+
+let nextClientId = 1;
+const clients = new Map(); // id -> { res }
+
+function headers() {
+  return {
+    'Content-Type': 'text/event-stream',
+    'Cache-Control': 'no-cache, no-transform',
+    Connection: 'keep-alive',
+  };
+}
+
+function write(res, type, data) {
+  try {
+    res.write(`event: ${type}\n`);
+    res.write(`data: ${JSON.stringify(data)}\n\n`);
+  } catch { /* client chiuso */ }
+}
+
+function mount(router) {
+  router.get('/stream', (req, res) => {
+    const id = nextClientId++;
+    res.writeHead(200, headers());
+    res.write(`: connected ${id}\n\n`);
+    clients.set(id, { res });
+    logger.info('🧵 SSE client connected', { id, total: clients.size });
+
+    req.on('close', () => {
+      clients.delete(id);
+      logger.info('🧵 SSE client disconnected', { id, total: clients.size });
+    });
+  });
+}
+
+function emitCreated(order) {
+  logger.info('🧵 SSE emit created', { id: order?.id });
+  for (const { res } of clients.values()) write(res, 'created', { order });
+}
+
+function emitStatus(payload) {
+  logger.info('🧵 SSE emit status', { id: payload?.id, status: payload?.status });
+  for (const { res } of clients.values()) write(res, 'status', payload);
+}
+
+module.exports = { mount, emitCreated, emitStatus };
+```
+
+### ./src/utils/customers.resolve.js
+```
+// server/src/utils/customers.resolve.js
+// ============================================================================
+// Risoluzione "customer_user_id" partendo da email/phone.
+// - Normalizza il telefono rimuovendo TUTTO tranne le cifre (0-9)
+// - Confronta l'email in maniera case-insensitive (LOWER(email))
+// - Cerca il cliente nella tabella `users` (quella che usi per i "customers")
+// - Ritorna l'id se trovato, altrimenti null
+// ============================================================================
+
+'use strict';
+
+const log = require('../logger') || console;
+
+// normalizza un telefono in modo conservativo → tengo solo le cifre
+function normalizePhone(v) {
+  const s = String(v || '').trim();
+  if (!s) return null;
+  const digits = s.replace(/[^\d]/g, ''); // rimuove spazi, +, -, punti, ecc.
+  return digits || null;
+}
+
+module.exports = async function resolveCustomerUserId(db, { email, phone }) {
+  // email normalizzata a minuscole
+  const emailNorm = (email || '').trim().toLowerCase() || null;
+  const phoneNorm = normalizePhone(phone);
+
+  // nessun dato utile → non cerco
+  if (!emailNorm && !phoneNorm) {
+    log.info('👥 resolveCustomerUserId: nessuna email/phone, skip');
+    return null;
+  }
+
+  // --------------------------------------------------------------------------
+  // Costruisco WHERE dinamico in base a cosa ho (email, phone o entrambi)
+  // --------------------------------------------------------------------------
+  const where = [];
+  const params = [];
+
+  if (emailNorm) {
+    where.push('LOWER(email) = ?');
+    params.push(emailNorm);
+  }
+
+  if (phoneNorm) {
+    // lato DB tolgo gli stessi caratteri "rumorosi" dal telefono salvato
+    where.push(`
+      REPLACE(
+        REPLACE(
+          REPLACE(
+            REPLACE(phone, ' ', ''),
+            '+', ''
+          ),
+          '-', ''
+        ),
+        '.', ''
+      ) = ?
+    `);
+    params.push(phoneNorm);
+  }
+
+  const sql = `
+    SELECT id
+    FROM users
+    WHERE ${where.join(' OR ')}
+    ORDER BY id DESC
+    LIMIT 1
+  `;
+
+  // Nota: mysql2/promise ritorna [rows, fields]; in alcuni punti puoi avere
+  // direttamente rows. La normalizzazione sotto copre entrambi i casi.
+  const rows = await db.query(sql, params);
+  const list = Array.isArray(rows) && Array.isArray(rows[0]) ? rows[0] : rows;
+
+  const foundId = list?.[0]?.id || null;
+
+  if (foundId) {
+    log.info('👥 resolveCustomerUserId HIT', {
+      id: foundId,
+      email: emailNorm,
+      phoneNorm,
+    });
+  } else {
+    log.info('👥 resolveCustomerUserId MISS', {
+      email: emailNorm,
+      phoneNorm,
+    });
+  }
+
+  return foundId;
+};
+```
+
+### ./src/utils/print-order.js
+```
+// src/utils/print-order.js
+// ============================================================================
+// Stampa ESC/POS “Pizzeria/Cucina”. NIENTE simbolo € (codepage problemi).
+// - legge env PRINTER_* e mapping categorie PIZZERIA_CATEGORIES / KITCHEN_CATEGORIES
+// - se PRINTER_ENABLED=false → no-op (non blocca i flussi)
+// - 🆕 per COMANDA (centro produzione): font più grande + bold, cliente/tavolo/sala evidenti,
+//   raggruppamento per categoria (ANTIPASTI → PIZZE ROSSE → PIZZE BIANCHE → altre)
+//   + spaziatura maggiore e wrapping note (leggibile per dislessia)
+//   + prezzi per riga (in piccolo) e totale finale (senza simbolo €)
+//   + orario “DOMENICA 10/11/2025  ore 04:42”
+// ============================================================================
+// Nota: manteniamo lo stile verboso con emoji nei log, come da progetto.
+// ============================================================================
+
+'use strict';
+
+const net = require('net');
+const logger = require('../logger');
+
+const {
+  PRINTER_ENABLED = 'true',
+  PRINTER_IP = '127.0.0.1',
+  PRINTER_PORT = '9100',
+  PRINTER_CUT = 'true',
+  PRINTER_HEADER = '',
+  PRINTER_FOOTER = '',
+  PRINTER_WIDTH_MM = '80',
+  // mapping reparti
+  PIZZERIA_CATEGORIES = 'PIZZE,PIZZE ROSSE,PIZZE BIANCHE',
+  KITCHEN_CATEGORIES = 'ANTIPASTI,FRITTI,BEVANDE',
+} = process.env;
+
+function esc(...codes) { return Buffer.from(codes); }
+
+// --- ESC/POS helpers (dimensioni/bold/alignment/spacing/font/codepage) ------
+function init(sock) { sock.write(esc(0x1B,0x40)); }                    // ESC @
+function alignLeft(sock){ sock.write(esc(0x1B,0x61,0x00)); }           // ESC a 0
+function alignCenter(sock){ sock.write(esc(0x1B,0x61,0x01)); }         // ESC a 1
+function boldOn(sock){ sock.write(esc(0x1B,0x45,0x01)); }              // ESC E 1
+function boldOff(sock){ sock.write(esc(0x1B,0x45,0x00)); }             // ESC E 0
+function sizeNormal(sock){ sock.write(esc(0x1D,0x21,0x00)); }          // GS ! 0 (1x)
+function sizeTall(sock){ sock.write(esc(0x1D,0x21,0x01)); }            // GS ! 1 (2x altezza)
+function sizeBig(sock){ sock.write(esc(0x1D,0x21,0x11)); }             // GS ! 17 (2x larghezza+altezza)
+function fontA(sock){ sock.write(esc(0x1B,0x4D,0x00)); }               // ESC M 0 → Font A (leggibile)
+function charSpacing(sock, n){ sock.write(esc(0x1B,0x20, Math.max(0,Math.min(255,n)))); } // ESC SP n
+function setLineSpacing(sock, n){ sock.write(esc(0x1B,0x33, Math.max(0,Math.min(255,n)))); } // ESC 3 n
+function resetLineSpacing(sock){ sock.write(esc(0x1B,0x32)); }         // ESC 2 (default)
+function feedLines(sock, n){ sock.write(esc(0x1B,0x64, Math.max(0,Math.min(255,n)))); }     // ESC d n
+function cutIfEnabled(sock){ if (PRINTER_CUT === 'true') sock.write(esc(0x1D,0x56,0x42,0x00)); } // GS V B n
+function codepageCP1252(sock){ try{ sock.write(esc(0x1B,0x74,0x10)); }catch{} } // ESC t 16 → CP1252 (tipico Epson)
+
+// --- Scrittura linea con sanificazione (accenti/apici/dash) -----------------
+function sanitizeForEscpos(s) {
+  return String(s || '')
+    // apici/virgolette tipografiche → ASCII
+    .replace(/[\u2018\u2019]/g, "'")
+    .replace(/[\u201C\u201D]/g, '"')
+    // em/en dash → trattino semplice
+    .replace(/[\u2013\u2014]/g, '-')
+    // simbolo euro → testuale
+    .replace(/€+/g, 'EUR')
+    // spazi multipli → singolo
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+function writeLine(sock, s) {
+  const line = sanitizeForEscpos(s) + '\n';
+  // molti ESC/POS accettano latin1; con CP1252 selezionata gli accenti IT vanno ok
+  sock.write(Buffer.from(line, 'latin1'));
+}
+
+// --- Layout/Wrap COMANDA -----------------------------------------------------
+const COMANDA_MAX_COLS = 42;        // stima sicura per 80mm con Font A
+const COMANDA_LINE_SP  = 48;        // spaziatura righe “larga” per leggibilità
+
+function wrapText(s, max = COMANDA_MAX_COLS) {
+  const text = sanitizeForEscpos(s);
+  if (!text) return [];
+  const words = text.split(' ');
+  const out = []; let cur = '';
+  for (const w of words) {
+    const candidate = cur ? cur + ' ' + w : w;
+    if (candidate.length <= max) cur = candidate;
+    else { if (cur) out.push(cur); cur = w; }
+  }
+  if (cur) out.push(cur);
+  return out;
+}
+
+function qtyStr(q) { return String(Math.max(1, Number(q) || 1)).padStart(2,' '); }
+function money(n){ return Number(n || 0).toFixed(2); }
+
+// ----------------------------------------------------------------------------
+function openSocket() {
+  return new Promise((resolve, reject) => {
+    const socket = net.createConnection(
+      { host: PRINTER_IP, port: Number(PRINTER_PORT || 9100) },
+      () => resolve(socket)
+    );
+    socket.on('error', reject);
+  });
+}
+
+function splitByDept(items) {
+  const piz = new Set(PIZZERIA_CATEGORIES.split(',').map(s => s.trim().toUpperCase()).filter(Boolean));
+  const kit = new Set(KITCHEN_CATEGORIES.split(',').map(s => s.trim().toUpperCase()).filter(Boolean));
+
+  const pizzeria = [];
+  const kitchen  = [];
+  for (const it of items) {
+    const cat = (it.category || 'Altro').toString().toUpperCase();
+    if (piz.has(cat)) pizzeria.push(it);
+    else if (kit.has(cat)) kitchen.push(it);
+    else pizzeria.push(it); // default
+  }
+  return { pizzeria, kitchen };
+}
+
+// --- Ordinamento categorie per COMANDA (centro produzione) -------------------
+const COMANDA_CATEGORY_ORDER = [
+  'ANTIPASTI',
+  'PIZZE ROSSE',
+  'PIZZE BIANCHE',
+];
+function categoryRank(name) {
+  const up = (name || 'Altro').toString().toUpperCase().trim();
+  const idx = COMANDA_CATEGORY_ORDER.indexOf(up);
+  return idx === -1 ? 100 + up.charCodeAt(0) : idx; // sconosciute dopo, ma stabili
+}
+
+// --- Estrai "Sala ..." e "Tavolo ..." ---------------------------------------
+function extractTableLabel(order) {
+  const direct = order.table_name || order.table_number || order.table_label || order.table_id;
+  if (direct) return `Tavolo ${direct}`;
+  const note = (order.note || '').toString();
+  const m = note.match(/Tavolo\s+([A-Za-z0-9\-_]+)/i);
+  return m ? `Tavolo ${m[1]}` : null;
+}
+function extractRoomLabel(order) {
+  const direct = order.room_name || order.room_label || order.room;
+  if (direct) return `Sala ${direct}`;
+  if (order.room_id) return `Sala ${order.room_id}`;
+  return null;
+}
+
+// --- Formattazione orario stile “DOMENICA 10/11/2025  ore 04:42” -------------
+function fmtComandaDate(iso) {
+  try{
+    const d = iso ? new Date(iso) : new Date();
+    const gg = d.toLocaleDateString('it-IT', { weekday: 'long' }).toUpperCase();
+    const dd = String(d.getDate()).padStart(2,'0');
+    const mm = String(d.getMonth()+1).padStart(2,'0');
+    const yy = d.getFullYear();
+    const hh = String(d.getHours()).padStart(2,'0');
+    const mn = String(d.getMinutes()).padStart(2,'0');
+    return `${gg} ${dd}/${mm}/${yy}  ore ${hh}:${mn}`;
+  }catch{ return String(iso || ''); }
+}
+
+// --- Stampa standard (CONTO) -------------------------------------------------
+async function printSlip(title, order) {
+  const sock = await openSocket();
+  const write = (buf) => sock.write(buf);
+
+  init(sock);
+  // Titolo alto (come prima)
+  write(esc(0x1B,0x21,0x20));       // double height (compat classic)
+  write(Buffer.from(String(title)+'\n','latin1'));
+  write(esc(0x1B,0x21,0x00));       // normal
+
+  const headerLines = (PRINTER_HEADER || '').split('|').filter(Boolean);
+  for (const h of headerLines) write(Buffer.from(sanitizeForEscpos(h)+'\n','latin1'));
+
+  write(Buffer.from('------------------------------\n','latin1'));
+  write(Buffer.from(`#${order.id}  ${sanitizeForEscpos(order.customer_name)}\n`,'latin1'));
+  if (order.phone) write(Buffer.from(`${sanitizeForEscpos(order.phone)}\n`,'latin1'));
+  if (order.people) write(Buffer.from(`Coperti: ${order.people}\n`,'latin1'));
+  if (order.scheduled_at) write(Buffer.from(`Orario: ${fmtComandaDate(order.scheduled_at)}\n`,'latin1'));
+  write(Buffer.from('------------------------------\n','latin1'));
+
+  for (const it of order.items) {
+    write(Buffer.from(`${it.qty} x ${sanitizeForEscpos(it.name)}  ${money(it.price)}\n`,'latin1'));
+    if (it.notes) write(Buffer.from(`  NOTE: ${sanitizeForEscpos(it.notes)}\n`,'latin1'));
+  }
+
+  write(Buffer.from('------------------------------\n','latin1'));
+  write(Buffer.from(`Totale: ${money(order.total || 0)}\n`,'latin1'));
+  if (PRINTER_FOOTER) {
+    write(Buffer.from('\n','latin1'));
+    for (const f of (PRINTER_FOOTER || '').split('|')) write(Buffer.from(sanitizeForEscpos(f)+'\n','latin1'));
+  }
+  write(Buffer.from('\n','latin1'));
+  cutIfEnabled(sock);
+  sock.end();
+}
+
+// --- Normalizzazione NOTE prodotto → “SENZA: …\nAGGIUNGI: …” -----------------
+function normalizeNotesForKitchen(raw) {
+  if (!raw) return null;
+  let s = String(raw);
+  // separatore “—” → newline; EXTRA → AGGIUNGI
+  s = s.replace(/—/g, '\n'); // em-dash → newline
+  s = s.replace(/\bEXTRA:/gi, 'AGGIUNGI:');
+  // se qualcuno scrive “SENZA: … AGGIUNGI: …” su 1 sola riga con trattini → forza newline
+  s = s.replace(/\s*[-–—]\s*AGGIUNGI:/gi, '\nAGGIUNGI:');
+  // pulizia
+  s = sanitizeForEscpos(s);
+  return s;
+}
+
+// --- Stampa COMANDA (centro produzione) — font grande/bold + spacing ---------
+async function printComandaSlip(title, order) {
+  const sock = await openSocket();
+
+  // init + set leggibilità (Font A, spaziatura righe, leggera spaziatura caratteri, codepage)
+  init(sock);
+  codepageCP1252(sock);
+  fontA(sock);
+  setLineSpacing(sock, COMANDA_LINE_SP);
+  charSpacing(sock, 1);
+
+  // Intestazione centrale
+  alignCenter(sock);
+  sizeBig(sock); boldOn(sock); writeLine(sock, title); boldOff(sock);
+
+  const client = (order.customer_name || 'Cliente').toString().trim();
+  sizeBig(sock); boldOn(sock); writeLine(sock, client); boldOff(sock);
+
+  const room = extractRoomLabel(order);
+  const table = extractTableLabel(order);
+  if (room) { sizeBig(sock); boldOn(sock); writeLine(sock, room); boldOff(sock); }
+  if (table){ sizeBig(sock); boldOn(sock); writeLine(sock, table); boldOff(sock); }
+
+  // Sub-intestazione compatta
+  sizeNormal(sock);
+  writeLine(sock, '==============================');
+  alignLeft(sock);
+  writeLine(sock, `#${order.id}`);
+  if (order.people) writeLine(sock, `Coperti: ${order.people}`);
+  if (order.scheduled_at) writeLine(sock, `Orario: ${fmtComandaDate(order.scheduled_at)}`);
+  if (order.phone) writeLine(sock, `Tel: ${order.phone}`);
+  if (order.note) {
+    const nlines = wrapText(`Note: ${order.note}`, COMANDA_MAX_COLS);
+    for (const ln of nlines) writeLine(sock, ln);
+  }
+  writeLine(sock, '------------------------------');
+
+  // Raggruppa per categoria con ordinamento desiderato
+  const groups = new Map(); // cat -> items[]
+  for (const it of (order.items || [])) {
+    const cat = (it.category || 'Altro').toString();
+    if (!groups.has(cat)) groups.set(cat, []);
+    groups.get(cat).push(it);
+  }
+  const categories = Array.from(groups.keys()).sort((a,b) => {
+    const ra = categoryRank(a), rb = categoryRank(b);
+    return ra === rb ? a.localeCompare(b, 'it') : ra - rb;
+  });
+
+  // Stampa per categoria
+  let grand = 0;
+  for (const cat of categories) {
+    const list = groups.get(cat) || [];
+
+    // Header categoria in bold (un pelo più grande)
+    writeLine(sock, ''); // riga vuota
+    boldOn(sock); sizeTall(sock); writeLine(sock, cat.toUpperCase()); boldOff(sock); sizeNormal(sock);
+    writeLine(sock, '------------------------------');
+
+    // Prodotto: qty ben visibile + nome in bold (UPPER), con spaziatura verticale extra
+    for (const it of list) {
+      const qty = Math.max(1, Number(it.qty) || 1);
+      const qtyTxt = qtyStr(qty);
+      const name = (it.name || '').toString().trim().toUpperCase();
+
+      // Riga principale (grande)
+      boldOn(sock); sizeTall(sock);
+      writeLine(sock, `${qtyTxt} x ${name}`);
+      boldOff(sock); sizeNormal(sock);
+
+      // NOTE (normalizzate: SENZA → newline → AGGIUNGI)
+      if (it.notes) {
+        const norm = normalizeNotesForKitchen(it.notes);
+        const lines = wrapText(`NOTE: ${norm}`, COMANDA_MAX_COLS);
+        boldOn(sock);
+        for (const ln of lines) writeLine(sock, '  ' + ln);
+        boldOff(sock);
+      }
+
+      // Prezzi in piccolo (unitario e totale riga)
+      const unit = Number(it.price || 0);
+      const rowTot = unit * qty;
+      if (unit > 0) {
+        writeLine(sock, `  prezzo: ${money(unit)}  •  riga: ${money(rowTot)}`);
+      }
+      grand += rowTot;
+
+      // aria tra righe prodotto
+      feedLines(sock, 1);
+    }
+  }
+
+  // Totale COMANDA (solo numerico, niente €)
+  alignCenter(sock);
+  writeLine(sock, '==============================');
+  boldOn(sock); writeLine(sock, `TOTALE: ${money(grand)}`); boldOff(sock);
+
+  // Footer tecnico + reset spacing + taglio
+  writeLine(sock, '');
+  writeLine(sock, 'COMANDA');
+  writeLine(sock, '');
+
+  resetLineSpacing(sock);
+  charSpacing(sock, 0);
+  cutIfEnabled(sock);
+  sock.end();
+}
+
+async function printOrderDual(orderFull) {
+  if (PRINTER_ENABLED !== 'true') {
+    logger.warn('🖨️  PRINT disabled (PRINTER_ENABLED=false)');
+    return;
+  }
+  const { pizzeria, kitchen } = splitByDept(orderFull.items || []);
+  const head = {
+    id: orderFull.id,
+    customer_name: orderFull.customer_name,
+    phone: orderFull.phone,
+    people: orderFull.people,
+    scheduled_at: orderFull.scheduled_at,
+    total: orderFull.total,
+    note: orderFull.note,                 // per eventuale 'Tavolo ...'
+    table_name: orderFull.table_name,     // se forniti dal chiamante
+    table_number: orderFull.table_number, // idem
+    table_id: orderFull.table_id,         // idem
+    room_name: orderFull.room_name,       // 🆕 sala se disponibile
+    room_id: orderFull.room_id,           // 🆕 id sala come fallback
+  };
+
+  if (pizzeria.length) {
+    await printSlip('PIZZERIA', { ...head, items: pizzeria });
+    logger.info('🖨️  PIZZERIA printed', { id: orderFull.id, items: pizzeria.length });
+  }
+  if (kitchen.length) {
+    await printSlip('CUCINA', { ...head, items: kitchen });
+    logger.info('🖨️  CUCINA printed', { id: orderFull.id, items: kitchen.length });
+  }
+}
+
+// 🆕 Stampa SOLO un centro (PIZZERIA | CUCINA) — usa la formattazione COMANDA
+async function printOrderForCenter(orderFull, center = 'PIZZERIA') {
+  if (PRINTER_ENABLED !== 'true') {
+    logger.warn('🧾 PRINT(comanda) disabled (PRINTER_ENABLED=false)');
+    return;
+  }
+  const { pizzeria, kitchen } = splitByDept(orderFull.items || []);
+  const head = {
+    id: orderFull.id,
+    customer_name: orderFull.customer_name,
+    phone: orderFull.phone,
+    people: orderFull.people,
+    scheduled_at: orderFull.scheduled_at,
+    total: orderFull.total,
+    note: orderFull.note,
+    table_name: orderFull.table_name,
+    table_number: orderFull.table_number,
+    table_id: orderFull.table_id,
+    room_name: orderFull.room_name,   // 🆕
+    room_id: orderFull.room_id,       // 🆕
+  };
+
+  const which = String(center || 'PIZZERIA').toUpperCase();
+  const payload = which === 'CUCINA' ? kitchen : pizzeria;
+  const title   = which === 'CUCINA' ? 'CUCINA' : 'PIZZERIA';
+
+  if (!payload.length) {
+    logger.info('🧾 comanda skip (no items per centro)', { id: orderFull.id, center: which });
+    return;
+  }
+  await printComandaSlip(title, { ...head, items: payload }); // 👈 stile COMANDA
+  logger.info('🧾 comanda printed', { id: orderFull.id, center: which, items: payload.length });
+}
+
+module.exports = { printOrderDual, printOrderForCenter };
+```

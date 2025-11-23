@@ -6,19 +6,21 @@
 // - generateToken / bindTable / revokeToken
 // - resolveToken(token): prima verifica su nfc_tags, poi JOIN per meta tavolo
 // - sessione tavolo (table_sessions)
+// - 🧲 closeSessionById: chiusura sessione per id (API /api/nfc/session/:id/close)
 // Stile: commenti lunghi + log con emoji
 // ============================================================================
 
 const crypto = require('crypto');
-const { query } = require('../db');      // wrapper mysql2
-const logger   = require('../logger');
+const { query } = require('../db'); // wrapper mysql2
+const logger = require('../logger');
 
-const TABLE    = 'nfc_tags';
+const TABLE = 'nfc_tags';
 const TABLE_TS = 'table_sessions';
 
 // ----------------------------- utils ----------------------------------------
 function base62(bytes = 9) {
-  const alphabet = '0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ';
+  const alphabet =
+    '0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ';
   const buf = crypto.randomBytes(bytes);
   let out = '';
   for (let i = 0; i < buf.length; i++) out += alphabet[buf[i] % alphabet.length];
@@ -37,7 +39,8 @@ async function getActiveByTable(tableId) {
        FROM ${TABLE}
       WHERE table_id=? AND is_revoked=0
    ORDER BY id DESC
-      LIMIT 1`, [tableId]
+      LIMIT 1`,
+    [tableId],
   );
   return rows[0] || null;
 }
@@ -45,7 +48,7 @@ async function getActiveByTable(tableId) {
 async function insertToken(tableId, token) {
   await query(
     `INSERT INTO ${TABLE} (table_id, token, is_revoked) VALUES (?, ?, 0)`,
-    [tableId, token]
+    [tableId, token],
   );
   return token;
 }
@@ -55,7 +58,7 @@ async function revokeByTable(tableId) {
     `UPDATE ${TABLE}
         SET is_revoked=1, revoked_at=NOW()
       WHERE table_id=? AND is_revoked=0`,
-    [tableId]
+    [tableId],
   );
 }
 
@@ -66,21 +69,30 @@ async function bindTable(tableId, opts = {}) {
   if (!forceNew) {
     const current = await getActiveByTable(tableId);
     if (current) {
-      logger.info(`🔗 [NFC] Token esistente per table_id=${tableId} → ${current.token}`);
+      logger.info(
+        `🔗 [NFC] Token esistente per table_id=${tableId} → ${current.token}`,
+      );
       return current.token;
     }
   }
   if (forceNew) {
-    logger.warn(`♻️ [NFC] Rigenerazione token per table_id=${tableId} (revoca precedenti)`);
+    logger.warn(
+      `♻️ [NFC] Rigenerazione token per table_id=${tableId} (revoca precedenti)`,
+    );
     await revokeByTable(tableId);
   }
 
   let token = generateToken(12);
   for (let i = 0; i < 5; i++) {
-    try { await insertToken(tableId, token); return token; }
-    catch (err) {
+    try {
+      await insertToken(tableId, token);
+      return token;
+    } catch (err) {
       const msg = String(err?.message || '');
-      if (msg.includes('ER_DUP_ENTRY')) { token = generateToken(12); continue; }
+      if (msg.includes('ER_DUP_ENTRY')) {
+        token = generateToken(12);
+        continue;
+      }
       throw err;
     }
   }
@@ -93,14 +105,17 @@ async function revokeToken(token) {
     `UPDATE ${TABLE}
         SET is_revoked=1, revoked_at=NOW()
       WHERE token=? AND is_revoked=0`,
-    [token]
+    [token],
   );
   return { ok: true };
 }
 
 function buildPublicUrl(token, req) {
-  const base = process.env.PUBLIC_BASE_URL
-    || `${req?.protocol || 'http'}://${req?.get ? req.get('host') : 'localhost:3000'}`;
+  const base =
+    process.env.PUBLIC_BASE_URL ||
+    `${req?.protocol || 'http'}://${
+      req?.get ? req.get('host') : 'localhost:3000'
+    }`;
   return `${base.replace(/\/+$/, '')}/t/${encodeURIComponent(token)}`;
 }
 
@@ -112,17 +127,19 @@ async function getActiveSession(tableId) {
       WHERE table_id=? AND closed_at IS NULL
    ORDER BY id DESC
       LIMIT 1`,
-    [tableId]
+    [tableId],
   );
   return rows?.[0] || null;
 }
 async function openSession(tableId, { by, note } = {}) {
   const res = await query(
     `INSERT INTO ${TABLE_TS} (table_id, opened_by, note) VALUES (?,?,?)`,
-    [tableId, by || null, note || null]
+    [tableId, by || null, note || null],
   );
   const id = res?.insertId || null;
-  logger.info(`🟢 [NFC] Sessione APERTA table_id=${tableId} (session_id=${id})`);
+  logger.info(
+    `🟢 [NFC] Sessione APERTA table_id=${tableId} (session_id=${id})`,
+  );
   return id;
 }
 async function closeActiveSession(tableId, { by, reason } = {}) {
@@ -132,11 +149,62 @@ async function closeActiveSession(tableId, { by, reason } = {}) {
     `UPDATE ${TABLE_TS}
         SET closed_at = NOW(), closed_by = ?
       WHERE id = ? AND closed_at IS NULL`,
-    [by || reason || null, act.id]
+    [by || reason || null, act.id],
   );
-  logger.info(`🔴 [NFC] Sessione CHIUSA table_id=${tableId} (session_id=${act.id})`);
+  logger.info(
+    `🔴 [NFC] Sessione CHIUSA table_id=${tableId} (session_id=${act.id})`,
+  );
   return { closed: 1, session_id: act.id };
 }
+
+/**
+ * 🧲 closeSessionById
+ * ----------------------------------------------------------------------------
+ * Chiusura sessione per ID (usato da API tipo: PUT /api/nfc/session/:id/close).
+ * - Non richiede il table_id a chiamata
+ * - È best-effort: se la sessione è già chiusa, non lancia errore.
+ */
+async function closeSessionById(sessionId, { by, reason } = {}) {
+  if (!sessionId) throw new Error('session_id mancante');
+
+  const rows = await query(
+    `SELECT id, table_id, opened_at, closed_at
+       FROM ${TABLE_TS}
+      WHERE id = ?
+      LIMIT 1`,
+    [sessionId],
+  );
+  const s = rows?.[0];
+  if (!s) {
+    logger.warn('🧲 [NFC] closeSessionById: sessione non trovata', {
+      session_id: sessionId,
+    });
+    return { closed: 0 };
+  }
+
+  if (s.closed_at) {
+    logger.info('🧲 [NFC] closeSessionById: sessione già chiusa', {
+      session_id: sessionId,
+      table_id: s.table_id,
+    });
+    return { closed: 0, session_id: s.id, already_closed: true };
+  }
+
+  await query(
+    `UPDATE ${TABLE_TS}
+        SET closed_at = NOW(), closed_by = ?
+      WHERE id = ? AND closed_at IS NULL`,
+    [by || reason || null, sessionId],
+  );
+
+  logger.info('🔴 [NFC] Sessione CHIUSA (by id)', {
+    session_id: sessionId,
+    table_id: s.table_id,
+  });
+
+  return { closed: 1, session_id: sessionId, table_id: s.table_id };
+}
+
 async function ensureSession(tableId, { ttlHours = 6, by } = {}) {
   const act = await getActiveSession(tableId);
   if (act) {
@@ -153,42 +221,57 @@ async function resolveToken(token) {
   if (!token) throw new Error('token mancante');
 
   // 1) esiste in nfc_tags (non revocato)?
-  const tag = (await query(
-    `SELECT id, table_id
+  const tag = (
+    await query(
+      `SELECT id, table_id
        FROM ${TABLE}
       WHERE token = ? AND is_revoked = 0
       LIMIT 1`,
-    [token]
-  ))?.[0];
+      [token],
+    )
+  )?.[0];
 
-  logger.info('🔎 [NFC] resolve.check', { token, found: !!tag, table_id: tag?.table_id });
+  logger.info('🔎 [NFC] resolve.check', {
+    token,
+    found: !!tag,
+    table_id: tag?.table_id,
+  });
 
-  if (!tag) return null;                      // ← 404 not_found_or_revoked
+  if (!tag) return null; // ← 404 not_found_or_revoked
 
   // 2) meta tavolo (JOIN) — usa table_number
-  const meta = (await query(
-    `SELECT t.table_number, t.room_id, r.name AS room_name
+  const meta =
+    (
+      await query(
+        `SELECT t.table_number, t.room_id, r.name AS room_name
        FROM tables t
   LEFT JOIN rooms  r ON r.id = t.room_id
       WHERE t.id = ?
       LIMIT 1`,
-    [tag.table_id]
-  ))?.[0] || {};
+        [tag.table_id],
+      )
+    )?.[0] || {};
 
   // 3) prenotazione odierna
-  const resv = (await query(
-    `SELECT id FROM reservations
+  const resv =
+    (
+      await query(
+        `SELECT id FROM reservations
       WHERE table_id = ?
         AND status IN ('pending','accepted')
         AND start_at >= UTC_DATE()
         AND start_at <  (UTC_DATE() + INTERVAL 1 DAY)
       ORDER BY start_at ASC
       LIMIT 1`,
-    [tag.table_id]
-  ))?.[0] || null;
+        [tag.table_id],
+      )
+    )?.[0] || null;
 
   // 4) assicura sessione
-  const session_id = await ensureSession(tag.table_id, { ttlHours: 6, by: 'nfc/resolve' });
+  const session_id = await ensureSession(tag.table_id, {
+    ttlHours: 6,
+    by: 'nfc/resolve',
+  });
 
   return {
     ok: true,
@@ -204,12 +287,15 @@ async function resolveToken(token) {
 // ------------------------------ cart snapshot --------------------------------
 async function getSessionCart(sessionId) {
   if (!sessionId) throw new Error('session_id mancante');
-  const s = (await query(
-    `SELECT id, closed_at, cart_json, cart_version, cart_updated_at
+  const s =
+    (
+      await query(
+        `SELECT id, closed_at, cart_json, cart_version, cart_updated_at
        FROM ${TABLE_TS}
       WHERE id=? LIMIT 1`,
-    [sessionId]
-  ))?.[0];
+        [sessionId],
+      )
+    )?.[0];
   if (!s) return null;
   return {
     id: s.id,
@@ -226,11 +312,15 @@ async function saveSessionCart(sessionId, version, cartObj) {
     `UPDATE ${TABLE_TS}
         SET cart_json = ?, cart_version = cart_version + 1, cart_updated_at = NOW()
       WHERE id = ? AND closed_at IS NULL AND cart_version = ?`,
-    [cartJson, sessionId, Number(version || 0)]
+    [cartJson, sessionId, Number(version || 0)],
   );
   if (Number(res?.affectedRows || 0) === 1) {
     const cur = await getSessionCart(sessionId);
-    return { ok: true, version: cur?.version ?? 0, updated_at: cur?.cart_updated_at ?? null };
+    return {
+      ok: true,
+      version: cur?.version ?? 0,
+      updated_at: cur?.cart_updated_at ?? null,
+    };
   }
   const current = await getSessionCart(sessionId);
   const err = new Error('version_conflict');
@@ -252,6 +342,7 @@ module.exports = {
   getActiveSession,
   openSession,
   closeActiveSession,
+  closeSessionById,
   ensureSession,
   // Cart
   getSessionCart,

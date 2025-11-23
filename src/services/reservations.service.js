@@ -495,27 +495,39 @@ async function checkOut(id, { at, user } = {}) {
   const existing = await getById(id);
   if (!existing) return null;
 
-  const checkout_at_mysql = isoToMysql(at || new Date()) || null;
+  // Orario di checkout: se non passo nulla → adesso
+  const checkoutDate = at ? new Date(at) : new Date();
+  const checkout_at_mysql = isoToMysql(checkoutDate) || null;
 
-  // dwell_sec se ho checkin_at
+  // dwell_sec (in secondi) se ho un checkin_at valido
   let dwell_sec = null;
-  if (r.checkin_at) {
-    const start = new Date(r.checkin_at).getTime();
-    const end   = checkout_at_mysql ? new Date(at).getTime() : Date.now();
-    dwell_sec   = Math.max(0, Math.floor((end - start) / 1000));
+  if (existing.checkin_at) {
+    const startMs = new Date(existing.checkin_at).getTime();
+    const endMs   = checkoutDate.getTime();
+    if (!Number.isNaN(startMs) && !Number.isNaN(endMs)) {
+      dwell_sec = Math.max(0, Math.floor((endMs - startMs) / 1000));
+    }
   }
-  const params = [ user?.email || null, id ];
-  const SQL = `
+
+  // Costruisco SQL + parametri mantenendo il tuo stile
+  const params = [checkout_at_mysql, trimOrNull(user?.email) || null];
+  let SQL = `
     UPDATE reservations
-       SET checkout_at = ${checkout_at_mysql ? '?' : 'CURRENT_TIMESTAMP'},
-           dwell_sec   = ${dwell_sec === null ? 'dwell_sec' : '?'},
+       SET checkout_at = ?,
            updated_at  = CURRENT_TIMESTAMP,
-           updated_by  = ?
+           updated_by  = ?`;
+
+  if (dwell_sec !== null) {
+    SQL += `,
+           dwell_sec   = ?`;
+    params.push(dwell_sec);
+  }
+
+  SQL += `
      WHERE id = ? LIMIT 1`;
-  const pr = checkout_at_mysql
-    ? (dwell_sec === null ? [checkout_at_mysql, ...params] : [checkout_at_mysql, dwell_sec, ...params])
-    : (dwell_sec === null ? params : [dwell_sec, ...params]);
-  await query(SQL, pr);
+  params.push(id);
+
+  await query(SQL, params);
 
   const updated = await getById(id);
   logger.info('✅ reservation check-out', {
