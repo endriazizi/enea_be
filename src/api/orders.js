@@ -3,18 +3,21 @@
 // /api/orders — gestione ordini (lista, dettaglio, creazione, stato, stampa)
 //
 // Allineato con:
-// - OrderBuilderPage (creazione ordini da tavolo + prenotazione)
+// - OrderBuilderPage (creazione ordini da tavolo + prenotazione + NFC session)
 // - TablesListPage (preview ordini per tavolo + stampa conto/comanda)
 //
 // Caratteristiche principali:
 // - LIST: filtro per hours/from/to/status/q/table_id
 //   - se passi ?table_id=XX ⇒ restituisce ordini "full" con righe e meta tavolo/sala
-// - GET /:id     ⇒ dettaglio ordine completo (righe + meta tavolo/sala/prenotazione)
-// - POST /       ⇒ crea ordine, ricalcola totale lato server, valorizza table_id
-// - PATCH /:id/status ⇒ cambio stato semplice (pending/confirmed/preparing/...)
-// - POST /:id/print           ⇒ stampa CONTO (printOrderDual, best-effort)
-// - POST /:id/print/comanda   ⇒ stampa comanda PIZZERIA/CUCINA
-// - POST /:id/print-comanda   ⇒ alias compat
+// - GET /:id                 ⇒ dettaglio ordine completo (righe + meta tavolo/sala/prenotazione)
+// - GET /:id/batches         ⇒ storico mandate T1/T2/T3 (order_batches + snapshot righe)
+// - GET /active-by-session   ⇒ ordine attivo per session_id NFC (best-effort + backfill)
+// - POST /                   ⇒ crea ordine, ricalcola totale lato server, valorizza table_id, lega NFC
+// - POST /:id/items          ⇒ aggiunge righe ad un ordine esistente (supporto T2/T3 lato BE)
+// - PATCH /:id/status        ⇒ cambio stato semplice (pending/confirmed/preparing/...)
+// - POST /:id/print          ⇒ stampa CONTO (printOrderDual, best-effort) + batch Tn
+// - POST /:id/print/comanda  ⇒ stampa comanda PIZZERIA/CUCINA + batch Tn
+// - POST /:id/print-comanda  ⇒ alias compat
 //
 // Tutte le integrazioni extra (SSE, Socket.IO, stampa, customers.resolve) sono
 // opzionali: se i moduli non ci sono, logghiamo un warning e continuiamo.
@@ -47,7 +50,7 @@ try {
   }
 } catch (e) {
   logger.warn('ℹ️ [orders] SSE non disponibile (../sse mancante o non valido)', {
-    error: String(e && e.message || e),
+    error: String((e && e.message) || e),
   });
 }
 
@@ -68,7 +71,7 @@ try {
   }
 } catch (e) {
   logger.warn('ℹ️ [orders] sockets non disponibili (../sockets/orders)', {
-    error: String(e && e.message || e),
+    error: String((e && e.message) || e),
   });
 }
 
@@ -95,9 +98,10 @@ try {
     }
   }
 } catch (e) {
-  logger.warn('ℹ️ [orders] print-order non disponibile (../utils/print-order mancante o non valido)', {
-    error: String(e && e.message || e),
-  });
+  logger.warn(
+    'ℹ️ [orders] print-order non disponibile (../utils/print-order mancante o non valido)',
+    { error: String((e && e.message) || e) },
+  );
 }
 
 // customers.resolve (best-effort) → mappa email/telefono su customer_user_id
@@ -109,7 +113,7 @@ try {
   }
 } catch (e) {
   logger.warn('ℹ️ [orders] customers.resolve non disponibile (../utils/customers.resolve mancante)', {
-    error: String(e && e.message || e),
+    error: String((e && e.message) || e),
   });
 }
 
@@ -263,7 +267,7 @@ async function getOrderFullById(id) {
        o.status,
        o.total,
        o.channel,
-       o.table_id,    -- 🆕 colonna aggiunta da 007_add_table_id_to_orders.sql
+       o.table_id,    -- colonna aggiunta da 007_add_table_id_to_orders.sql
        o.note,
        o.created_at,
        o.updated_at,
@@ -319,6 +323,154 @@ async function getOrderFullById(id) {
   };
 }
 
+/**
+ * Ricalcola il totale ordine sulla base delle righe presenti in order_items.
+ * Aggiorna anche updated_at e restituisce il nuovo totale numerico.
+ */
+async function recalcOrderTotal(orderId) {
+  const rows = await query(
+    'SELECT IFNULL(SUM(qty * price), 0) AS total FROM order_items WHERE order_id = ?',
+    [orderId],
+  );
+  const total = rows && rows[0] ? Number(rows[0].total || 0) : 0;
+
+  await query(
+    `UPDATE orders
+       SET total = ?, updated_at = UTC_TIMESTAMP()
+     WHERE id = ?`,
+    [total, orderId],
+  );
+
+  return total;
+}
+
+// ============================================================================
+// 🆕 Helper NFC: lega ordine ↔ sessione
+// ============================================================================
+
+// === INIZIO MODIFICA: bind ordine ↔ sessione tavolo ========================
+async function bindOrderToSession(sessionId, orderId) {
+  // best-effort: se manca uno dei due, non facciamo nulla
+  if (!sessionId || !orderId) return;
+
+  try {
+    // 🔁 NOTA IMPORTANTE:
+    // Usiamo la tabella ESISTENTE "table_sessions", che è la stessa
+    // letta da /api/nfc/session/last-order per trovare last_order_id.
+    await query(
+      `UPDATE table_sessions
+          SET last_order_id = ?, updated_at = UTC_TIMESTAMP()
+        WHERE id = ?`,
+      [orderId, sessionId],
+    );
+
+    logger.info('🔗 [NFC] bind order→session OK', {
+      sessionId,
+      orderId,
+    });
+  } catch (e) {
+    // Non deve MAI bloccare la creazione ordine / stampa: solo warning.
+    logger.warn('⚠️ [NFC] bind order→session KO (best-effort, continuo)', {
+      sessionId,
+      orderId,
+      error: String((e && e.message) || e),
+    });
+  }
+}
+// === FINE MODIFICA ==========================================================
+
+// ============================================================================
+// NEW: Helper per T1/T2/T3 (order_batches con snapshot JSON)
+// ============================================================================
+
+/**
+ * Crea una riga in order_batches per l'ordine indicato.
+ * - batch_no = MAX(batch_no)+1 per quell'ordine
+ * - items_snapshot_json = snapshot righe ordine (id,product_id,name,qty,price,notes,category)
+ *
+ * best-effort:
+ * - se la tabella non esiste o dà errore → log WARN ma NON blocca la stampa.
+ */
+async function createOrderBatchSnapshot(orderId, options = {}) {
+  const { sentBy = null, note = null } = options || {};
+  try {
+    // 1) prossimo batch_no
+    const rows = await query(
+      'SELECT IFNULL(MAX(batch_no), 0) AS max_no FROM order_batches WHERE order_id = ?',
+      [orderId],
+    );
+    const maxNo = rows && rows[0] ? Number(rows[0].max_no || 0) : 0;
+    const nextNo = maxNo + 1;
+
+    // 2) snapshot righe corrente (ordine completo, con categoria già risolta)
+    const items = await query(
+      `SELECT i.id,
+              i.product_id,
+              i.name,
+              i.qty,
+              i.price,
+              i.notes,
+              COALESCE(c.name, 'Altro') AS category
+       FROM order_items i
+       LEFT JOIN products   p ON p.id = i.product_id
+       LEFT JOIN categories c ON c.id = p.category_id
+       WHERE i.order_id = ?
+       ORDER BY i.id ASC`,
+      [orderId],
+    );
+
+    const snapshot = (items || []).map((it) => ({
+      id        : it.id,
+      product_id: it.product_id,
+      name      : it.name,
+      qty       : Number(it.qty || 0),
+      price     : Number(it.price || 0),
+      notes     : it.notes || null,
+      category  : it.category || 'Altro',
+    }));
+
+    await query(
+      `INSERT INTO order_batches (
+         order_id,
+         batch_no,
+         sent_at,
+         sent_by,
+         note,
+         items_snapshot_json
+       )
+       VALUES (
+         ?,
+         ?,
+         UTC_TIMESTAMP(),
+         ?,
+         ?,
+         ?
+       )`,
+      [
+        orderId,
+        nextNo,
+        sentBy || null,
+        note || null,
+        JSON.stringify(snapshot),
+      ],
+    );
+
+    logger.info('🧾 [orders] batch snapshot creato', {
+      order_id: orderId,
+      batch_no: nextNo,
+      items   : snapshot.length,
+      note    : note || null,
+      sentBy  : sentBy || null,
+    });
+  } catch (e) {
+    // NON deve mai bloccare stampa / flusso ordine
+    logger.warn('⚠️ [orders] createOrderBatchSnapshot KO (best-effort, continuo)', {
+      order_id: orderId,
+      error   : String((e && e.message) || e),
+    });
+  }
+}
+
 // ============================================================================
 // Montiamo eventuale endpoint SSE /api/orders/stream
 // ============================================================================
@@ -329,7 +481,7 @@ try {
   }
 } catch (e) {
   logger.warn('ℹ️ [orders] sse.mount KO (continuo senza SSE)', {
-    error: String(e && e.message || e),
+    error: String((e && e.message) || e),
   });
 }
 
@@ -419,6 +571,170 @@ router.get('/', async (req, res) => {
   }
 });
 
+// ============================================================================
+// 🆕 GET /api/orders/active-by-session?session_id=18
+//     - usa nfc_sessions.last_order_id se presente
+//     - altrimenti cerca l'ultimo ordine "aperto" per quel tavolo
+//       e fa backfill di last_order_id (best-effort)
+// ============================================================================
+
+router.get('/active-by-session', async (req, res) => {
+  try {
+    const raw = req.query.session_id || req.query.sessionId;
+    const sessionId = toNum(raw, 0);
+    if (!sessionId) {
+      return res.status(400).json({ ok: false, error: 'missing_session_id' });
+    }
+
+    // 🔎 Leggo dalla tabella REALE usata dal resto del BE: table_sessions
+    const rows = await query(
+      `SELECT id, table_id, last_order_id
+         FROM table_sessions
+        WHERE id = ?
+        LIMIT 1`,
+      [sessionId],
+    );
+
+    const session = rows && rows[0];
+    if (!session) {
+      logger.info('📭 [NFC] active-by-session: session non trovata', { sessionId });
+      // FE può distinguere con 404, ma di solito qui non ci arrivi se hai appena aperto la sessione
+      return res.status(404).json({ ok: false, error: 'session_not_found' });
+    }
+
+    let orderId = session.last_order_id ? Number(session.last_order_id) : null;
+    let order   = null;
+
+    // 1) Provo dal last_order_id
+    if (orderId) {
+      order = await getOrderFullById(orderId);
+      if (!order) {
+        logger.warn('📭 [NFC] active-by-session: last_order_id non valido', {
+          sessionId,
+          orderId,
+        });
+        orderId = null;
+      }
+    }
+
+    // 2) Se non ho ordine, provo dal tavolo (ultimo ordine "aperto")
+    if (!order) {
+      if (!session.table_id) {
+        logger.info('📭 [NFC] active-by-session: nessun table_id e nessun last_order', {
+          sessionId,
+        });
+        return res.status(200).json(null);
+      }
+
+      const ordRows = await query(
+        `SELECT id
+           FROM orders
+          WHERE table_id = ?
+            AND status IN ('pending','confirmed','preparing','ready')
+          ORDER BY id DESC
+          LIMIT 1`,
+        [session.table_id],
+      );
+
+      if (!ordRows || !ordRows[0]) {
+        logger.info('📭 [NFC] active-by-session: nessun ordine aperto per tavolo', {
+          sessionId,
+          table_id: session.table_id,
+        });
+        return res.status(200).json(null);
+      }
+
+      orderId = ordRows[0].id;
+      order   = await getOrderFullById(orderId);
+
+      // Backfill last_order_id best-effort su table_sessions
+      try {
+        await query(
+          `UPDATE table_sessions
+             SET last_order_id = ?, updated_at = UTC_TIMESTAMP()
+           WHERE id = ?`,
+          [orderId, sessionId],
+        );
+        logger.info('🔗 [NFC] backfill last_order_id da orders', {
+          sessionId,
+          orderId,
+          table_id: session.table_id,
+        });
+      } catch (e) {
+        logger.warn('⚠️ [NFC] backfill last_order_id KO (best-effort)', {
+          sessionId,
+          orderId,
+          error: String((e && e.message) || e),
+        });
+      }
+    }
+
+    if (!order) {
+      return res.status(200).json(null);
+    }
+
+    logger.info('📦 [NFC] active order by session', {
+      sessionId,
+      order_id: order.id,
+      table_id: order.table_id,
+    });
+
+    // Qui ritorniamo direttamente l'ordine "full"
+    res.json(order);
+  } catch (e) {
+    logger.error('📦 orders active-by-session ❌', { error: String(e) });
+    res.status(500).json({ ok: false, error: 'orders_active_by_session_error' });
+  }
+});
+
+// 🔎 Storico mandate / T1-Tn (order_batches)
+// Nota routing: deve stare PRIMA di "/:id(\\d+)".
+router.get('/:id(\\d+)/batches', async (req, res) => {
+  try {
+    const id = toNum(req.params.id);
+
+    const rows = await query(
+      `SELECT
+         b.id,
+         b.order_id,
+         b.batch_no,
+         b.sent_at,
+         b.sent_by,
+         b.note,
+         b.items_snapshot_json
+       FROM order_batches b
+       WHERE b.order_id = ?
+       ORDER BY b.batch_no ASC, b.id ASC`,
+      [id],
+    );
+
+    const mapped = (rows || []).map((r) => {
+      let items = null;
+      if (r.items_snapshot_json) {
+        try {
+          items = JSON.parse(r.items_snapshot_json);
+        } catch {
+          items = null;
+        }
+      }
+      return {
+        id       : r.id,
+        order_id : r.order_id,
+        batch_no : r.batch_no,
+        sent_at  : r.sent_at,
+        sent_by  : r.sent_by,
+        note     : r.note,
+        items,
+      };
+    });
+
+    res.json(mapped);
+  } catch (e) {
+    logger.error('📄 order_batches list ❌', { error: String(e) });
+    res.status(500).json({ ok: false, error: 'order_batches_list_error' });
+  }
+});
+
 // Dettaglio ordine "full"
 router.get('/:id(\\d+)', async (req, res) => {
   try {
@@ -431,6 +747,94 @@ router.get('/:id(\\d+)', async (req, res) => {
   } catch (e) {
     logger.error('📄 orders get ❌', { error: String(e) });
     res.status(500).json({ ok: false, error: 'orders_get_error' });
+  }
+});
+
+// ➕ Aggiunge righe ad un ordine esistente (Opzione B: T2/T3 lato BE)
+router.post('/:id(\\d+)/items', async (req, res) => {
+  try {
+    const id = toNum(req.params.id);
+    if (!id) {
+      return res.status(400).json({ ok: false, error: 'invalid_id' });
+    }
+
+    const dto = req.body || {};
+    const items = Array.isArray(dto.items) ? dto.items : [];
+
+    if (!items.length) {
+      return res.status(400).json({ ok: false, error: 'no_items' });
+    }
+
+    // Verifico che l'ordine esista
+    const existing = await query(
+      'SELECT id FROM orders WHERE id = ? LIMIT 1',
+      [id],
+    );
+    if (!existing || !existing[0]) {
+      return res.status(404).json({ ok: false, error: 'not_found' });
+    }
+
+    let inserted = 0;
+
+    for (const it of items) {
+      if (!it || typeof it !== 'object') continue;
+      const name = (it.name || '').toString().trim();
+      if (!name) continue;
+
+      await query(
+        `INSERT INTO order_items (
+           order_id,
+           product_id,
+           name,
+           qty,
+           price,
+           notes
+         )
+         VALUES (?,?,?,?,?,?)`,
+        [
+          id,
+          it.product_id != null ? it.product_id : null,
+          name,
+          toNum(it.qty, 1),
+          toNum(it.price),
+          it.notes || null,
+        ],
+      );
+      inserted += 1;
+    }
+
+    const newTotal = await recalcOrderTotal(id);
+    const full = await getOrderFullById(id);
+
+    try {
+      // uso emitStatus come "notifica generica" di aggiornamento ordine
+      sse.emitStatus({ id, status: full && full.status, total: newTotal });
+    } catch (e) {
+      logger.warn('🧵 SSE emitStatus (items) ⚠️', { error: String(e) });
+    }
+    try {
+      socketBus.broadcastUpdated(full);
+    } catch (e) {
+      logger.warn('📡 socket broadcastUpdated (items) ⚠️', { error: String(e) });
+    }
+
+    logger.info('➕ [orders] items added', {
+      id,
+      added: inserted,
+      total: newTotal,
+    });
+
+    res.status(201).json(full);
+  } catch (e) {
+    logger.error('➕ orders add-items ❌', {
+      error: String(e),
+      id   : toNum(req.params.id),
+    });
+    res.status(500).json({
+      ok    : false,
+      error : 'orders_add_items_error',
+      reason: String(e),
+    });
   }
 });
 
@@ -465,7 +869,7 @@ router.post('/', async (req, res) => {
       }
     } catch (e) {
       logger.warn('⚠️ [Orders] resolveCustomerUserId KO', {
-        error: String(e && e.message || e),
+        error: String((e && e.message) || e),
       });
     }
 
@@ -494,7 +898,7 @@ router.post('/', async (req, res) => {
       } catch (e) {
         logger.warn(
           '⚠️ [Orders] resolve table_id from reservation_id KO',
-          { error: String(e && e.message || e) },
+          { error: String((e && e.message) || e) },
         );
       }
     }
@@ -555,6 +959,16 @@ router.post('/', async (req, res) => {
 
     const full = await getOrderFullById(orderId);
 
+    // 🆕 Se arriva session_id dal FE (NFC), lego l'ordine alla sessione
+    const sessionId =
+      dto.session_id ||
+      dto.sessionId ||
+      null;
+
+    if (sessionId) {
+      await bindOrderToSession(toNum(sessionId, 0), orderId);
+    }
+
     // Notifiche SSE / Socket.IO (best-effort)
     try {
       sse.emitCreated(full);
@@ -602,6 +1016,7 @@ router.patch('/:id(\\d+)/status', async (req, res) => {
       `UPDATE orders
          SET status = ?, updated_at = UTC_TIMESTAMP()
        WHERE id = ?`,
+
       [status, id],
     );
 
@@ -625,7 +1040,7 @@ router.patch('/:id(\\d+)/status', async (req, res) => {
   }
 });
 
-// Stampa CONTO (best-effort)
+// Stampa CONTO (best-effort) + batch snapshot Tn
 router.post('/:id(\\d+)/print', async (req, res) => {
   try {
     const id = toNum(req.params.id);
@@ -633,6 +1048,15 @@ router.post('/:id(\\d+)/print', async (req, res) => {
     if (!full) {
       return res.status(404).json({ ok: false, error: 'not_found' });
     }
+
+    // Tn: ogni volta che stampo il CONTO registro un batch
+    const sentBy =
+      (req.user && (req.user.email || req.user.username || req.user.id)) ||
+      null;
+    await createOrderBatchSnapshot(id, {
+      sentBy,
+      note: 'CONTO',
+    });
 
     try {
       await printOrderDual(full);
@@ -681,6 +1105,15 @@ async function handlePrintComanda(req, res) {
         1,
       ),
     );
+
+    // Tn: ogni volta che invio COMANDA registro un batch
+    const sentBy =
+      (req.user && (req.user.email || req.user.username || req.user.id)) ||
+      null;
+    await createOrderBatchSnapshot(id, {
+      sentBy,
+      note: `COMANDA:${center}`,
+    });
 
     try {
       for (let i = 0; i < copies; i += 1) {

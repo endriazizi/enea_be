@@ -4,6 +4,7 @@
 //   GET    /api/orders                         → lista (filtri: status|hours|from|to|q)
 //   GET    /api/orders/:id                     → dettaglio (header + items + categoria)
 //   POST   /api/orders                         → crea ordine + items
+//   POST   /api/orders/:id/items               → aggiunge righe ad un ordine esistente
 //   PATCH  /api/orders/:id/status              → cambio stato (emette SSE "status")
 //   POST   /api/orders/:id/print               → stampa comande (PIZZERIA/CUCINA)
 //   POST   /api/orders/print                   → compat: body { id }
@@ -70,6 +71,29 @@ async function loadHeader(orderId, conn) {
   if (!rows.length) return null;
   const h = rows[0];
   return { ...h, total: h.total != null ? Number(h.total) : null };
+}
+
+/**
+ * Ricalcola il totale di un ordine sulla base di order_items.
+ * Se viene passato un connection, usa quella transazionale.
+ */
+async function recalcOrderTotal(orderId, conn) {
+  const sql = `
+    SELECT IFNULL(SUM(i.qty * i.price), 0) AS total
+    FROM order_items i
+    WHERE i.order_id = ?
+  `;
+  const [rows] = await (conn || pool).query(sql, [orderId]);
+  const total = rows.length ? Number(rows[0].total || 0) : 0;
+
+  await (conn || pool).query(
+    `UPDATE orders
+       SET total = ?, updated_at = NOW()
+     WHERE id = ?`,
+    [total, orderId],
+  );
+
+  return total;
 }
 
 /** Stampa via TCP 9100 (ESC/POS) */
@@ -182,6 +206,85 @@ router.get('/:id(\\d+)', async (req, res) => {
   }
 });
 
+// ➕ Aggiunge righe ad un ordine esistente (compat con Opzione B)
+router.post('/:id(\\d+)/items', async (req, res) => {
+  const id = Number(req.params.id);
+  if (!id) return res.status(400).json({ ok: false, error: 'invalid_id' });
+
+  const body = req.body || {};
+  const items = Array.isArray(body.items) ? body.items : [];
+  if (!items.length) {
+    return res.status(400).json({ ok: false, error: 'no_items' });
+  }
+
+  const conn = await pool.getConnection();
+  try {
+    await conn.beginTransaction();
+
+    const [exists] = await conn.query(
+      'SELECT id FROM orders WHERE id = ? LIMIT 1',
+      [id],
+    );
+    if (!exists.length) {
+      await conn.rollback();
+      conn.release();
+      return res.status(404).json({ ok: false, error: 'not_found' });
+    }
+
+    let inserted = 0;
+
+    for (const it of items) {
+      if (!it || typeof it !== 'object') continue;
+      const name = String(it.name || '').trim();
+      if (!name) continue;
+
+      await conn.query(
+        `INSERT INTO order_items (order_id, product_id, name, qty, price, notes, created_at)
+         VALUES (?,?,?,?,?,?,NOW())`,
+        [
+          id,
+          it.product_id ?? null,
+          name,
+          it.qty ?? 1,
+          it.price ?? 0,
+          it.notes ?? null,
+        ],
+      );
+      inserted += 1;
+    }
+
+    const total = await recalcOrderTotal(id, conn);
+
+    await conn.commit();
+
+    const header = await loadHeader(id, conn);
+    const details = await loadItems(id, conn);
+    const full = { ...header, items: details };
+
+    // riuso evento "status" come "ordine aggiornato"
+    bus.emit('status', { id, status: full.status });
+
+    log.info('➕ ORDERS.addItems ✅', {
+      service: 'server',
+      id,
+      added : inserted,
+      total,
+    });
+
+    res.status(201).json(full);
+  } catch (err) {
+    await conn.rollback();
+    log.error('➕ ORDERS.addItems ❌', {
+      service: 'server',
+      error  : String(err),
+      id,
+    });
+    res.status(500).json({ ok: false, error: 'orders_add_items_error', reason: String(err) });
+  } finally {
+    conn.release();
+  }
+});
+
 // Crea ordine
 router.post('/', async (req, res) => {
   const body = req.body || {};
@@ -219,8 +322,8 @@ router.post('/', async (req, res) => {
     );
     const orderId = r.insertId;
 
-    const items = Array.isArray(body.items) ? body.items : [];
-    for (const it of items) {
+    const itemsBody = Array.isArray(body.items) ? body.items : [];
+    for (const it of itemsBody) {
       await conn.query(
         `INSERT INTO order_items (order_id, product_id, name, qty, price, notes, created_at)
          VALUES (?,?,?,?,?,?,NOW())`,
@@ -233,7 +336,7 @@ router.post('/', async (req, res) => {
     const full = { ...(await loadHeader(orderId, conn)), items: await loadItems(orderId, conn) };
     bus.emit('created', { id: full.id, status: full.status });
 
-    log.info('🧾 ORDERS.create ✅', { service: 'server', id: orderId, items: items.length });
+    log.info('🧾 ORDERS.create ✅', { service: 'server', id: orderId, items: itemsBody.length });
     res.status(201).json(full);
   } catch (err) {
     await conn.rollback();

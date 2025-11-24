@@ -266,14 +266,22 @@ router.put('/cart', async (req, res) => {
 // Ultimo ordine associato alla sessione (se table_sessions.last_order_id è
 // valorizzato). Implementazione originale tua, ripresa e lasciata invariata.
 // ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// GET /api/nfc/session/last-order?session_id=123
+// ---------------------------------------------------------------------------
+// Ultimo ordine associato alla sessione (se table_sessions.last_order_id è
+// valorizzato). Implementazione originale tua, ripresa e aggiustata solo
+// togliendo le colonne che NON esistono in "orders" (reservation_id, room_id).
+// ---------------------------------------------------------------------------
 router.get('/last-order', async (req, res) => {
   const log = req.app.get('logger');
   try {
     const sessionId = Number(req.query.session_id || 0) || 0;
-    if (!sessionId)
+    if (!sessionId) {
       return res
         .status(400)
         .json({ ok: false, error: 'session_id_required' });
+    }
 
     // 1) prendo last_order_id dalla sessione
     const rows1 = await query(
@@ -286,19 +294,27 @@ router.get('/last-order', async (req, res) => {
       return res.json({ ok: true, hasOrder: false, order: null });
     }
 
-    // 2) header + total aggregato
+    // 2) header + total aggregato (SOLO colonne esistenti in "orders")
     const rows2 = await query(
       `
       SELECT
-        o.id, o.status, o.customer_name, o.phone, o.note, o.people,
-        o.channel, o.reservation_id, o.table_id, o.room_id, o.scheduled_at,
-        o.created_at, o.updated_at,
+        o.id,
+        o.status,
+        o.customer_name,
+        o.phone,
+        o.note,
+        o.people,
+        o.channel,
+        o.table_id,
+        o.scheduled_at,
+        o.created_at,
+        o.updated_at,
         IFNULL(SUM(oi.qty * oi.price), 0) AS total
       FROM orders o
       LEFT JOIN order_items oi ON oi.order_id = o.id
       WHERE o.id = ?
       GROUP BY o.id
-    `,
+      `,
       [lastOrderId],
     );
 
@@ -319,7 +335,7 @@ router.get('/last-order', async (req, res) => {
       FROM order_items
       WHERE order_id = ?
       ORDER BY id
-    `,
+      `,
       [lastOrderId],
     );
 
@@ -328,7 +344,12 @@ router.get('/last-order', async (req, res) => {
       lastOrderId,
       items: items.length,
     });
-    return res.json({ ok: true, hasOrder: true, order: { ...order, items } });
+
+    return res.json({
+      ok      : true,
+      hasOrder: true,
+      order   : { ...order, items },
+    });
   } catch (e) {
     req.app
       .get('logger')

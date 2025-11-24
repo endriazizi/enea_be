@@ -1,6 +1,6 @@
 # 🧩 Project code (file ammessi in .)
 
-_Generato: Sat, Nov 22, 2025  2:10:25 PM_
+_Generato: Mon, Nov 24, 2025 11:00:12 AM_
 
 ### ./package.json
 ```
@@ -836,34 +836,296 @@ module.exports = router;
 ### ./src/api/nfc-session.js
 ```
 // C:\Users\Endri Azizi\progetti-dev\my_dev\be\src\api\nfc-session.js
+'use strict';
+
 // ============================================================================
-// API NFC Session — interrogazione stato sessione (ultimo ordine, ecc.)
-// - GET /api/nfc/session/last-order?session_id=123
-//   → { ok:true, hasOrder:boolean, order: { id, status, total, items:[...] } | null }
+// API NFC Session — interrogazione stato sessione (ultimo ordine, carrello, ecc.)
+// - GET  /api/nfc/session/active?table_id=XX
+//      → { ok:true, active:false }
+//        { ok:true, active:true, session_id, started_at, cart_updated_at? }
+// - POST /api/nfc/session/close
+//      → chiude una sessione (per session_id, con opzionale table_id per log)
+//        body: { session_id:number, table_id?:number }
+// - GET  /api/nfc/session/cart?session_id=123
+//      → { ok:true, session_id, version, cart, updated_at? } | 404 se nessuna
+// - PUT  /api/nfc/session/cart
+//      → { ok:true, session_id, version, updated_at? } oppure 409 (version_conflict)
+// - GET  /api/nfc/session/last-order?session_id=123
+//      → { ok:true, hasOrder:boolean, order: { id, status, total, items:[...] } | null }
 // Stile: commenti lunghi, log con emoji
 // ============================================================================
-'use strict';
 
 const express = require('express');
 const router  = express.Router();
 const { query } = require('../db');
+const nfcSvc   = require('../services/nfc.service');
 
+// ---------------------------------------------------------------------------
+// GET /api/nfc/session/active?table_id=XX
+// ---------------------------------------------------------------------------
+// Usato dalla Lista Tavoli per mostrare il badge "Sessione attiva".
+// NON crea nuove sessioni: è un semplice check sullo stato corrente.
+// ---------------------------------------------------------------------------
+router.get('/active', async (req, res) => {
+  const log = req.app.get('logger');
+  try {
+    const tableId = Number(req.query.table_id || 0) || 0;
+    if (!tableId) {
+      return res.status(400).json({ ok: false, error: 'table_id_required' });
+    }
+
+    // 1) prendo la sessione attiva (se esiste)
+    const active = await nfcSvc.getActiveSession(tableId);
+    if (!active) {
+      log?.info?.('📭 [NFC] nessuna sessione attiva per tavolo', { tableId });
+      return res.json({ ok: true, active: false });
+    }
+
+    // 2) best-effort: leggo metadati carrello per avere cart_updated_at
+    let cartMeta = null;
+    try {
+      cartMeta = await nfcSvc.getSessionCart(active.id);
+    } catch (e) {
+      log?.warn?.('⚠️ [NFC] getSessionCart in /active fallita (ignoro)', {
+        tableId,
+        session_id: active.id,
+        error: String(e),
+      });
+    }
+
+    const payload = {
+      ok: true,
+      active: true,
+      session_id: active.id,
+      started_at: active.opened_at || null,
+      cart_updated_at: cartMeta?.cart_updated_at || null,
+    };
+
+    log?.info?.('🟢 [NFC] sessione attiva trovata', {
+      tableId,
+      session_id: active.id,
+    });
+
+    return res.json(payload);
+  } catch (e) {
+    log?.error?.('💥 [NFC] /session/active failed', { error: String(e) });
+    return res.status(500).json({ ok: false, error: 'active_failed' });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// POST /api/nfc/session/close
+// ---------------------------------------------------------------------------
+// Chiude una sessione tavolo.
+// - via session_id (preferito) → chiude quella specifica riga.
+// - opzionale table_id: solo per log / fallback.
+// Non crea nuove sessioni; se non c'è nulla da chiudere, closed=0.
+// ---------------------------------------------------------------------------
+router.post('/close', async (req, res) => {
+  const log = req.app.get('logger');
+  try {
+    const body = req.body || {};
+    const sessionId = Number(body.session_id || 0) || 0;
+    const tableId   = Number(body.table_id   || 0) || 0;
+
+    if (!sessionId && !tableId) {
+      return res
+        .status(400)
+        .json({ ok: false, error: 'session_id_or_table_id_required' });
+    }
+
+    let closed = 0;
+    let effectiveSessionId = sessionId || null;
+
+    // Se ho session_id, provo a chiudere direttamente quella riga
+    if (sessionId) {
+      const resSel = await query(
+        'SELECT id, table_id, closed_at FROM table_sessions WHERE id = ? LIMIT 1',
+        [sessionId],
+      );
+      const row = resSel?.[0];
+      if (!row) {
+        log?.warn?.('❓ [NFC] /close con session_id inesistente', {
+          sessionId,
+          tableId,
+        });
+      } else if (row.closed_at) {
+        log?.info?.('ℹ️ [NFC] /close su sessione già chiusa', {
+          sessionId,
+          tableId: row.table_id,
+        });
+        effectiveSessionId = row.id;
+      } else {
+        const resUpd = await query(
+          `UPDATE table_sessions
+              SET closed_at = NOW(),
+                  closed_by = ?
+            WHERE id = ? AND closed_at IS NULL`,
+          ['api:nfc-session/close', sessionId],
+        );
+        closed = Number(resUpd?.affectedRows || 0);
+        effectiveSessionId = row.id;
+        log?.info?.('🔴 [NFC] Sessione CHIUSA via session_id', {
+          sessionId,
+          tableId: row.table_id,
+          closed,
+        });
+      }
+    }
+
+    // Se non ho session_id oppure non ho chiuso nulla, ma ho tableId,
+    // faccio fallback su closeActiveSession(table_id).
+    if (!closed && tableId) {
+      const result = await nfcSvc.closeActiveSession(tableId, {
+        by: 'api:nfc-session/close',
+      });
+      closed = Number(result?.closed || 0);
+      if (!effectiveSessionId && result?.session_id) {
+        effectiveSessionId = result.session_id;
+      }
+      log?.info?.('🔴 [NFC] Sessione CHIUSA via table_id', {
+        tableId,
+        closed,
+        session_id: result?.session_id || null,
+      });
+    }
+
+    return res.json({
+      ok: true,
+      closed,
+      session_id: effectiveSessionId,
+    });
+  } catch (e) {
+    log?.error?.('💥 [NFC] /session/close failed', { error: String(e) });
+    return res.status(500).json({ ok: false, error: 'close_failed' });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// GET /api/nfc/session/cart?session_id=SID
+// ---------------------------------------------------------------------------
+// Restituisce lo snapshot carrello lato BE.
+// - 200 con payload se esiste
+// - 404 se nessuna sessione o nessun carrello
+// ---------------------------------------------------------------------------
+router.get('/cart', async (req, res) => {
+  const log = req.app.get('logger');
+  try {
+    const sessionId = Number(req.query.session_id || 0) || 0;
+    if (!sessionId) {
+      return res.status(400).json({ ok: false, error: 'session_id_required' });
+    }
+
+    const meta = await nfcSvc.getSessionCart(sessionId);
+    if (!meta) {
+      log?.info?.('📭 [NFC] nessun carrello per sessione', { sessionId });
+      return res.status(404).json({ ok: false, error: 'cart_not_found' });
+    }
+
+    let cartObj = null;
+    if (meta.cart_json) {
+      try {
+        cartObj = JSON.parse(meta.cart_json);
+      } catch (e) {
+        log?.warn?.('⚠️ [NFC] cart_json non parseable, ritorno stringa raw', {
+          sessionId,
+          error: String(e),
+        });
+        cartObj = meta.cart_json;
+      }
+    }
+
+    return res.json({
+      ok: true,
+      session_id: sessionId,
+      version: meta.version ?? 0,
+      cart: cartObj,
+      updated_at: meta.cart_updated_at ?? null,
+    });
+  } catch (e) {
+    log?.error?.('💥 [NFC] /session/cart (GET) failed', { error: String(e) });
+    return res.status(500).json({ ok: false, error: 'cart_get_failed' });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// PUT /api/nfc/session/cart
+// ---------------------------------------------------------------------------
+// Salva lo snapshot carrello con optimistic locking via version.
+// Body: { session_id, version, cart }
+// - 200 se ok
+// - 409 se version_conflict (stato cambiato nel frattempo)
+// ---------------------------------------------------------------------------
+router.put('/cart', async (req, res) => {
+  const log = req.app.get('logger');
+  try {
+    const body = req.body || {};
+    const sessionId = Number(body.session_id || 0) || 0;
+    const version   = Number(body.version   || 0) || 0;
+    const cart      = body.cart ?? null;
+
+    if (!sessionId) {
+      return res.status(400).json({ ok: false, error: 'session_id_required' });
+    }
+
+    try {
+      const result = await nfcSvc.saveSessionCart(sessionId, version, cart);
+      return res.json({
+        ok: true,
+        session_id: sessionId,
+        version: result?.version ?? 0,
+        updated_at: result?.updated_at ?? null,
+      });
+    } catch (err) {
+      if (err && err.status === 409) {
+        // Conflitto di versione → passo through info corrente se disponibile.
+        log?.warn?.('⚠️ [NFC] saveSessionCart version_conflict', {
+          sessionId,
+          current: err.current || null,
+        });
+        return res.status(409).json({
+          ok: false,
+          error: 'version_conflict',
+          current: err.current || null,
+        });
+      }
+      throw err;
+    }
+  } catch (e) {
+    log?.error?.('💥 [NFC] /session/cart (PUT) failed', { error: String(e) });
+    return res.status(500).json({ ok: false, error: 'cart_save_failed' });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// GET /api/nfc/session/last-order?session_id=123
+// ---------------------------------------------------------------------------
+// Ultimo ordine associato alla sessione (se table_sessions.last_order_id è
+// valorizzato). Implementazione originale tua, ripresa e lasciata invariata.
+// ---------------------------------------------------------------------------
 router.get('/last-order', async (req, res) => {
   const log = req.app.get('logger');
   try {
     const sessionId = Number(req.query.session_id || 0) || 0;
-    if (!sessionId) return res.status(400).json({ ok:false, error:'session_id_required' });
+    if (!sessionId)
+      return res
+        .status(400)
+        .json({ ok: false, error: 'session_id_required' });
 
     // 1) prendo last_order_id dalla sessione
-    const rows1 = await query('SELECT last_order_id FROM table_sessions WHERE id = ?', [ sessionId ]);
+    const rows1 = await query(
+      'SELECT last_order_id FROM table_sessions WHERE id = ?',
+      [sessionId],
+    );
     const lastOrderId = Number(rows1?.[0]?.last_order_id || 0) || 0;
     if (!lastOrderId) {
       log?.info?.('📭 [NFC] no last_order for session', { sessionId });
-      return res.json({ ok:true, hasOrder:false, order:null });
+      return res.json({ ok: true, hasOrder: false, order: null });
     }
 
     // 2) header + total aggregato
-    const rows2 = await query(`
+    const rows2 = await query(
+      `
       SELECT
         o.id, o.status, o.customer_name, o.phone, o.note, o.people,
         o.channel, o.reservation_id, o.table_id, o.room_id, o.scheduled_at,
@@ -873,28 +1135,42 @@ router.get('/last-order', async (req, res) => {
       LEFT JOIN order_items oi ON oi.order_id = o.id
       WHERE o.id = ?
       GROUP BY o.id
-    `, [ lastOrderId ]);
+    `,
+      [lastOrderId],
+    );
 
     if (!rows2?.length) {
-      log?.warn?.('❓ [NFC] last_order_id presente ma ordine non trovato', { sessionId, lastOrderId });
-      return res.json({ ok:true, hasOrder:false, order:null });
+      log?.warn?.(
+        '❓ [NFC] last_order_id presente ma ordine non trovato',
+        { sessionId, lastOrderId },
+      );
+      return res.json({ ok: true, hasOrder: false, order: null });
     }
 
     const order = rows2[0];
 
     // 3) items dettagliati
-    const items = await query(`
+    const items = await query(
+      `
       SELECT id, name, qty, price, notes
       FROM order_items
       WHERE order_id = ?
       ORDER BY id
-    `, [ lastOrderId ]);
+    `,
+      [lastOrderId],
+    );
 
-    log?.info?.('📦 [NFC] last-order found', { sessionId, lastOrderId, items: items.length });
-    return res.json({ ok:true, hasOrder:true, order: { ...order, items } });
+    log?.info?.('📦 [NFC] last-order found', {
+      sessionId,
+      lastOrderId,
+      items: items.length,
+    });
+    return res.json({ ok: true, hasOrder: true, order: { ...order, items } });
   } catch (e) {
-    req.app.get('logger')?.error?.('💥 [NFC] /session/last-order failed', { error: String(e) });
-    return res.status(500).json({ ok:false, error:'last_order_failed' });
+    req.app
+      .get('logger')
+      ?.error?.('💥 [NFC] /session/last-order failed', { error: String(e) });
+    return res.status(500).json({ ok: false, error: 'last_order_failed' });
   }
 });
 
@@ -1118,18 +1394,21 @@ module.exports = router;
 // /api/orders — gestione ordini (lista, dettaglio, creazione, stato, stampa)
 //
 // Allineato con:
-// - OrderBuilderPage (creazione ordini da tavolo + prenotazione)
+// - OrderBuilderPage (creazione ordini da tavolo + prenotazione + NFC session)
 // - TablesListPage (preview ordini per tavolo + stampa conto/comanda)
 //
 // Caratteristiche principali:
 // - LIST: filtro per hours/from/to/status/q/table_id
 //   - se passi ?table_id=XX ⇒ restituisce ordini "full" con righe e meta tavolo/sala
-// - GET /:id     ⇒ dettaglio ordine completo (righe + meta tavolo/sala/prenotazione)
-// - POST /       ⇒ crea ordine, ricalcola totale lato server, valorizza table_id
-// - PATCH /:id/status ⇒ cambio stato semplice (pending/confirmed/preparing/...)
-// - POST /:id/print           ⇒ stampa CONTO (printOrderDual, best-effort)
-// - POST /:id/print/comanda   ⇒ stampa comanda PIZZERIA/CUCINA
-// - POST /:id/print-comanda   ⇒ alias compat
+// - GET /:id                 ⇒ dettaglio ordine completo (righe + meta tavolo/sala/prenotazione)
+// - GET /:id/batches         ⇒ storico mandate T1/T2/T3 (order_batches + snapshot righe)
+// - GET /active-by-session   ⇒ ordine attivo per session_id NFC (best-effort + backfill)
+// - POST /                   ⇒ crea ordine, ricalcola totale lato server, valorizza table_id, lega NFC
+// - POST /:id/items          ⇒ aggiunge righe ad un ordine esistente (supporto T2/T3 lato BE)
+// - PATCH /:id/status        ⇒ cambio stato semplice (pending/confirmed/preparing/...)
+// - POST /:id/print          ⇒ stampa CONTO (printOrderDual, best-effort) + batch Tn
+// - POST /:id/print/comanda  ⇒ stampa comanda PIZZERIA/CUCINA + batch Tn
+// - POST /:id/print-comanda  ⇒ alias compat
 //
 // Tutte le integrazioni extra (SSE, Socket.IO, stampa, customers.resolve) sono
 // opzionali: se i moduli non ci sono, logghiamo un warning e continuiamo.
@@ -1162,7 +1441,7 @@ try {
   }
 } catch (e) {
   logger.warn('ℹ️ [orders] SSE non disponibile (../sse mancante o non valido)', {
-    error: String(e && e.message || e),
+    error: String((e && e.message) || e),
   });
 }
 
@@ -1183,7 +1462,7 @@ try {
   }
 } catch (e) {
   logger.warn('ℹ️ [orders] sockets non disponibili (../sockets/orders)', {
-    error: String(e && e.message || e),
+    error: String((e && e.message) || e),
   });
 }
 
@@ -1210,9 +1489,10 @@ try {
     }
   }
 } catch (e) {
-  logger.warn('ℹ️ [orders] print-order non disponibile (../utils/print-order mancante o non valido)', {
-    error: String(e && e.message || e),
-  });
+  logger.warn(
+    'ℹ️ [orders] print-order non disponibile (../utils/print-order mancante o non valido)',
+    { error: String((e && e.message) || e) },
+  );
 }
 
 // customers.resolve (best-effort) → mappa email/telefono su customer_user_id
@@ -1224,7 +1504,7 @@ try {
   }
 } catch (e) {
   logger.warn('ℹ️ [orders] customers.resolve non disponibile (../utils/customers.resolve mancante)', {
-    error: String(e && e.message || e),
+    error: String((e && e.message) || e),
   });
 }
 
@@ -1378,7 +1658,7 @@ async function getOrderFullById(id) {
        o.status,
        o.total,
        o.channel,
-       o.table_id,    -- 🆕 colonna aggiunta da 007_add_table_id_to_orders.sql
+       o.table_id,    -- colonna aggiunta da 007_add_table_id_to_orders.sql
        o.note,
        o.created_at,
        o.updated_at,
@@ -1434,6 +1714,154 @@ async function getOrderFullById(id) {
   };
 }
 
+/**
+ * Ricalcola il totale ordine sulla base delle righe presenti in order_items.
+ * Aggiorna anche updated_at e restituisce il nuovo totale numerico.
+ */
+async function recalcOrderTotal(orderId) {
+  const rows = await query(
+    'SELECT IFNULL(SUM(qty * price), 0) AS total FROM order_items WHERE order_id = ?',
+    [orderId],
+  );
+  const total = rows && rows[0] ? Number(rows[0].total || 0) : 0;
+
+  await query(
+    `UPDATE orders
+       SET total = ?, updated_at = UTC_TIMESTAMP()
+     WHERE id = ?`,
+    [total, orderId],
+  );
+
+  return total;
+}
+
+// ============================================================================
+// 🆕 Helper NFC: lega ordine ↔ sessione
+// ============================================================================
+
+// === INIZIO MODIFICA: bind ordine ↔ sessione tavolo ========================
+async function bindOrderToSession(sessionId, orderId) {
+  // best-effort: se manca uno dei due, non facciamo nulla
+  if (!sessionId || !orderId) return;
+
+  try {
+    // 🔁 NOTA IMPORTANTE:
+    // Usiamo la tabella ESISTENTE "table_sessions", che è la stessa
+    // letta da /api/nfc/session/last-order per trovare last_order_id.
+    await query(
+      `UPDATE table_sessions
+          SET last_order_id = ?, updated_at = UTC_TIMESTAMP()
+        WHERE id = ?`,
+      [orderId, sessionId],
+    );
+
+    logger.info('🔗 [NFC] bind order→session OK', {
+      sessionId,
+      orderId,
+    });
+  } catch (e) {
+    // Non deve MAI bloccare la creazione ordine / stampa: solo warning.
+    logger.warn('⚠️ [NFC] bind order→session KO (best-effort, continuo)', {
+      sessionId,
+      orderId,
+      error: String((e && e.message) || e),
+    });
+  }
+}
+// === FINE MODIFICA ==========================================================
+
+// ============================================================================
+// NEW: Helper per T1/T2/T3 (order_batches con snapshot JSON)
+// ============================================================================
+
+/**
+ * Crea una riga in order_batches per l'ordine indicato.
+ * - batch_no = MAX(batch_no)+1 per quell'ordine
+ * - items_snapshot_json = snapshot righe ordine (id,product_id,name,qty,price,notes,category)
+ *
+ * best-effort:
+ * - se la tabella non esiste o dà errore → log WARN ma NON blocca la stampa.
+ */
+async function createOrderBatchSnapshot(orderId, options = {}) {
+  const { sentBy = null, note = null } = options || {};
+  try {
+    // 1) prossimo batch_no
+    const rows = await query(
+      'SELECT IFNULL(MAX(batch_no), 0) AS max_no FROM order_batches WHERE order_id = ?',
+      [orderId],
+    );
+    const maxNo = rows && rows[0] ? Number(rows[0].max_no || 0) : 0;
+    const nextNo = maxNo + 1;
+
+    // 2) snapshot righe corrente (ordine completo, con categoria già risolta)
+    const items = await query(
+      `SELECT i.id,
+              i.product_id,
+              i.name,
+              i.qty,
+              i.price,
+              i.notes,
+              COALESCE(c.name, 'Altro') AS category
+       FROM order_items i
+       LEFT JOIN products   p ON p.id = i.product_id
+       LEFT JOIN categories c ON c.id = p.category_id
+       WHERE i.order_id = ?
+       ORDER BY i.id ASC`,
+      [orderId],
+    );
+
+    const snapshot = (items || []).map((it) => ({
+      id        : it.id,
+      product_id: it.product_id,
+      name      : it.name,
+      qty       : Number(it.qty || 0),
+      price     : Number(it.price || 0),
+      notes     : it.notes || null,
+      category  : it.category || 'Altro',
+    }));
+
+    await query(
+      `INSERT INTO order_batches (
+         order_id,
+         batch_no,
+         sent_at,
+         sent_by,
+         note,
+         items_snapshot_json
+       )
+       VALUES (
+         ?,
+         ?,
+         UTC_TIMESTAMP(),
+         ?,
+         ?,
+         ?
+       )`,
+      [
+        orderId,
+        nextNo,
+        sentBy || null,
+        note || null,
+        JSON.stringify(snapshot),
+      ],
+    );
+
+    logger.info('🧾 [orders] batch snapshot creato', {
+      order_id: orderId,
+      batch_no: nextNo,
+      items   : snapshot.length,
+      note    : note || null,
+      sentBy  : sentBy || null,
+    });
+  } catch (e) {
+    // NON deve mai bloccare stampa / flusso ordine
+    logger.warn('⚠️ [orders] createOrderBatchSnapshot KO (best-effort, continuo)', {
+      order_id: orderId,
+      error   : String((e && e.message) || e),
+    });
+  }
+}
+
 // ============================================================================
 // Montiamo eventuale endpoint SSE /api/orders/stream
 // ============================================================================
@@ -1444,7 +1872,7 @@ try {
   }
 } catch (e) {
   logger.warn('ℹ️ [orders] sse.mount KO (continuo senza SSE)', {
-    error: String(e && e.message || e),
+    error: String((e && e.message) || e),
   });
 }
 
@@ -1534,6 +1962,170 @@ router.get('/', async (req, res) => {
   }
 });
 
+// ============================================================================
+// 🆕 GET /api/orders/active-by-session?session_id=18
+//     - usa nfc_sessions.last_order_id se presente
+//     - altrimenti cerca l'ultimo ordine "aperto" per quel tavolo
+//       e fa backfill di last_order_id (best-effort)
+// ============================================================================
+
+router.get('/active-by-session', async (req, res) => {
+  try {
+    const raw = req.query.session_id || req.query.sessionId;
+    const sessionId = toNum(raw, 0);
+    if (!sessionId) {
+      return res.status(400).json({ ok: false, error: 'missing_session_id' });
+    }
+
+    // 🔎 Leggo dalla tabella REALE usata dal resto del BE: table_sessions
+    const rows = await query(
+      `SELECT id, table_id, last_order_id
+         FROM table_sessions
+        WHERE id = ?
+        LIMIT 1`,
+      [sessionId],
+    );
+
+    const session = rows && rows[0];
+    if (!session) {
+      logger.info('📭 [NFC] active-by-session: session non trovata', { sessionId });
+      // FE può distinguere con 404, ma di solito qui non ci arrivi se hai appena aperto la sessione
+      return res.status(404).json({ ok: false, error: 'session_not_found' });
+    }
+
+    let orderId = session.last_order_id ? Number(session.last_order_id) : null;
+    let order   = null;
+
+    // 1) Provo dal last_order_id
+    if (orderId) {
+      order = await getOrderFullById(orderId);
+      if (!order) {
+        logger.warn('📭 [NFC] active-by-session: last_order_id non valido', {
+          sessionId,
+          orderId,
+        });
+        orderId = null;
+      }
+    }
+
+    // 2) Se non ho ordine, provo dal tavolo (ultimo ordine "aperto")
+    if (!order) {
+      if (!session.table_id) {
+        logger.info('📭 [NFC] active-by-session: nessun table_id e nessun last_order', {
+          sessionId,
+        });
+        return res.status(200).json(null);
+      }
+
+      const ordRows = await query(
+        `SELECT id
+           FROM orders
+          WHERE table_id = ?
+            AND status IN ('pending','confirmed','preparing','ready')
+          ORDER BY id DESC
+          LIMIT 1`,
+        [session.table_id],
+      );
+
+      if (!ordRows || !ordRows[0]) {
+        logger.info('📭 [NFC] active-by-session: nessun ordine aperto per tavolo', {
+          sessionId,
+          table_id: session.table_id,
+        });
+        return res.status(200).json(null);
+      }
+
+      orderId = ordRows[0].id;
+      order   = await getOrderFullById(orderId);
+
+      // Backfill last_order_id best-effort su table_sessions
+      try {
+        await query(
+          `UPDATE table_sessions
+             SET last_order_id = ?, updated_at = UTC_TIMESTAMP()
+           WHERE id = ?`,
+          [orderId, sessionId],
+        );
+        logger.info('🔗 [NFC] backfill last_order_id da orders', {
+          sessionId,
+          orderId,
+          table_id: session.table_id,
+        });
+      } catch (e) {
+        logger.warn('⚠️ [NFC] backfill last_order_id KO (best-effort)', {
+          sessionId,
+          orderId,
+          error: String((e && e.message) || e),
+        });
+      }
+    }
+
+    if (!order) {
+      return res.status(200).json(null);
+    }
+
+    logger.info('📦 [NFC] active order by session', {
+      sessionId,
+      order_id: order.id,
+      table_id: order.table_id,
+    });
+
+    // Qui ritorniamo direttamente l'ordine "full"
+    res.json(order);
+  } catch (e) {
+    logger.error('📦 orders active-by-session ❌', { error: String(e) });
+    res.status(500).json({ ok: false, error: 'orders_active_by_session_error' });
+  }
+});
+
+// 🔎 Storico mandate / T1-Tn (order_batches)
+// Nota routing: deve stare PRIMA di "/:id(\\d+)".
+router.get('/:id(\\d+)/batches', async (req, res) => {
+  try {
+    const id = toNum(req.params.id);
+
+    const rows = await query(
+      `SELECT
+         b.id,
+         b.order_id,
+         b.batch_no,
+         b.sent_at,
+         b.sent_by,
+         b.note,
+         b.items_snapshot_json
+       FROM order_batches b
+       WHERE b.order_id = ?
+       ORDER BY b.batch_no ASC, b.id ASC`,
+      [id],
+    );
+
+    const mapped = (rows || []).map((r) => {
+      let items = null;
+      if (r.items_snapshot_json) {
+        try {
+          items = JSON.parse(r.items_snapshot_json);
+        } catch {
+          items = null;
+        }
+      }
+      return {
+        id       : r.id,
+        order_id : r.order_id,
+        batch_no : r.batch_no,
+        sent_at  : r.sent_at,
+        sent_by  : r.sent_by,
+        note     : r.note,
+        items,
+      };
+    });
+
+    res.json(mapped);
+  } catch (e) {
+    logger.error('📄 order_batches list ❌', { error: String(e) });
+    res.status(500).json({ ok: false, error: 'order_batches_list_error' });
+  }
+});
+
 // Dettaglio ordine "full"
 router.get('/:id(\\d+)', async (req, res) => {
   try {
@@ -1546,6 +2138,94 @@ router.get('/:id(\\d+)', async (req, res) => {
   } catch (e) {
     logger.error('📄 orders get ❌', { error: String(e) });
     res.status(500).json({ ok: false, error: 'orders_get_error' });
+  }
+});
+
+// ➕ Aggiunge righe ad un ordine esistente (Opzione B: T2/T3 lato BE)
+router.post('/:id(\\d+)/items', async (req, res) => {
+  try {
+    const id = toNum(req.params.id);
+    if (!id) {
+      return res.status(400).json({ ok: false, error: 'invalid_id' });
+    }
+
+    const dto = req.body || {};
+    const items = Array.isArray(dto.items) ? dto.items : [];
+
+    if (!items.length) {
+      return res.status(400).json({ ok: false, error: 'no_items' });
+    }
+
+    // Verifico che l'ordine esista
+    const existing = await query(
+      'SELECT id FROM orders WHERE id = ? LIMIT 1',
+      [id],
+    );
+    if (!existing || !existing[0]) {
+      return res.status(404).json({ ok: false, error: 'not_found' });
+    }
+
+    let inserted = 0;
+
+    for (const it of items) {
+      if (!it || typeof it !== 'object') continue;
+      const name = (it.name || '').toString().trim();
+      if (!name) continue;
+
+      await query(
+        `INSERT INTO order_items (
+           order_id,
+           product_id,
+           name,
+           qty,
+           price,
+           notes
+         )
+         VALUES (?,?,?,?,?,?)`,
+        [
+          id,
+          it.product_id != null ? it.product_id : null,
+          name,
+          toNum(it.qty, 1),
+          toNum(it.price),
+          it.notes || null,
+        ],
+      );
+      inserted += 1;
+    }
+
+    const newTotal = await recalcOrderTotal(id);
+    const full = await getOrderFullById(id);
+
+    try {
+      // uso emitStatus come "notifica generica" di aggiornamento ordine
+      sse.emitStatus({ id, status: full && full.status, total: newTotal });
+    } catch (e) {
+      logger.warn('🧵 SSE emitStatus (items) ⚠️', { error: String(e) });
+    }
+    try {
+      socketBus.broadcastUpdated(full);
+    } catch (e) {
+      logger.warn('📡 socket broadcastUpdated (items) ⚠️', { error: String(e) });
+    }
+
+    logger.info('➕ [orders] items added', {
+      id,
+      added: inserted,
+      total: newTotal,
+    });
+
+    res.status(201).json(full);
+  } catch (e) {
+    logger.error('➕ orders add-items ❌', {
+      error: String(e),
+      id   : toNum(req.params.id),
+    });
+    res.status(500).json({
+      ok    : false,
+      error : 'orders_add_items_error',
+      reason: String(e),
+    });
   }
 });
 
@@ -1580,7 +2260,7 @@ router.post('/', async (req, res) => {
       }
     } catch (e) {
       logger.warn('⚠️ [Orders] resolveCustomerUserId KO', {
-        error: String(e && e.message || e),
+        error: String((e && e.message) || e),
       });
     }
 
@@ -1609,7 +2289,7 @@ router.post('/', async (req, res) => {
       } catch (e) {
         logger.warn(
           '⚠️ [Orders] resolve table_id from reservation_id KO',
-          { error: String(e && e.message || e) },
+          { error: String((e && e.message) || e) },
         );
       }
     }
@@ -1670,6 +2350,16 @@ router.post('/', async (req, res) => {
 
     const full = await getOrderFullById(orderId);
 
+    // 🆕 Se arriva session_id dal FE (NFC), lego l'ordine alla sessione
+    const sessionId =
+      dto.session_id ||
+      dto.sessionId ||
+      null;
+
+    if (sessionId) {
+      await bindOrderToSession(toNum(sessionId, 0), orderId);
+    }
+
     // Notifiche SSE / Socket.IO (best-effort)
     try {
       sse.emitCreated(full);
@@ -1717,6 +2407,7 @@ router.patch('/:id(\\d+)/status', async (req, res) => {
       `UPDATE orders
          SET status = ?, updated_at = UTC_TIMESTAMP()
        WHERE id = ?`,
+
       [status, id],
     );
 
@@ -1740,7 +2431,7 @@ router.patch('/:id(\\d+)/status', async (req, res) => {
   }
 });
 
-// Stampa CONTO (best-effort)
+// Stampa CONTO (best-effort) + batch snapshot Tn
 router.post('/:id(\\d+)/print', async (req, res) => {
   try {
     const id = toNum(req.params.id);
@@ -1748,6 +2439,15 @@ router.post('/:id(\\d+)/print', async (req, res) => {
     if (!full) {
       return res.status(404).json({ ok: false, error: 'not_found' });
     }
+
+    // Tn: ogni volta che stampo il CONTO registro un batch
+    const sentBy =
+      (req.user && (req.user.email || req.user.username || req.user.id)) ||
+      null;
+    await createOrderBatchSnapshot(id, {
+      sentBy,
+      note: 'CONTO',
+    });
 
     try {
       await printOrderDual(full);
@@ -1796,6 +2496,15 @@ async function handlePrintComanda(req, res) {
         1,
       ),
     );
+
+    // Tn: ogni volta che invio COMANDA registro un batch
+    const sentBy =
+      (req.user && (req.user.email || req.user.username || req.user.id)) ||
+      null;
+    await createOrderBatchSnapshot(id, {
+      sentBy,
+      note: `COMANDA:${center}`,
+    });
 
     try {
       for (let i = 0; i < copies; i += 1) {
@@ -3453,17 +4162,17 @@ module.exports = function reqResLogger(req, res, next) {
 'use strict';
 
 const path = require('path');
-const fs   = require('fs');
+const fs = require('fs');
 const http = require('http');
 const express = require('express');
-const cors    = require('cors');
+const cors = require('cors');
 
-const env    = require('./env');
+const env = require('./env');
 const logger = require('./logger');
-const dbmod  = require('./db');
+const dbmod = require('./db');
 
 // === GOOGLE: nuovi router puliti ============================================
-const googleOauth  = require('./api/google/oauth');
+const googleOauth = require('./api/google/oauth');
 const googlePeople = require('./api/google/people');
 
 const app = express();
@@ -3484,7 +4193,7 @@ function ensureExists(relPath, friendlyName) {
     fs.existsSync(abs + '.js') ||
     fs.existsSync(path.join(abs, 'index.js'));
   if (!ok) logger.error(`❌ Manca il file ${friendlyName}:`, { expected: abs });
-  else     logger.info(`✅ Trovato ${friendlyName}`, { file: abs });
+  else logger.info(`✅ Trovato ${friendlyName}`, { file: abs });
   return ok;
 }
 
@@ -3495,17 +4204,29 @@ app.get('/api/ping', (_req, res) => {
 });
 
 // API core (tue)
-if (ensureExists('api/auth', 'API /api/auth')) app.use('/api/auth', require('./api/auth'));
-if (ensureExists('api/reservations', 'API /api/reservations')) app.use('/api/reservations', require('./api/reservations'));
-if (ensureExists('api/products', 'API /api/products')) app.use('/api/products', require('./api/products'));
-if (ensureExists('api/orders', 'API /api/orders')) app.use('/api/orders', require('./api/orders'));
-if (ensureExists('api/tables', 'API /api/tables')) app.use('/api/tables', require('./api/tables'));
-if (ensureExists('api/rooms', 'API /api/rooms')) app.use('/api/rooms', require('./api/rooms'));
-if (ensureExists('api/notifications', 'API /api/notifications')) app.use('/api/notifications', require('./api/notifications'));
+if (ensureExists('api/auth', 'API /api/auth'))
+  app.use('/api/auth', require('./api/auth'));
+if (ensureExists('api/reservations', 'API /api/reservations'))
+  app.use('/api/reservations', require('./api/reservations'));
+if (ensureExists('api/products', 'API /api/products'))
+  app.use('/api/products', require('./api/products'));
+if (ensureExists('api/orders', 'API /api/orders'))
+  app.use('/api/orders', require('./api/orders'));
+if (ensureExists('api/tables', 'API /api/tables'))
+  app.use('/api/tables', require('./api/tables'));
+if (ensureExists('api/rooms', 'API /api/rooms'))
+  app.use('/api/rooms', require('./api/rooms'));
+if (ensureExists('api/notifications', 'API /api/notifications'))
+  app.use('/api/notifications', require('./api/notifications'));
 
 // ✅ INGREDIENTI (già presenti)
-if (ensureExists('api/ingredients', 'API /api/ingredients')) app.use('/api/ingredients', require('./api/ingredients'));
-if (ensureExists('api/product_ingredients', 'API /api/product-ingredients')) app.use('/api/product-ingredients', require('./api/product_ingredients'));
+if (ensureExists('api/ingredients', 'API /api/ingredients'))
+  app.use('/api/ingredients', require('./api/ingredients'));
+if (ensureExists('api/product_ingredients', 'API /api/product-ingredients'))
+  app.use(
+    '/api/product-ingredients',
+    require('./api/product_ingredients'),
+  );
 
 /**
  * 🧹 GOOGLE – MOUNT PULITI
@@ -3517,38 +4238,60 @@ app.use('/api/google/oauth', googleOauth);
 app.use('/api/google/people', googlePeople);
 
 // 🆕 NFC API
-app.use('/api/nfc', require('./api/nfc'));
-// 🆕 NFC Session API (ultimo ordine per sessione)
-app.use('/api/nfc/session', require('./api/nfc-session')); // <— AGGIUNTA
-if (ensureExists('api/customers', 'API /api/customers')) app.use('/api/customers', require('./api/customers')(app));
+if (ensureExists('api/nfc', 'API /api/nfc'))
+  app.use('/api/nfc', require('./api/nfc'));
 
+// 🆕 NFC Session API (ultimo ordine per sessione + chiusura by id)
+if (ensureExists('api/nfc-session', 'API /api/nfc-session')) {
+  // NB: path REST: /api/nfc/session/...
+  app.use('/api/nfc/session', require('./api/nfc-session'));
+}
+
+if (ensureExists('api/customers', 'API /api/customers'))
+  app.use('/api/customers', require('./api/customers')(app));
 
 // Health
-if (ensureExists('api/health', 'API /api/health')) app.use('/api/health', require('./api/health'));
+if (ensureExists('api/health', 'API /api/health'))
+  app.use('/api/health', require('./api/health'));
 
 // (Eventuali) Socket.IO
 const { Server } = require('socket.io');
-const io = new Server(server, { path: '/socket.io', cors: { origin: true, credentials: true } });
+const io = new Server(server, {
+  path: '/socket.io',
+  cors: { origin: true, credentials: true },
+});
 if (ensureExists('sockets/index', 'Sockets entry')) {
   require('./sockets/index')(io);
 } else {
-  logger.warn('⚠️ sockets/index non trovato: i socket non saranno gestiti');
-  io.on('connection', (s) => logger.info('🔌 socket connected (fallback)', { id: s.id }));
+  logger.warn(
+    '⚠️ sockets/index non trovato: i socket non saranno gestiti',
+  );
+  io.on('connection', (s) =>
+    logger.info('🔌 socket connected (fallback)', { id: s.id }),
+  );
 }
 
 // (Facoltativi) Schema check / Migrations
 if (ensureExists('db/schema-check', 'Schema checker')) {
   const { runSchemaCheck } = require('./db/schema-check');
-  runSchemaCheck().catch(err => logger.error('❌ Schema check failed', { error: String(err) }));
+  runSchemaCheck().catch((err) =>
+    logger.error('❌ Schema check failed', { error: String(err) }),
+  );
 }
 if (ensureExists('db/migrator', 'DB migrator')) {
   const { runMigrations } = require('./db/migrator');
   runMigrations()
     .then(() => logger.info('🧰 MIGRATIONS ✅ all applied'))
-    .catch((e) => logger.error('❌ Startup failed (migrations)', { error: String(e) }));
+    .catch((e) =>
+      logger.error('❌ Startup failed (migrations)', {
+        error: String(e),
+      }),
+    );
 }
 
-server.listen(env.PORT, () => logger.info(`🚀 HTTP listening on :${env.PORT}`));
+server.listen(env.PORT, () =>
+  logger.info(`🚀 HTTP listening on :${env.PORT}`),
+);
 ```
 
 ### ./src/services/google.service.js
@@ -3937,19 +4680,21 @@ module.exports = {
 // - generateToken / bindTable / revokeToken
 // - resolveToken(token): prima verifica su nfc_tags, poi JOIN per meta tavolo
 // - sessione tavolo (table_sessions)
+// - 🧲 closeSessionById: chiusura sessione per id (API /api/nfc/session/:id/close)
 // Stile: commenti lunghi + log con emoji
 // ============================================================================
 
 const crypto = require('crypto');
-const { query } = require('../db');      // wrapper mysql2
-const logger   = require('../logger');
+const { query } = require('../db'); // wrapper mysql2
+const logger = require('../logger');
 
-const TABLE    = 'nfc_tags';
+const TABLE = 'nfc_tags';
 const TABLE_TS = 'table_sessions';
 
 // ----------------------------- utils ----------------------------------------
 function base62(bytes = 9) {
-  const alphabet = '0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ';
+  const alphabet =
+    '0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ';
   const buf = crypto.randomBytes(bytes);
   let out = '';
   for (let i = 0; i < buf.length; i++) out += alphabet[buf[i] % alphabet.length];
@@ -3968,7 +4713,8 @@ async function getActiveByTable(tableId) {
        FROM ${TABLE}
       WHERE table_id=? AND is_revoked=0
    ORDER BY id DESC
-      LIMIT 1`, [tableId]
+      LIMIT 1`,
+    [tableId],
   );
   return rows[0] || null;
 }
@@ -3976,7 +4722,7 @@ async function getActiveByTable(tableId) {
 async function insertToken(tableId, token) {
   await query(
     `INSERT INTO ${TABLE} (table_id, token, is_revoked) VALUES (?, ?, 0)`,
-    [tableId, token]
+    [tableId, token],
   );
   return token;
 }
@@ -3986,7 +4732,7 @@ async function revokeByTable(tableId) {
     `UPDATE ${TABLE}
         SET is_revoked=1, revoked_at=NOW()
       WHERE table_id=? AND is_revoked=0`,
-    [tableId]
+    [tableId],
   );
 }
 
@@ -3997,21 +4743,30 @@ async function bindTable(tableId, opts = {}) {
   if (!forceNew) {
     const current = await getActiveByTable(tableId);
     if (current) {
-      logger.info(`🔗 [NFC] Token esistente per table_id=${tableId} → ${current.token}`);
+      logger.info(
+        `🔗 [NFC] Token esistente per table_id=${tableId} → ${current.token}`,
+      );
       return current.token;
     }
   }
   if (forceNew) {
-    logger.warn(`♻️ [NFC] Rigenerazione token per table_id=${tableId} (revoca precedenti)`);
+    logger.warn(
+      `♻️ [NFC] Rigenerazione token per table_id=${tableId} (revoca precedenti)`,
+    );
     await revokeByTable(tableId);
   }
 
   let token = generateToken(12);
   for (let i = 0; i < 5; i++) {
-    try { await insertToken(tableId, token); return token; }
-    catch (err) {
+    try {
+      await insertToken(tableId, token);
+      return token;
+    } catch (err) {
       const msg = String(err?.message || '');
-      if (msg.includes('ER_DUP_ENTRY')) { token = generateToken(12); continue; }
+      if (msg.includes('ER_DUP_ENTRY')) {
+        token = generateToken(12);
+        continue;
+      }
       throw err;
     }
   }
@@ -4024,14 +4779,17 @@ async function revokeToken(token) {
     `UPDATE ${TABLE}
         SET is_revoked=1, revoked_at=NOW()
       WHERE token=? AND is_revoked=0`,
-    [token]
+    [token],
   );
   return { ok: true };
 }
 
 function buildPublicUrl(token, req) {
-  const base = process.env.PUBLIC_BASE_URL
-    || `${req?.protocol || 'http'}://${req?.get ? req.get('host') : 'localhost:3000'}`;
+  const base =
+    process.env.PUBLIC_BASE_URL ||
+    `${req?.protocol || 'http'}://${
+      req?.get ? req.get('host') : 'localhost:3000'
+    }`;
   return `${base.replace(/\/+$/, '')}/t/${encodeURIComponent(token)}`;
 }
 
@@ -4043,17 +4801,19 @@ async function getActiveSession(tableId) {
       WHERE table_id=? AND closed_at IS NULL
    ORDER BY id DESC
       LIMIT 1`,
-    [tableId]
+    [tableId],
   );
   return rows?.[0] || null;
 }
 async function openSession(tableId, { by, note } = {}) {
   const res = await query(
     `INSERT INTO ${TABLE_TS} (table_id, opened_by, note) VALUES (?,?,?)`,
-    [tableId, by || null, note || null]
+    [tableId, by || null, note || null],
   );
   const id = res?.insertId || null;
-  logger.info(`🟢 [NFC] Sessione APERTA table_id=${tableId} (session_id=${id})`);
+  logger.info(
+    `🟢 [NFC] Sessione APERTA table_id=${tableId} (session_id=${id})`,
+  );
   return id;
 }
 async function closeActiveSession(tableId, { by, reason } = {}) {
@@ -4063,11 +4823,62 @@ async function closeActiveSession(tableId, { by, reason } = {}) {
     `UPDATE ${TABLE_TS}
         SET closed_at = NOW(), closed_by = ?
       WHERE id = ? AND closed_at IS NULL`,
-    [by || reason || null, act.id]
+    [by || reason || null, act.id],
   );
-  logger.info(`🔴 [NFC] Sessione CHIUSA table_id=${tableId} (session_id=${act.id})`);
+  logger.info(
+    `🔴 [NFC] Sessione CHIUSA table_id=${tableId} (session_id=${act.id})`,
+  );
   return { closed: 1, session_id: act.id };
 }
+
+/**
+ * 🧲 closeSessionById
+ * ----------------------------------------------------------------------------
+ * Chiusura sessione per ID (usato da API tipo: PUT /api/nfc/session/:id/close).
+ * - Non richiede il table_id a chiamata
+ * - È best-effort: se la sessione è già chiusa, non lancia errore.
+ */
+async function closeSessionById(sessionId, { by, reason } = {}) {
+  if (!sessionId) throw new Error('session_id mancante');
+
+  const rows = await query(
+    `SELECT id, table_id, opened_at, closed_at
+       FROM ${TABLE_TS}
+      WHERE id = ?
+      LIMIT 1`,
+    [sessionId],
+  );
+  const s = rows?.[0];
+  if (!s) {
+    logger.warn('🧲 [NFC] closeSessionById: sessione non trovata', {
+      session_id: sessionId,
+    });
+    return { closed: 0 };
+  }
+
+  if (s.closed_at) {
+    logger.info('🧲 [NFC] closeSessionById: sessione già chiusa', {
+      session_id: sessionId,
+      table_id: s.table_id,
+    });
+    return { closed: 0, session_id: s.id, already_closed: true };
+  }
+
+  await query(
+    `UPDATE ${TABLE_TS}
+        SET closed_at = NOW(), closed_by = ?
+      WHERE id = ? AND closed_at IS NULL`,
+    [by || reason || null, sessionId],
+  );
+
+  logger.info('🔴 [NFC] Sessione CHIUSA (by id)', {
+    session_id: sessionId,
+    table_id: s.table_id,
+  });
+
+  return { closed: 1, session_id: sessionId, table_id: s.table_id };
+}
+
 async function ensureSession(tableId, { ttlHours = 6, by } = {}) {
   const act = await getActiveSession(tableId);
   if (act) {
@@ -4084,42 +4895,57 @@ async function resolveToken(token) {
   if (!token) throw new Error('token mancante');
 
   // 1) esiste in nfc_tags (non revocato)?
-  const tag = (await query(
-    `SELECT id, table_id
+  const tag = (
+    await query(
+      `SELECT id, table_id
        FROM ${TABLE}
       WHERE token = ? AND is_revoked = 0
       LIMIT 1`,
-    [token]
-  ))?.[0];
+      [token],
+    )
+  )?.[0];
 
-  logger.info('🔎 [NFC] resolve.check', { token, found: !!tag, table_id: tag?.table_id });
+  logger.info('🔎 [NFC] resolve.check', {
+    token,
+    found: !!tag,
+    table_id: tag?.table_id,
+  });
 
-  if (!tag) return null;                      // ← 404 not_found_or_revoked
+  if (!tag) return null; // ← 404 not_found_or_revoked
 
   // 2) meta tavolo (JOIN) — usa table_number
-  const meta = (await query(
-    `SELECT t.table_number, t.room_id, r.name AS room_name
+  const meta =
+    (
+      await query(
+        `SELECT t.table_number, t.room_id, r.name AS room_name
        FROM tables t
   LEFT JOIN rooms  r ON r.id = t.room_id
       WHERE t.id = ?
       LIMIT 1`,
-    [tag.table_id]
-  ))?.[0] || {};
+        [tag.table_id],
+      )
+    )?.[0] || {};
 
   // 3) prenotazione odierna
-  const resv = (await query(
-    `SELECT id FROM reservations
+  const resv =
+    (
+      await query(
+        `SELECT id FROM reservations
       WHERE table_id = ?
         AND status IN ('pending','accepted')
         AND start_at >= UTC_DATE()
         AND start_at <  (UTC_DATE() + INTERVAL 1 DAY)
       ORDER BY start_at ASC
       LIMIT 1`,
-    [tag.table_id]
-  ))?.[0] || null;
+        [tag.table_id],
+      )
+    )?.[0] || null;
 
   // 4) assicura sessione
-  const session_id = await ensureSession(tag.table_id, { ttlHours: 6, by: 'nfc/resolve' });
+  const session_id = await ensureSession(tag.table_id, {
+    ttlHours: 6,
+    by: 'nfc/resolve',
+  });
 
   return {
     ok: true,
@@ -4135,12 +4961,15 @@ async function resolveToken(token) {
 // ------------------------------ cart snapshot --------------------------------
 async function getSessionCart(sessionId) {
   if (!sessionId) throw new Error('session_id mancante');
-  const s = (await query(
-    `SELECT id, closed_at, cart_json, cart_version, cart_updated_at
+  const s =
+    (
+      await query(
+        `SELECT id, closed_at, cart_json, cart_version, cart_updated_at
        FROM ${TABLE_TS}
       WHERE id=? LIMIT 1`,
-    [sessionId]
-  ))?.[0];
+        [sessionId],
+      )
+    )?.[0];
   if (!s) return null;
   return {
     id: s.id,
@@ -4157,11 +4986,15 @@ async function saveSessionCart(sessionId, version, cartObj) {
     `UPDATE ${TABLE_TS}
         SET cart_json = ?, cart_version = cart_version + 1, cart_updated_at = NOW()
       WHERE id = ? AND closed_at IS NULL AND cart_version = ?`,
-    [cartJson, sessionId, Number(version || 0)]
+    [cartJson, sessionId, Number(version || 0)],
   );
   if (Number(res?.affectedRows || 0) === 1) {
     const cur = await getSessionCart(sessionId);
-    return { ok: true, version: cur?.version ?? 0, updated_at: cur?.cart_updated_at ?? null };
+    return {
+      ok: true,
+      version: cur?.version ?? 0,
+      updated_at: cur?.cart_updated_at ?? null,
+    };
   }
   const current = await getSessionCart(sessionId);
   const err = new Error('version_conflict');
@@ -4183,6 +5016,7 @@ module.exports = {
   getActiveSession,
   openSession,
   closeActiveSession,
+  closeSessionById,
   ensureSession,
   // Cart
   getSessionCart,
@@ -4496,6 +5330,7 @@ module.exports = { printOrderSplitByCategory };
 //   GET    /api/orders                         → lista (filtri: status|hours|from|to|q)
 //   GET    /api/orders/:id                     → dettaglio (header + items + categoria)
 //   POST   /api/orders                         → crea ordine + items
+//   POST   /api/orders/:id/items               → aggiunge righe ad un ordine esistente
 //   PATCH  /api/orders/:id/status              → cambio stato (emette SSE "status")
 //   POST   /api/orders/:id/print               → stampa comande (PIZZERIA/CUCINA)
 //   POST   /api/orders/print                   → compat: body { id }
@@ -4562,6 +5397,29 @@ async function loadHeader(orderId, conn) {
   if (!rows.length) return null;
   const h = rows[0];
   return { ...h, total: h.total != null ? Number(h.total) : null };
+}
+
+/**
+ * Ricalcola il totale di un ordine sulla base di order_items.
+ * Se viene passato un connection, usa quella transazionale.
+ */
+async function recalcOrderTotal(orderId, conn) {
+  const sql = `
+    SELECT IFNULL(SUM(i.qty * i.price), 0) AS total
+    FROM order_items i
+    WHERE i.order_id = ?
+  `;
+  const [rows] = await (conn || pool).query(sql, [orderId]);
+  const total = rows.length ? Number(rows[0].total || 0) : 0;
+
+  await (conn || pool).query(
+    `UPDATE orders
+       SET total = ?, updated_at = NOW()
+     WHERE id = ?`,
+    [total, orderId],
+  );
+
+  return total;
 }
 
 /** Stampa via TCP 9100 (ESC/POS) */
@@ -4674,6 +5532,85 @@ router.get('/:id(\\d+)', async (req, res) => {
   }
 });
 
+// ➕ Aggiunge righe ad un ordine esistente (compat con Opzione B)
+router.post('/:id(\\d+)/items', async (req, res) => {
+  const id = Number(req.params.id);
+  if (!id) return res.status(400).json({ ok: false, error: 'invalid_id' });
+
+  const body = req.body || {};
+  const items = Array.isArray(body.items) ? body.items : [];
+  if (!items.length) {
+    return res.status(400).json({ ok: false, error: 'no_items' });
+  }
+
+  const conn = await pool.getConnection();
+  try {
+    await conn.beginTransaction();
+
+    const [exists] = await conn.query(
+      'SELECT id FROM orders WHERE id = ? LIMIT 1',
+      [id],
+    );
+    if (!exists.length) {
+      await conn.rollback();
+      conn.release();
+      return res.status(404).json({ ok: false, error: 'not_found' });
+    }
+
+    let inserted = 0;
+
+    for (const it of items) {
+      if (!it || typeof it !== 'object') continue;
+      const name = String(it.name || '').trim();
+      if (!name) continue;
+
+      await conn.query(
+        `INSERT INTO order_items (order_id, product_id, name, qty, price, notes, created_at)
+         VALUES (?,?,?,?,?,?,NOW())`,
+        [
+          id,
+          it.product_id ?? null,
+          name,
+          it.qty ?? 1,
+          it.price ?? 0,
+          it.notes ?? null,
+        ],
+      );
+      inserted += 1;
+    }
+
+    const total = await recalcOrderTotal(id, conn);
+
+    await conn.commit();
+
+    const header = await loadHeader(id, conn);
+    const details = await loadItems(id, conn);
+    const full = { ...header, items: details };
+
+    // riuso evento "status" come "ordine aggiornato"
+    bus.emit('status', { id, status: full.status });
+
+    log.info('➕ ORDERS.addItems ✅', {
+      service: 'server',
+      id,
+      added : inserted,
+      total,
+    });
+
+    res.status(201).json(full);
+  } catch (err) {
+    await conn.rollback();
+    log.error('➕ ORDERS.addItems ❌', {
+      service: 'server',
+      error  : String(err),
+      id,
+    });
+    res.status(500).json({ ok: false, error: 'orders_add_items_error', reason: String(err) });
+  } finally {
+    conn.release();
+  }
+});
+
 // Crea ordine
 router.post('/', async (req, res) => {
   const body = req.body || {};
@@ -4711,8 +5648,8 @@ router.post('/', async (req, res) => {
     );
     const orderId = r.insertId;
 
-    const items = Array.isArray(body.items) ? body.items : [];
-    for (const it of items) {
+    const itemsBody = Array.isArray(body.items) ? body.items : [];
+    for (const it of itemsBody) {
       await conn.query(
         `INSERT INTO order_items (order_id, product_id, name, qty, price, notes, created_at)
          VALUES (?,?,?,?,?,?,NOW())`,
@@ -4725,7 +5662,7 @@ router.post('/', async (req, res) => {
     const full = { ...(await loadHeader(orderId, conn)), items: await loadItems(orderId, conn) };
     bus.emit('created', { id: full.id, status: full.status });
 
-    log.info('🧾 ORDERS.create ✅', { service: 'server', id: orderId, items: items.length });
+    log.info('🧾 ORDERS.create ✅', { service: 'server', id: orderId, items: itemsBody.length });
     res.status(201).json(full);
   } catch (err) {
     await conn.rollback();
