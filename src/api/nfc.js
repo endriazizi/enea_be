@@ -197,4 +197,31 @@ router.post('/session/close', async (req, res) => {
   }
 });
 
+// 🆕 POST /api/nfc/session/open { table_id, by? } → { ok:true, session_id }
+router.post('/session/open', async (req, res) => {
+  try {
+    const table_id = Number(req.body?.table_id || 0);
+    const by = (req.body?.by || 'api/nfc/session/open').toString();
+    if (!table_id) return res.status(400).json({ ok: false, error: 'table_id mancante' });
+
+    // use ensureSession to respect TTL logic and avoid duplicate open rows
+    const session_id = await NFC.ensureSession(table_id, { by, ttlHours: 6 });
+
+    logger.info(`🟢 [API] open session table_id=${table_id} → session_id=${session_id}`);
+
+    // Broadcast new session (best-effort)
+    try {
+      const io = getIO(req);
+      if (io && session_id) io.emit('nfc:session_opened', { table_id, session_id });
+    } catch (e) {
+      logger.warn('⚠️ [API] nfc session open broadcast KO', { error: String(e) });
+    }
+
+    res.json({ ok: true, session_id });
+  } catch (err) {
+    logger.error('❌ [API] /nfc/session/open', { error: String(err) });
+    res.status(500).json({ ok: false, error: err?.message || 'internal_error' });
+  }
+});
+
 module.exports = router;

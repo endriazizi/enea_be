@@ -31,6 +31,20 @@ const router  = express.Router();
 const logger = require('../logger');
 const { query } = require('../db');
 
+// === requireAuth con fallback DEV ============================================
+let requireAuth;
+try {
+  ({ requireAuth } = require('../middleware/auth'));
+  if (typeof requireAuth !== 'function') throw new Error('requireAuth non è una funzione');
+  logger.info('🔐 requireAuth caricato da ../middleware/auth');
+} catch {
+  logger.warn('⚠️ requireAuth non disponibile. Uso FALLBACK DEV (solo locale).');
+  requireAuth = (req, _res, next) => {
+    req.user = { id: 0, email: process.env.AUTH_DEV_USER || 'dev@local' };
+    next();
+  };
+}
+
 // ============================================================================
 // Moduli opzionali: SSE, Socket.IO, stampa, customers.resolve
 // ============================================================================
@@ -342,6 +356,168 @@ async function recalcOrderTotal(orderId) {
   );
 
   return total;
+}
+
+// ============================================================================
+// 🆕 Modello professionale — helper per qty negative / correzioni
+// ============================================================================
+
+/**
+ * Costruisce una mappa { `${name}@@${price}` -> agg_qty } per tutte
+ * le voci che hanno almeno una riga con qty negativa nel batch items.
+ *
+ * Usiamo una singola query su order_items per recuperare la qty "base"
+ * attuale in DB per ciascuna combinazione (name, price).
+ *
+ * @param {number} orderId
+ * @param {Array<{ name:string, price:number, qty:number }>} items
+ * @returns {Promise<Map<string, number>>}
+ */
+async function buildBaseQtyMapForCorrections(orderId, items) {
+  const negativeKeys = [];
+  const seen = new Set();
+
+  for (const raw of items || []) {
+    const qty = Number(raw && raw.qty);
+    if (!Number.isFinite(qty) || qty >= 0) continue;
+
+    const name = (raw.name || '').toString().trim();
+    if (!name) continue;
+
+    const priceNum = Number(raw.price || 0);
+    const key = `${name}@@${priceNum.toFixed(2)}`;
+
+    if (seen.has(key)) continue;
+    seen.add(key);
+    negativeKeys.push({ name, price: priceNum, key });
+  }
+
+  const baseMap = new Map();
+  if (!negativeKeys.length) {
+    return baseMap; // nessuna qty negativa → niente query DB
+  }
+
+  const params = [orderId];
+  const conds  = [];
+
+  for (const nk of negativeKeys) {
+    conds.push('(oi.name = ? AND oi.price = ?)');
+    params.push(nk.name, nk.price);
+  }
+
+  const sql = `
+    SELECT
+      oi.name,
+      oi.price,
+      IFNULL(SUM(oi.qty), 0) AS agg_qty
+    FROM order_items oi
+    WHERE oi.order_id = ?
+      AND (${conds.join(' OR ')})
+    GROUP BY oi.name, oi.price
+  `;
+
+  const rows = await query(sql, params);
+
+  for (const r of rows || []) {
+    const name      = (r.name || '').toString().trim();
+    const priceNum  = Number(r.price || 0);
+    const key       = `${name}@@${priceNum.toFixed(2)}`;
+    const aggQtyNum = Number(r.agg_qty || 0);
+    baseMap.set(key, aggQtyNum);
+  }
+
+  return baseMap;
+}
+
+/**
+ * Valida un batch di righe (positive e negative) prima dell'insert.
+ *
+ * Regole:
+ * - se una correzione (qty < 0) si riferisce ad una combinazione (name,price)
+ *   che NON esiste in DB → errore qty_under_zero
+ * - se applicando i delta la qty aggregata andasse sotto zero → errore qty_under_zero
+ *
+ * Se tutto ok, non ritorna nulla.
+ *
+ * @param {number} orderId
+ * @param {Array<{ name:string, price:number, qty:number }>} items
+ * @throws {Error & { status?:number, code?:string, payload?:any }}
+ */
+async function validateItemDeltas(orderId, items) {
+  if (!Array.isArray(items) || !items.length) return;
+
+  const baseMap = await buildBaseQtyMapForCorrections(orderId, items);
+  const aggMap  = new Map(baseMap);
+
+  for (const item of items) {
+    const name = (item.name || '').toString().trim();
+    const priceNum = Number(item.price || 0);
+    const deltaQty = Number(item.qty || 0);
+
+    if (!deltaQty) continue; // qty = 0 non influenza niente
+
+    const key = `${name}@@${priceNum.toFixed(2)}`;
+
+    // Caso: correzione su voce non presente in DB → partiamo da 0, ma è già errore
+    if (deltaQty < 0 && !baseMap.has(key)) {
+      const baseQty  = 0;
+      const aggAfter = baseQty + deltaQty;
+
+      logger.warn('⚠️ [orders] correzione su voce inesistente', {
+        order_id : orderId,
+        name,
+        price    : priceNum,
+        base_qty : baseQty,
+        delta_qty: deltaQty,
+        agg_after: aggAfter,
+      });
+
+      const err = new Error('qty_under_zero');
+      err.status  = 400;
+      err.code    = 'qty_under_zero';
+      err.payload = {
+        name,
+        price    : priceNum,
+        base_qty : baseQty,
+        delta_qty: deltaQty,
+        agg_after: aggAfter,
+      };
+      throw err;
+    }
+
+    const prevQty = Number(
+      aggMap.has(key)
+        ? aggMap.get(key)
+        : (baseMap.get(key) ?? 0),
+    );
+    const nextQty = prevQty + deltaQty;
+
+    if (nextQty < 0) {
+      logger.warn('⚠️ [orders] correzione porterebbe qty sotto zero', {
+        order_id : orderId,
+        name,
+        price    : priceNum,
+        base_qty : prevQty,
+        delta_qty: deltaQty,
+        agg_after: nextQty,
+      });
+
+      const err = new Error('qty_under_zero');
+      err.status  = 400;
+      err.code    = 'qty_under_zero';
+      err.payload = {
+        name,
+        price    : priceNum,
+        base_qty : prevQty,
+        delta_qty: deltaQty,
+        agg_after: nextQty,
+      };
+      throw err;
+    }
+
+    // Aggiorno qty "virtuale" dopo il delta
+    aggMap.set(key, nextQty);
+  }
 }
 
 // ============================================================================
@@ -750,15 +926,17 @@ router.get('/:id(\\d+)', async (req, res) => {
   }
 });
 
-// ➕ Aggiunge righe ad un ordine esistente (Opzione B: T2/T3 lato BE)
+// ➕ Aggiunge righe ad un ordine esistente (T2/T3 lato BE + correzioni qty negative)
 router.post('/:id(\\d+)/items', async (req, res) => {
+  const log = req.app.get('logger') || logger;
+
   try {
     const id = toNum(req.params.id);
     if (!id) {
       return res.status(400).json({ ok: false, error: 'invalid_id' });
     }
 
-    const dto = req.body || {};
+    const dto   = req.body || {};
     const items = Array.isArray(dto.items) ? dto.items : [];
 
     if (!items.length) {
@@ -774,14 +952,47 @@ router.post('/:id(\\d+)/items', async (req, res) => {
       return res.status(404).json({ ok: false, error: 'not_found' });
     }
 
-    let inserted = 0;
-
+    // Normalizzazione:
+    // - trim name
+    // - qty numerica (qty=0 scartata)
+    // - price numerico
+    const normalized = [];
     for (const it of items) {
       if (!it || typeof it !== 'object') continue;
+
       const name = (it.name || '').toString().trim();
       if (!name) continue;
 
-      await query(
+      const qty = toNum(it.qty, 0);
+      if (!qty) continue; // qty = 0 → non ha effetto
+
+      const priceNum = toNum(it.price, 0);
+
+      normalized.push({
+        product_id: it.product_id != null ? it.product_id : null,
+        name,
+        qty,
+        price: priceNum,
+        notes: it.notes || null,
+      });
+    }
+
+    if (!normalized.length) {
+      return res.status(400).json({ ok: false, error: 'no_items' });
+    }
+
+    const hasCorrections = normalized.some((it) => it.qty < 0);
+
+    // 🧮 Validazione "modello professionale" per qty negative
+    if (hasCorrections) {
+      await validateItemDeltas(id, normalized);
+    }
+
+    let insertedRows = 0;
+
+    // INSERT riga-per-riga (volumi contenuti, leggibile)
+    for (const it of normalized) {
+      const result = await query(
         `INSERT INTO order_items (
            order_id,
            product_id,
@@ -793,21 +1004,37 @@ router.post('/:id(\\d+)/items', async (req, res) => {
          VALUES (?,?,?,?,?,?)`,
         [
           id,
-          it.product_id != null ? it.product_id : null,
-          name,
-          toNum(it.qty, 1),
-          toNum(it.price),
-          it.notes || null,
+          it.product_id,
+          it.name,
+          it.qty,
+          it.price,
+          it.notes,
         ],
       );
-      inserted += 1;
+      insertedRows += Number(result && result.affectedRows || 0);
+
+      if (it.qty < 0) {
+        log.info('➖ [orders] correction line', {
+          order_id : id,
+          base_name: it.name,
+          delta_qty: it.qty,
+          price    : it.price,
+        });
+      } else {
+        log.info('➕ [orders] add item line', {
+          order_id: id,
+          name    : it.name,
+          qty     : it.qty,
+          price   : it.price,
+        });
+      }
     }
 
     const newTotal = await recalcOrderTotal(id);
-    const full = await getOrderFullById(id);
+    const full     = await getOrderFullById(id);
 
+    // Notifiche SSE / Socket.IO (come prima)
     try {
-      // uso emitStatus come "notifica generica" di aggiornamento ordine
       sse.emitStatus({ id, status: full && full.status, total: newTotal });
     } catch (e) {
       logger.warn('🧵 SSE emitStatus (items) ⚠️', { error: String(e) });
@@ -818,17 +1045,35 @@ router.post('/:id(\\d+)/items', async (req, res) => {
       logger.warn('📡 socket broadcastUpdated (items) ⚠️', { error: String(e) });
     }
 
-    logger.info('➕ [orders] items added', {
+    log.info('➕ [orders] items added (modello professionale)', {
       id,
-      added: inserted,
-      total: newTotal,
+      lines         : normalized.length,
+      inserted_rows : insertedRows,
+      total         : newTotal,
+      has_corrections: hasCorrections,
     });
 
+    // Manteniamo la risposta compatibile: ritorniamo l'ordine "full"
     res.status(201).json(full);
   } catch (e) {
+    const id = toNum(req.params.id);
+
+    // Caso specifico: qty_under_zero (violazione regole correzioni)
+    if (e && e.code === 'qty_under_zero') {
+      logger.warn('⚠️ orders add-items — qty_under_zero', {
+        id,
+        detail: e.payload || null,
+      });
+      return res.status(e.status || 400).json({
+        ok    : false,
+        error : 'qty_under_zero',
+        detail: e.payload || null,
+      });
+    }
+
     logger.error('➕ orders add-items ❌', {
       error: String(e),
-      id   : toNum(req.params.id),
+      id,
     });
     res.status(500).json({
       ok    : false,
@@ -1037,6 +1282,48 @@ router.patch('/:id(\\d+)/status', async (req, res) => {
   } catch (e) {
     logger.error('✏️ orders status ❌', { error: String(e) });
     res.status(500).json({ ok: false, error: 'orders_status_error' });
+  }
+});
+
+// Elimina ordine (protetto)
+router.delete('/:id(\\d+)', requireAuth, async (req, res) => {
+  try {
+    const id = toNum(req.params.id);
+
+    const rows = await query('SELECT id FROM orders WHERE id = ? LIMIT 1', [id]);
+    if (!rows || !rows[0]) {
+      return res.status(404).json({ ok: false, error: 'not_found' });
+    }
+
+    // Best-effort: rimuoviamo righe / batches e testa ordine.
+    // Nota: questa è una cancellazione hard; se preferisci soft-delete
+    // possiamo invece aggiornare lo status a 'cancelled' o 'deleted'.
+    try {
+      await query('DELETE FROM order_items WHERE order_id = ?', [id]);
+      await query('DELETE FROM order_batches WHERE order_id = ?', [id]);
+      await query('DELETE FROM orders WHERE id = ?', [id]);
+    } catch (e) {
+      logger.warn('⚠️ orders delete inner queries KO', { id, error: String(e) });
+      return res.status(500).json({ ok: false, error: 'orders_delete_error', reason: String(e) });
+    }
+
+    // Notify SSE / Socket.IO (best-effort)
+    try {
+      sse.emitStatus({ id, status: 'deleted' });
+    } catch (e) {
+      logger.warn('🧵 SSE emitStatus (deleted) ⚠️', { error: String(e) });
+    }
+    try {
+      socketBus.broadcastUpdated({ id, deleted: true });
+    } catch (e) {
+      logger.warn('📡 socket broadcastUpdated (deleted) ⚠️', { error: String(e) });
+    }
+
+    logger.info('🗑️ orders delete OK', { id });
+    return res.json({ ok: true });
+  } catch (e) {
+    logger.error('🗑️ orders delete ❌', { error: String(e) });
+    return res.status(500).json({ ok: false, error: 'orders_delete_error' });
   }
 });
 
