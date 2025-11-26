@@ -268,6 +268,27 @@ async function resolveToken(token) {
     )?.[0] || null;
 
   // 4) assicura sessione
+  // check whether this table is enabled for sessions
+  const stateRow = (
+    await query(
+      `SELECT enabled FROM nfc_table_state WHERE table_id = ? LIMIT 1`,
+      [tag.table_id],
+    )
+  )?.[0];
+  const enabled = stateRow ? Number(stateRow.enabled || 0) === 1 : true;
+
+  if (!enabled) {
+    logger.info('🔒 [NFC] token resolved but table disabled', { token, table_id: tag.table_id });
+    return {
+      ok: false,
+      disabled: true,
+      table_id: tag.table_id,
+      table_number: meta.table_number ?? null,
+      room_id: meta.room_id ?? null,
+      room_name: meta.room_name ?? null,
+    };
+  }
+
   const session_id = await ensureSession(tag.table_id, {
     ttlHours: 6,
     by: 'nfc/resolve',

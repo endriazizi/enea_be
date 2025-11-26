@@ -9,6 +9,7 @@ const express = require('express');
 const router  = express.Router();
 const NFC     = require('../services/nfc.service');
 const logger  = require('../logger');
+const { query } = require('../db');
 
 // Helper per ottenere io: preferisci req.app.get('io'), fallback al singleton
 function getIO(req) {
@@ -225,3 +226,62 @@ router.post('/session/open', async (req, res) => {
 });
 
 module.exports = router;
+
+// -------------------------- Table state endpoints -------------------------
+// POST /api/nfc/table/:tableId/disable  -> { ok:true }
+// POST /api/nfc/table/:tableId/enable   -> { ok:true }
+// GET  /api/nfc/table-states            -> [{ table_id, enabled, updated_at }, ...]
+
+router.post('/table/:tableId/disable', async (req, res) => {
+  try {
+    const tableId = Number(req.params.tableId || 0) || 0;
+    logger.info(`🔔 [API] /nfc/table/${tableId}/disable called`, { service: 'server', tableId });
+    if (!tableId) return res.status(400).json({ ok: false, error: 'tableId missing' });
+
+    // upsert into nfc_table_state
+    await query(
+      `INSERT INTO nfc_table_state (table_id, enabled, updated_at) VALUES (?, 0, UTC_TIMESTAMP()) ON DUPLICATE KEY UPDATE enabled=0, updated_at=UTC_TIMESTAMP()`,
+      [tableId],
+    );
+
+    // close active session if any
+    try {
+      await NFC.closeActiveSession(tableId, { by: 'api:nfc/table/disable' });
+    } catch (e) {
+      logger.warn('⚠️ [NFC] closeActiveSession during disable failed', { tableId, error: String(e) });
+    }
+
+    res.json({ ok: true });
+  } catch (err) {
+    logger.error('❌ [API] /nfc/table/:id/disable', { error: String(err) });
+    res.status(500).json({ ok: false, error: err?.message || 'internal_error' });
+  }
+});
+
+router.post('/table/:tableId/enable', async (req, res) => {
+  try {
+    const tableId = Number(req.params.tableId || 0) || 0;
+    logger.info(`🔔 [API] /nfc/table/${tableId}/enable called`, { service: 'server', tableId });
+    if (!tableId) return res.status(400).json({ ok: false, error: 'tableId missing' });
+
+    await query(
+      `INSERT INTO nfc_table_state (table_id, enabled, updated_at) VALUES (?, 1, UTC_TIMESTAMP()) ON DUPLICATE KEY UPDATE enabled=1, updated_at=UTC_TIMESTAMP()`,
+      [tableId],
+    );
+
+    res.json({ ok: true });
+  } catch (err) {
+    logger.error('❌ [API] /nfc/table/:id/enable', { error: String(err) });
+    res.status(500).json({ ok: false, error: err?.message || 'internal_error' });
+  }
+});
+
+router.get('/table-states', async (req, res) => {
+  try {
+    const rows = await query('SELECT table_id, enabled, updated_at FROM nfc_table_state');
+    res.json(rows || []);
+  } catch (err) {
+    logger.error('❌ [API] /nfc/table-states', { error: String(err) });
+    res.status(500).json({ ok: false, error: err?.message || 'internal_error' });
+  }
+});
