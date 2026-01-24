@@ -1,6 +1,261 @@
 # 🧩 Project code (file ammessi in .)
 
-_Generato: Mon, Nov 24, 2025 11:00:12 AM_
+_Generato: Tue, Jan 20, 2026 11:46:49 PM_
+
+### ./docs/canvas-backend.md
+```
+# Canvas — Backend Node.js + Express (La Lanterna / Comodissimo)
+Stato, regole e roadmap del backend ordini + prenotazioni + NFC + stampa.
+
+---
+
+## 🧱 Stack & setup
+
+- **Runtime**: Node.js 22.x
+- **Framework**: Express
+- **Database**: MySQL / MariaDB (mysql2)
+- **Migrazioni**: file SQL numerati `001_*.sql`, `002_*.sql`, ecc.
+- **Socket**: Socket.IO server (singleton)
+- **Logging**: winston + daily rotate, log con emoji dove utile
+- **Stampa**: ESC/POS via TCP 9100 (Sunmi/Epson), senza simbolo `€` per ora
+- **CORS**: configurato via `.env` (es. `CORS_ORIGIN=http://localhost:8100`)
+
+---
+
+## 📂 Struttura directory (semplificata)
+
+- `server/src/server.js` — bootstrap principale Express + Socket.IO
+- `server/src/env.js` — gestione variabili ambiente
+- `server/src/logger.js` — logger configurato
+- `server/src/db/`
+  - `index.js` — pool MySQL (multipleStatements: true)
+  - `migrator.js` — applicazione migrations
+  - `migrations/001_schema.sql` — ordini base
+  - `migrations/002_seed.sql` — prodotti seed
+  - `migrations/003_reservations.sql` — tavoli/prenotazioni
+  - `migrations/004_add_is_active_to_products.sql` — colonna is_active
+  - `migrations/005_rooms.sql`, `006_tables_room_fk.sql` — rooms + FK tables
+- `server/src/api/`
+  - `orders.js` — gestione ordini
+  - `reservations.js` — prenotazioni
+  - `tables.js` — tavoli
+  - `nfc-session.js` — sessioni NFC
+  - (future) `printer.js` — salute e comandi stampante
+- `server/src/sockets/`
+  - `index.js` — init singleton Socket.IO
+  - `orders.js` — canale ordini
+  - `reservations.js` — canale prenotazioni
+  - `nfc-session.js` — canale NFC (separato o integrato)
+
+---
+
+## 🧾 Modello dati principale
+
+### Tabella `products`
+- Prodotti con `is_active` (per nascondere senza cancellare)
+- Usata da FE (PWA clienti / Admin) per mostrare menu
+
+### Tabelle `orders` e `order_items`
+- `orders`:
+  - id, customer_name, phone, email
+  - people, scheduled_at
+  - status: `pending | preparing | ready | completed | cancelled`
+  - total (ricalcolato lato server)
+  - channel: `admin | kiosk | pwa | phone` ecc.
+  - table_id (FK tables)
+  - meta tavolo/sala: join con `tables` e `rooms`
+  - created_at, updated_at
+- `order_items`:
+  - order_id (FK)
+  - name
+  - qty (può essere **negativo** per correzioni)
+  - price_unit
+  - total_line (qty * price_unit)
+  - meta JSON per ingredienti/base/extra
+
+### Tabelle `rooms`, `tables`
+- `rooms`: sale (interno, esterno, ecc.)
+- `tables`:
+  - id, room_id (FK rooms)
+  - table_number
+  - seats
+  - status: `free | occupied | cleaning | blocked`
+
+### Tabelle `reservations`
+- Gestione prenotazioni con:
+  - cliente, contatti
+  - data/ora inizio + end_at (calcolato)
+  - numero persone
+  - stato: `pending | confirmed | cancelled | no-show | completed`
+  - eventuale table_id assegnato
+
+### NFC / Sessioni (design)
+- Tabella dedicata o colonna su ordine/tavolo per session_id (per ora best effort)
+- Endpoint per legare session_id ↔ tavolo ↔ ordine
+
+---
+
+## ✔️ Endpoints chiave
+
+### `/api/orders`
+
+- `GET /api/orders`
+  - Filtri:
+    - `hours`, `from`, `to`, `status`, `q`, `table_id`
+  - Se `table_id` presente → restituisce ordini “full” con righe e meta tavolo/sala
+- `GET /api/orders/:id`
+  - Dettaglio ordine completo
+  - Include:
+    - ordine
+    - items
+    - meta tavolo (room/table)
+    - meta prenotazione se presente
+- `GET /api/orders/:id/batches`
+  - Storico mandate T1/T2/T3 (order_batches + snapshot righe)
+- `GET /api/orders/active-by-session`
+  - Restituisce ordine attivo per `session_id` NFC (best effort + backfill)
+- `POST /api/orders`
+  - Crea ordine
+  - Ricalcola sempre `total` lato server
+  - Valorizza `table_id` se fornito
+  - Se presente `session_id` → lega alla sessione NFC
+- `POST /api/orders/:id/items`
+  - Aggiunge righe ad ordine esistente
+  - Supporta qty negative per **correzioni**
+  - Ricalcola total ordine dopo insert
+- `PUT /api/orders/:id/status`
+  - Aggiorna stato ordine (es. `pending → preparing → ready → completed`)
+  - Triggera evento Socket.IO `order-updated`
+
+---
+
+### `/api/reservations`
+
+- `GET /api/reservations`
+  - Filtri: `from`, `to`, `status`, ecc.
+- `GET /api/reservations/:id`
+  - Dettaglio prenotazione (cliente, orario, persone, note, tavolo)
+- `POST /api/reservations`
+  - Crea prenotazione (admin o canale esterno)
+  - Calcola `end_at` (es. durata default 90min)
+  - (Roadmap) controlli overlap
+- `PUT /api/reservations/:id/status`
+  - Cambia stato (pending/confirmed/cancelled/no-show/completed)
+- `PUT /api/reservations/:id/table`
+  - Assegna/aggiorna tavolo
+- (Futuro) `GET /api/reservations/availability`
+  - Calcola disponibilità tavoli per intervallo orario
+
+---
+
+### `/api/tables`
+
+- `GET /api/tables`
+  - Lista tavoli con room_name, table_number, status
+  - (Opzione) include conteggio ordini attivi
+- `POST /api/tables/:id/clear`
+  - Pulisce tavolo:
+    - marca tavolo come `free`
+    - chiude eventuale ordine attivo (o lo marca `completed` se già pagato)
+    - chiude sessione NFC collegata (se esiste)
+
+---
+
+### `/api/nfc-session`
+
+- `POST /api/nfc-session`
+  - Crea/aggiorna sessione per un tag NFC
+- `GET /api/nfc-session/:id/active-order`
+  - Restituisce ordine attivo per quella sessione
+- `PUT /api/nfc-session/:id/close`
+  - Chiude esplicitamente la sessione (usata quando tavolo viene pulito)
+
+---
+
+### `/api/printer` (roadmap)
+
+- `GET /api/printer/health`
+  - Verifica raggiungibilità stampante (TCP 9100)
+- `POST /api/printer/print-order`
+  - Stampa comanda cucina
+- `POST /api/printer/print-receipt`
+  - Stampa preconto (NO `€` per ora per compatibilità codepage)
+- `POST /api/printer/print-placeholders`
+  - Stampa segnaposto/tavolo
+
+---
+
+## ✔️ Stato attuale (BE) — cosa consideriamo già fatto
+
+- ✅ Pool MySQL con `multipleStatements: true`
+- ✅ Migrazioni 001–006 applicate (orders, reservations, rooms/tables + FKs, products.is_active)
+- ✅ `/api/orders` stabilizzato:
+  - Fix CONCAT con `CHAR(63)` nei LIKE per evitare conflitti con `?`
+  - Ritorno `{ ...order, items }` corretto in GET by id
+- ✅ `/api/reservations` base funzionante
+- ✅ `/api/health/time` (o similare) per diagnostica fusi orari (da verificare naming finale)
+- ✅ Socket.IO:
+  - Singleton con log connessione/disconnessione
+  - Canali base per orders (e predisposizione per reservations)
+- ✅ Integrazione con PWA admin:
+  - tables-list + order-builder agganciati alle API
+
+---
+
+## 🔥 To-Do prioritari (BE)
+
+1. **Overlap prenotazioni**
+   - Su `POST /api/reservations`:
+     - Calcolare `end_at` lato server
+     - Rifiutare prenotazioni che si sovrappongono sullo stesso tavolo
+   - Opzionale: endpoint `/api/reservations/availability`
+
+2. **Chiusura tavolo+sessione robusta**
+   - Garantire che `tables/:id/clear`:
+     - chiuda sessione NFC collegata (`nfc-session/:id/close`)
+     - aggiorni correttamente stato ordine (se ancora attivo)
+
+3. **Socket reservations**
+   - Implementare canale Socket.IO `reservations`:
+     - Eventi `reservation-created` e `reservation-updated`
+     - Esportare helper per emitirli da `api/reservations.js`
+
+4. **Endpoint /api/printer/health**
+   - Ping TCP verso stampante
+   - Gestire timeout/ECONNREFUSED con errori puliti (502, messaggi chiari)
+   - Log con emoji (es. `🖨️`)
+
+5. **TimeZone policy**
+   - DB e API in UTC
+   - FE converte in Europe/Rome
+   - `/api/health/time` mostra:
+     - ora server
+     - ora DB
+     - time_zone impostata
+
+---
+
+## ⭐️ Backlog BE
+
+- Audit `print_jobs` in DB (storico stampe, retry, stato)
+- Endpoint reporting base (incassi, numero coperti, ecc.)
+- Integrazione futura con gateway fiscale / RT (AdE)
+- Endpoint helper per Twilio WhatsApp (callback/status log)
+
+---
+
+## 📝 Note operative per ChatGPT (in VS Code)
+
+- Prima di cambiare endpoint:
+  - Rileggere questo file `docs/canvas-backend.md`
+- Quando si chiede una patch:
+  - Specificare chiaramente il file:
+    - es. `src/api/orders.js`, `src/api/reservations.js`, `src/sockets/index.js`
+  - Mantenere:
+    - Stile log (emoji)
+    - Struttura commenti esistenti
+    - Migrazioni numerate incrementalmente (`007_*.sql`, `008_*.sql`, ecc.)
+```
 
 ### ./package.json
 ```
@@ -642,6 +897,7 @@ const express = require('express');
 const router  = express.Router();
 const NFC     = require('../services/nfc.service');
 const logger  = require('../logger');
+const { query } = require('../db');
 
 // Helper per ottenere io: preferisci req.app.get('io'), fallback al singleton
 function getIO(req) {
@@ -830,7 +1086,93 @@ router.post('/session/close', async (req, res) => {
   }
 });
 
+// 🆕 POST /api/nfc/session/open { table_id, by? } → { ok:true, session_id }
+router.post('/session/open', async (req, res) => {
+  try {
+    const table_id = Number(req.body?.table_id || 0);
+    const by = (req.body?.by || 'api/nfc/session/open').toString();
+    if (!table_id) return res.status(400).json({ ok: false, error: 'table_id mancante' });
+
+    // use ensureSession to respect TTL logic and avoid duplicate open rows
+    const session_id = await NFC.ensureSession(table_id, { by, ttlHours: 6 });
+
+    logger.info(`🟢 [API] open session table_id=${table_id} → session_id=${session_id}`);
+
+    // Broadcast new session (best-effort)
+    try {
+      const io = getIO(req);
+      if (io && session_id) io.emit('nfc:session_opened', { table_id, session_id });
+    } catch (e) {
+      logger.warn('⚠️ [API] nfc session open broadcast KO', { error: String(e) });
+    }
+
+    res.json({ ok: true, session_id });
+  } catch (err) {
+    logger.error('❌ [API] /nfc/session/open', { error: String(err) });
+    res.status(500).json({ ok: false, error: err?.message || 'internal_error' });
+  }
+});
+
 module.exports = router;
+
+// -------------------------- Table state endpoints -------------------------
+// POST /api/nfc/table/:tableId/disable  -> { ok:true }
+// POST /api/nfc/table/:tableId/enable   -> { ok:true }
+// GET  /api/nfc/table-states            -> [{ table_id, enabled, updated_at }, ...]
+
+router.post('/table/:tableId/disable', async (req, res) => {
+  try {
+    const tableId = Number(req.params.tableId || 0) || 0;
+    logger.info(`🔔 [API] /nfc/table/${tableId}/disable called`, { service: 'server', tableId });
+    if (!tableId) return res.status(400).json({ ok: false, error: 'tableId missing' });
+
+    // upsert into nfc_table_state
+    await query(
+      `INSERT INTO nfc_table_state (table_id, enabled, updated_at) VALUES (?, 0, UTC_TIMESTAMP()) ON DUPLICATE KEY UPDATE enabled=0, updated_at=UTC_TIMESTAMP()`,
+      [tableId],
+    );
+
+    // close active session if any
+    try {
+      await NFC.closeActiveSession(tableId, { by: 'api:nfc/table/disable' });
+    } catch (e) {
+      logger.warn('⚠️ [NFC] closeActiveSession during disable failed', { tableId, error: String(e) });
+    }
+
+    res.json({ ok: true });
+  } catch (err) {
+    logger.error('❌ [API] /nfc/table/:id/disable', { error: String(err) });
+    res.status(500).json({ ok: false, error: err?.message || 'internal_error' });
+  }
+});
+
+router.post('/table/:tableId/enable', async (req, res) => {
+  try {
+    const tableId = Number(req.params.tableId || 0) || 0;
+    logger.info(`🔔 [API] /nfc/table/${tableId}/enable called`, { service: 'server', tableId });
+    if (!tableId) return res.status(400).json({ ok: false, error: 'tableId missing' });
+
+    await query(
+      `INSERT INTO nfc_table_state (table_id, enabled, updated_at) VALUES (?, 1, UTC_TIMESTAMP()) ON DUPLICATE KEY UPDATE enabled=1, updated_at=UTC_TIMESTAMP()`,
+      [tableId],
+    );
+
+    res.json({ ok: true });
+  } catch (err) {
+    logger.error('❌ [API] /nfc/table/:id/enable', { error: String(err) });
+    res.status(500).json({ ok: false, error: err?.message || 'internal_error' });
+  }
+});
+
+router.get('/table-states', async (req, res) => {
+  try {
+    const rows = await query('SELECT table_id, enabled, updated_at FROM nfc_table_state');
+    res.json(rows || []);
+  } catch (err) {
+    logger.error('❌ [API] /nfc/table-states', { error: String(err) });
+    res.status(500).json({ ok: false, error: err?.message || 'internal_error' });
+  }
+});
 ```
 
 ### ./src/api/nfc-session.js
@@ -1103,14 +1445,22 @@ router.put('/cart', async (req, res) => {
 // Ultimo ordine associato alla sessione (se table_sessions.last_order_id è
 // valorizzato). Implementazione originale tua, ripresa e lasciata invariata.
 // ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// GET /api/nfc/session/last-order?session_id=123
+// ---------------------------------------------------------------------------
+// Ultimo ordine associato alla sessione (se table_sessions.last_order_id è
+// valorizzato). Implementazione originale tua, ripresa e aggiustata solo
+// togliendo le colonne che NON esistono in "orders" (reservation_id, room_id).
+// ---------------------------------------------------------------------------
 router.get('/last-order', async (req, res) => {
   const log = req.app.get('logger');
   try {
     const sessionId = Number(req.query.session_id || 0) || 0;
-    if (!sessionId)
+    if (!sessionId) {
       return res
         .status(400)
         .json({ ok: false, error: 'session_id_required' });
+    }
 
     // 1) prendo last_order_id dalla sessione
     const rows1 = await query(
@@ -1123,19 +1473,27 @@ router.get('/last-order', async (req, res) => {
       return res.json({ ok: true, hasOrder: false, order: null });
     }
 
-    // 2) header + total aggregato
+    // 2) header + total aggregato (SOLO colonne esistenti in "orders")
     const rows2 = await query(
       `
       SELECT
-        o.id, o.status, o.customer_name, o.phone, o.note, o.people,
-        o.channel, o.reservation_id, o.table_id, o.room_id, o.scheduled_at,
-        o.created_at, o.updated_at,
+        o.id,
+        o.status,
+        o.customer_name,
+        o.phone,
+        o.note,
+        o.people,
+        o.channel,
+        o.table_id,
+        o.scheduled_at,
+        o.created_at,
+        o.updated_at,
         IFNULL(SUM(oi.qty * oi.price), 0) AS total
       FROM orders o
       LEFT JOIN order_items oi ON oi.order_id = o.id
       WHERE o.id = ?
       GROUP BY o.id
-    `,
+      `,
       [lastOrderId],
     );
 
@@ -1156,7 +1514,7 @@ router.get('/last-order', async (req, res) => {
       FROM order_items
       WHERE order_id = ?
       ORDER BY id
-    `,
+      `,
       [lastOrderId],
     );
 
@@ -1165,7 +1523,12 @@ router.get('/last-order', async (req, res) => {
       lastOrderId,
       items: items.length,
     });
-    return res.json({ ok: true, hasOrder: true, order: { ...order, items } });
+
+    return res.json({
+      ok      : true,
+      hasOrder: true,
+      order   : { ...order, items },
+    });
   } catch (e) {
     req.app
       .get('logger')
@@ -1188,22 +1551,25 @@ module.exports = router;
  * Obiettivo: MAI passare ad Express handler undefined.
  *
  * Stile: log con emoji, requireAuth con fallback DEV, guardie robuste.
+ *
+ * ✅ PULIZIA WA:
+ * - Usiamo SOLO ../services/whatsapp.service come unico punto WA
+ * - Niente più doppioni whatsapp-twilio.service
  */
 
 const express = require('express');
 const router  = express.Router();
 
 const logger = require('../logger');
-const env    = require('../env');
 
 // === requireAuth con fallback DEV (stile già usato altrove) ==================
 let requireAuth;
 try {
-  ({ requireAuth } = require('./auth'));
+  ({ requireAuth } = require('../middleware/auth'));
   if (typeof requireAuth !== 'function') throw new Error('requireAuth non è una funzione');
-  logger.info('🔐 requireAuth caricato da ./auth');
+  logger.info('🔐 requireAuth caricato da ../middleware/auth');
 } catch (e) {
-  logger.warn('⚠️ requireAuth non disponibile. Uso FALLBACK DEV (solo locale).');
+  logger.warn('⚠️ requireAuth non disponibile. Uso FALLBACK DEV (solo locale).', { error: String(e) });
   requireAuth = (req, _res, next) => {
     req.user = {
       id: Number(process.env.AUTH_DEV_ID || 0),
@@ -1216,7 +1582,6 @@ try {
 // === Carico servizi (con fallback a null) ====================================
 let mailer = null;
 try {
-  // Il tuo progetto ha src/services/mailer.service.js
   mailer = require('../services/mailer.service');
   logger.info('📧 mailer.service caricato');
 } catch {
@@ -1225,31 +1590,14 @@ try {
 
 let waSvc = null;
 try {
-  // Preferisci un "aggregatore" già esistente (whatsapp.service)
   waSvc = require('../services/whatsapp.service');
-  logger.info('📲 whatsapp.service caricato');
+  logger.info('📲 whatsapp.service caricato (UNICO)');
 } catch {
-  // In alternativa prova il provider Twilio o Whatsender se esistono
-  try {
-    waSvc = require('../services/whatsapp-twilio.service.js');
-    logger.info('📲 whatsapp-twilio.service caricato');
-  } catch {
-    try {
-      waSvc = require('../services/whatsender.service.js');
-      logger.info('📲 whatsender.service caricato');
-    } catch {
-      logger.warn('📲 Nessun servizio WhatsApp disponibile');
-      waSvc = null;
-    }
-  }
+  logger.warn('📲 whatsapp.service non disponibile');
+  waSvc = null;
 }
 
 // === Helper: wrapper sicuro per route handler ================================
-/**
- * safeRoute(handlerName, impl)
- * Ritorna sempre una funzione (req,res) valida per Express.
- * Se impl non è una funzione, risponde 501 e logga chiaramente.
- */
 function safeRoute(handlerName, impl) {
   return async (req, res) => {
     if (typeof impl !== 'function') {
@@ -1271,17 +1619,11 @@ router.get('/health', (_req, res) => {
     ok: true,
     mailer: !!mailer,
     whatsapp: !!waSvc,
-    providerHint: process.env.WA_PROVIDER || process.env.TWILIO_ENABLED || process.env.WHATSENDER_ENABLED || null
+    waHealth: waSvc?.health ? waSvc.health() : null
   });
 });
 
 // === EMAIL ===================================================================
-
-/**
- * POST /api/notifications/email/test
- * body: { to, subject?, text?, html? }
- * Nota: cerchiamo metodi noti nel tuo mailer: sendMail / sendSimple / sendTestEmail
- */
 router.post(
   '/email/test',
   requireAuth,
@@ -1295,7 +1637,6 @@ router.post(
 
     if (!to) return res.status(400).json({ error: 'missing_to' });
 
-    // Prova in ordine i metodi più comuni del tuo mailer
     const sendFn =
       mailer.sendMail ||
       mailer.sendSimple ||
@@ -1318,7 +1659,6 @@ router.post(
 /**
  * POST /api/notifications/wa/test
  * body: { to, text? }
- * Cerca metodi comuni: sendText / sendMessage / sendStatusChange
  */
 router.post(
   '/wa/test',
@@ -1330,34 +1670,16 @@ router.post(
     const text = (req.body?.text || 'Ciao 👋 questo è un messaggio di test').toString();
     if (!to) return res.status(400).json({ error: 'missing_to' });
 
-    // Trova una funzione invio compatibile nel service
-    const sendFn =
-      waSvc.sendText ||
-      waSvc.sendMessage ||
-      null;
-
-    // Alcuni tuoi service hanno invece 'sendStatusChange({to, status, ...})'
-    const sendStatusChange = waSvc.sendStatusChange || null;
-
-    let out = null;
-    if (sendFn) {
-      out = await sendFn({ to, text });
-    } else if (sendStatusChange) {
-      // fallback: uso un "finto" status-change per test (non cambia stato, solo invia testo)
-      out = await sendStatusChange({ to, reservation: { id: 0, customer_name: 'Test' }, status: 'confirmed', reason: text });
-    } else {
-      return res.status(501).json({ error: 'wa_send_method_not_found' });
-    }
-
-    logger.info('📲 WA test inviato ✅', { to, sid: out?.sid || null });
-    res.json({ ok: true, sid: out?.sid || null });
+    // Ora sendText è GARANTITO dal service unico
+    const out = await waSvc.sendText({ to, text });
+    logger.info('📲 WA test inviato ✅', { to, sid: out?.sid || null, skipped: !!out?.skipped });
+    res.json({ ok: true, sid: out?.sid || null, skipped: out?.skipped || false, reason: out?.reason || null });
   })
 );
 
 /**
  * POST /api/notifications/wa/send
  * body: { to, text, mediaUrl? }
- * Canale semplice "text" (opzionale media).
  */
 router.post(
   '/wa/send',
@@ -1371,16 +1693,9 @@ router.post(
 
     if (!to || !text) return res.status(400).json({ error: 'missing_params', need: 'to,text' });
 
-    const sendFn =
-      waSvc.sendText ||
-      waSvc.sendMessage ||
-      null;
-
-    if (!sendFn) return res.status(501).json({ error: 'wa_send_method_not_found' });
-
-    const out = await sendFn({ to, text, mediaUrl });
-    logger.info('📲 WA inviato ✅', { to, sid: out?.sid || null, hasMedia: !!mediaUrl });
-    res.json({ ok: true, sid: out?.sid || null });
+    const out = await waSvc.sendText({ to, text, mediaUrl });
+    logger.info('📲 WA inviato ✅', { to, sid: out?.sid || null, hasMedia: !!mediaUrl, skipped: !!out?.skipped });
+    res.json({ ok: true, sid: out?.sid || null, skipped: out?.skipped || false, reason: out?.reason || null });
   })
 );
 
@@ -1421,6 +1736,20 @@ const router  = express.Router();
 
 const logger = require('../logger');
 const { query } = require('../db');
+
+// === requireAuth con fallback DEV ============================================
+let requireAuth;
+try {
+  ({ requireAuth } = require('../middleware/auth'));
+  if (typeof requireAuth !== 'function') throw new Error('requireAuth non è una funzione');
+  logger.info('🔐 requireAuth caricato da ../middleware/auth');
+} catch {
+  logger.warn('⚠️ requireAuth non disponibile. Uso FALLBACK DEV (solo locale).');
+  requireAuth = (req, _res, next) => {
+    req.user = { id: 0, email: process.env.AUTH_DEV_USER || 'dev@local' };
+    next();
+  };
+}
 
 // ============================================================================
 // Moduli opzionali: SSE, Socket.IO, stampa, customers.resolve
@@ -1733,6 +2062,168 @@ async function recalcOrderTotal(orderId) {
   );
 
   return total;
+}
+
+// ============================================================================
+// 🆕 Modello professionale — helper per qty negative / correzioni
+// ============================================================================
+
+/**
+ * Costruisce una mappa { `${name}@@${price}` -> agg_qty } per tutte
+ * le voci che hanno almeno una riga con qty negativa nel batch items.
+ *
+ * Usiamo una singola query su order_items per recuperare la qty "base"
+ * attuale in DB per ciascuna combinazione (name, price).
+ *
+ * @param {number} orderId
+ * @param {Array<{ name:string, price:number, qty:number }>} items
+ * @returns {Promise<Map<string, number>>}
+ */
+async function buildBaseQtyMapForCorrections(orderId, items) {
+  const negativeKeys = [];
+  const seen = new Set();
+
+  for (const raw of items || []) {
+    const qty = Number(raw && raw.qty);
+    if (!Number.isFinite(qty) || qty >= 0) continue;
+
+    const name = (raw.name || '').toString().trim();
+    if (!name) continue;
+
+    const priceNum = Number(raw.price || 0);
+    const key = `${name}@@${priceNum.toFixed(2)}`;
+
+    if (seen.has(key)) continue;
+    seen.add(key);
+    negativeKeys.push({ name, price: priceNum, key });
+  }
+
+  const baseMap = new Map();
+  if (!negativeKeys.length) {
+    return baseMap; // nessuna qty negativa → niente query DB
+  }
+
+  const params = [orderId];
+  const conds  = [];
+
+  for (const nk of negativeKeys) {
+    conds.push('(oi.name = ? AND oi.price = ?)');
+    params.push(nk.name, nk.price);
+  }
+
+  const sql = `
+    SELECT
+      oi.name,
+      oi.price,
+      IFNULL(SUM(oi.qty), 0) AS agg_qty
+    FROM order_items oi
+    WHERE oi.order_id = ?
+      AND (${conds.join(' OR ')})
+    GROUP BY oi.name, oi.price
+  `;
+
+  const rows = await query(sql, params);
+
+  for (const r of rows || []) {
+    const name      = (r.name || '').toString().trim();
+    const priceNum  = Number(r.price || 0);
+    const key       = `${name}@@${priceNum.toFixed(2)}`;
+    const aggQtyNum = Number(r.agg_qty || 0);
+    baseMap.set(key, aggQtyNum);
+  }
+
+  return baseMap;
+}
+
+/**
+ * Valida un batch di righe (positive e negative) prima dell'insert.
+ *
+ * Regole:
+ * - se una correzione (qty < 0) si riferisce ad una combinazione (name,price)
+ *   che NON esiste in DB → errore qty_under_zero
+ * - se applicando i delta la qty aggregata andasse sotto zero → errore qty_under_zero
+ *
+ * Se tutto ok, non ritorna nulla.
+ *
+ * @param {number} orderId
+ * @param {Array<{ name:string, price:number, qty:number }>} items
+ * @throws {Error & { status?:number, code?:string, payload?:any }}
+ */
+async function validateItemDeltas(orderId, items) {
+  if (!Array.isArray(items) || !items.length) return;
+
+  const baseMap = await buildBaseQtyMapForCorrections(orderId, items);
+  const aggMap  = new Map(baseMap);
+
+  for (const item of items) {
+    const name = (item.name || '').toString().trim();
+    const priceNum = Number(item.price || 0);
+    const deltaQty = Number(item.qty || 0);
+
+    if (!deltaQty) continue; // qty = 0 non influenza niente
+
+    const key = `${name}@@${priceNum.toFixed(2)}`;
+
+    // Caso: correzione su voce non presente in DB → partiamo da 0, ma è già errore
+    if (deltaQty < 0 && !baseMap.has(key)) {
+      const baseQty  = 0;
+      const aggAfter = baseQty + deltaQty;
+
+      logger.warn('⚠️ [orders] correzione su voce inesistente', {
+        order_id : orderId,
+        name,
+        price    : priceNum,
+        base_qty : baseQty,
+        delta_qty: deltaQty,
+        agg_after: aggAfter,
+      });
+
+      const err = new Error('qty_under_zero');
+      err.status  = 400;
+      err.code    = 'qty_under_zero';
+      err.payload = {
+        name,
+        price    : priceNum,
+        base_qty : baseQty,
+        delta_qty: deltaQty,
+        agg_after: aggAfter,
+      };
+      throw err;
+    }
+
+    const prevQty = Number(
+      aggMap.has(key)
+        ? aggMap.get(key)
+        : (baseMap.get(key) ?? 0),
+    );
+    const nextQty = prevQty + deltaQty;
+
+    if (nextQty < 0) {
+      logger.warn('⚠️ [orders] correzione porterebbe qty sotto zero', {
+        order_id : orderId,
+        name,
+        price    : priceNum,
+        base_qty : prevQty,
+        delta_qty: deltaQty,
+        agg_after: nextQty,
+      });
+
+      const err = new Error('qty_under_zero');
+      err.status  = 400;
+      err.code    = 'qty_under_zero';
+      err.payload = {
+        name,
+        price    : priceNum,
+        base_qty : prevQty,
+        delta_qty: deltaQty,
+        agg_after: nextQty,
+      };
+      throw err;
+    }
+
+    // Aggiorno qty "virtuale" dopo il delta
+    aggMap.set(key, nextQty);
+  }
 }
 
 // ============================================================================
@@ -2141,15 +2632,17 @@ router.get('/:id(\\d+)', async (req, res) => {
   }
 });
 
-// ➕ Aggiunge righe ad un ordine esistente (Opzione B: T2/T3 lato BE)
+// ➕ Aggiunge righe ad un ordine esistente (T2/T3 lato BE + correzioni qty negative)
 router.post('/:id(\\d+)/items', async (req, res) => {
+  const log = req.app.get('logger') || logger;
+
   try {
     const id = toNum(req.params.id);
     if (!id) {
       return res.status(400).json({ ok: false, error: 'invalid_id' });
     }
 
-    const dto = req.body || {};
+    const dto   = req.body || {};
     const items = Array.isArray(dto.items) ? dto.items : [];
 
     if (!items.length) {
@@ -2165,14 +2658,47 @@ router.post('/:id(\\d+)/items', async (req, res) => {
       return res.status(404).json({ ok: false, error: 'not_found' });
     }
 
-    let inserted = 0;
-
+    // Normalizzazione:
+    // - trim name
+    // - qty numerica (qty=0 scartata)
+    // - price numerico
+    const normalized = [];
     for (const it of items) {
       if (!it || typeof it !== 'object') continue;
+
       const name = (it.name || '').toString().trim();
       if (!name) continue;
 
-      await query(
+      const qty = toNum(it.qty, 0);
+      if (!qty) continue; // qty = 0 → non ha effetto
+
+      const priceNum = toNum(it.price, 0);
+
+      normalized.push({
+        product_id: it.product_id != null ? it.product_id : null,
+        name,
+        qty,
+        price: priceNum,
+        notes: it.notes || null,
+      });
+    }
+
+    if (!normalized.length) {
+      return res.status(400).json({ ok: false, error: 'no_items' });
+    }
+
+    const hasCorrections = normalized.some((it) => it.qty < 0);
+
+    // 🧮 Validazione "modello professionale" per qty negative
+    if (hasCorrections) {
+      await validateItemDeltas(id, normalized);
+    }
+
+    let insertedRows = 0;
+
+    // INSERT riga-per-riga (volumi contenuti, leggibile)
+    for (const it of normalized) {
+      const result = await query(
         `INSERT INTO order_items (
            order_id,
            product_id,
@@ -2184,21 +2710,37 @@ router.post('/:id(\\d+)/items', async (req, res) => {
          VALUES (?,?,?,?,?,?)`,
         [
           id,
-          it.product_id != null ? it.product_id : null,
-          name,
-          toNum(it.qty, 1),
-          toNum(it.price),
-          it.notes || null,
+          it.product_id,
+          it.name,
+          it.qty,
+          it.price,
+          it.notes,
         ],
       );
-      inserted += 1;
+      insertedRows += Number(result && result.affectedRows || 0);
+
+      if (it.qty < 0) {
+        log.info('➖ [orders] correction line', {
+          order_id : id,
+          base_name: it.name,
+          delta_qty: it.qty,
+          price    : it.price,
+        });
+      } else {
+        log.info('➕ [orders] add item line', {
+          order_id: id,
+          name    : it.name,
+          qty     : it.qty,
+          price   : it.price,
+        });
+      }
     }
 
     const newTotal = await recalcOrderTotal(id);
-    const full = await getOrderFullById(id);
+    const full     = await getOrderFullById(id);
 
+    // Notifiche SSE / Socket.IO (come prima)
     try {
-      // uso emitStatus come "notifica generica" di aggiornamento ordine
       sse.emitStatus({ id, status: full && full.status, total: newTotal });
     } catch (e) {
       logger.warn('🧵 SSE emitStatus (items) ⚠️', { error: String(e) });
@@ -2209,17 +2751,35 @@ router.post('/:id(\\d+)/items', async (req, res) => {
       logger.warn('📡 socket broadcastUpdated (items) ⚠️', { error: String(e) });
     }
 
-    logger.info('➕ [orders] items added', {
+    log.info('➕ [orders] items added (modello professionale)', {
       id,
-      added: inserted,
-      total: newTotal,
+      lines         : normalized.length,
+      inserted_rows : insertedRows,
+      total         : newTotal,
+      has_corrections: hasCorrections,
     });
 
+    // Manteniamo la risposta compatibile: ritorniamo l'ordine "full"
     res.status(201).json(full);
   } catch (e) {
+    const id = toNum(req.params.id);
+
+    // Caso specifico: qty_under_zero (violazione regole correzioni)
+    if (e && e.code === 'qty_under_zero') {
+      logger.warn('⚠️ orders add-items — qty_under_zero', {
+        id,
+        detail: e.payload || null,
+      });
+      return res.status(e.status || 400).json({
+        ok    : false,
+        error : 'qty_under_zero',
+        detail: e.payload || null,
+      });
+    }
+
     logger.error('➕ orders add-items ❌', {
       error: String(e),
-      id   : toNum(req.params.id),
+      id,
     });
     res.status(500).json({
       ok    : false,
@@ -2245,16 +2805,22 @@ router.post('/', async (req, res) => {
     // customer_user_id opzionale via helper (se disponibile)
     const email = dto.email || (dto.customer && dto.customer.email) || null;
     const phone = dto.phone || (dto.customer && dto.customer.phone) || null;
+    const displayName =
+      dto.customer_name ||
+      (dto.customer && (dto.customer.name || dto.customer.display_name)) ||
+      null;
+
     let customer_user_id = null;
     try {
       customer_user_id = await resolveCustomerUserId(
         { query },
-        { email, phone },
+        { email, phone, displayName },
       );
       if (customer_user_id) {
         logger.info('🧩 [Orders] mapped customer_user_id', {
           email,
           phone,
+          displayName,
           customer_user_id,
         });
       }
@@ -2263,6 +2829,7 @@ router.post('/', async (req, res) => {
         error: String((e && e.message) || e),
       });
     }
+
 
     // table_id dal payload, con fallback su reservation_id → reservations.table_id
     let tableIdFinal =
@@ -2428,6 +2995,48 @@ router.patch('/:id(\\d+)/status', async (req, res) => {
   } catch (e) {
     logger.error('✏️ orders status ❌', { error: String(e) });
     res.status(500).json({ ok: false, error: 'orders_status_error' });
+  }
+});
+
+// Elimina ordine (protetto)
+router.delete('/:id(\\d+)', requireAuth, async (req, res) => {
+  try {
+    const id = toNum(req.params.id);
+
+    const rows = await query('SELECT id FROM orders WHERE id = ? LIMIT 1', [id]);
+    if (!rows || !rows[0]) {
+      return res.status(404).json({ ok: false, error: 'not_found' });
+    }
+
+    // Best-effort: rimuoviamo righe / batches e testa ordine.
+    // Nota: questa è una cancellazione hard; se preferisci soft-delete
+    // possiamo invece aggiornare lo status a 'cancelled' o 'deleted'.
+    try {
+      await query('DELETE FROM order_items WHERE order_id = ?', [id]);
+      await query('DELETE FROM order_batches WHERE order_id = ?', [id]);
+      await query('DELETE FROM orders WHERE id = ?', [id]);
+    } catch (e) {
+      logger.warn('⚠️ orders delete inner queries KO', { id, error: String(e) });
+      return res.status(500).json({ ok: false, error: 'orders_delete_error', reason: String(e) });
+    }
+
+    // Notify SSE / Socket.IO (best-effort)
+    try {
+      sse.emitStatus({ id, status: 'deleted' });
+    } catch (e) {
+      logger.warn('🧵 SSE emitStatus (deleted) ⚠️', { error: String(e) });
+    }
+    try {
+      socketBus.broadcastUpdated({ id, deleted: true });
+    } catch (e) {
+      logger.warn('📡 socket broadcastUpdated (deleted) ⚠️', { error: String(e) });
+    }
+
+    logger.info('🗑️ orders delete OK', { id });
+    return res.json({ ok: true });
+  } catch (e) {
+    logger.error('🗑️ orders delete ❌', { error: String(e) });
+    return res.status(500).json({ ok: false, error: 'orders_delete_error' });
   }
 });
 
@@ -3697,14 +4306,25 @@ const EXPECTED = {
   },
 
   users: {
-  id:         { data_type: 'bigint',   nullable: 'NO'  },
-  first_name: { data_type: 'varchar',  nullable: 'YES' },
-  last_name:  { data_type: 'varchar',  nullable: 'YES' },
-  email:      { data_type: 'varchar',  nullable: 'YES' },
-  phone:      { data_type: 'varchar',  nullable: 'YES' },
-  created_at: { data_type: 'timestamp',nullable: 'NO'  },
-  updated_at: { data_type: 'timestamp',nullable: 'YES' },
-},
+    id:         { data_type: 'bigint',   nullable: 'NO'  },
+    first_name: { data_type: 'varchar',  nullable: 'YES' },
+    last_name:  { data_type: 'varchar',  nullable: 'YES' },
+    email:      { data_type: 'varchar',  nullable: 'YES' },
+    phone:      { data_type: 'varchar',  nullable: 'YES' },
+
+    // 🆕 STEP 1 — modello clienti
+    phone_normalized: { data_type: 'varchar',  nullable: 'YES' },
+    phone_verified_at: { data_type: 'datetime', nullable: 'YES' },
+    verification_channel: {
+      data_type: 'enum',
+      nullable: 'YES',
+      column_type: "enum('otp_sms','otp_whatsapp','manual_call','other')",
+    },
+    trust_score: { data_type: 'tinyint', nullable: 'NO' },
+
+    created_at: { data_type: 'timestamp', nullable: 'NO'  },
+    updated_at: { data_type: 'timestamp', nullable: 'YES' },
+  },
 
   reservations: {
     id: { data_type: 'bigint', nullable: 'NO' },
@@ -4942,6 +5562,27 @@ async function resolveToken(token) {
     )?.[0] || null;
 
   // 4) assicura sessione
+  // check whether this table is enabled for sessions
+  const stateRow = (
+    await query(
+      `SELECT enabled FROM nfc_table_state WHERE table_id = ? LIMIT 1`,
+      [tag.table_id],
+    )
+  )?.[0];
+  const enabled = stateRow ? Number(stateRow.enabled || 0) === 1 : true;
+
+  if (!enabled) {
+    logger.info('🔒 [NFC] token resolved but table disabled', { token, table_id: tag.table_id });
+    return {
+      ok: false,
+      disabled: true,
+      table_id: tag.table_id,
+      table_number: meta.table_number ?? null,
+      room_id: meta.room_id ?? null,
+      room_name: meta.room_name ?? null,
+    };
+  }
+
   const session_id = await ensureSession(tag.table_id, {
     ttlHours: 6,
     by: 'nfc/resolve',
@@ -5033,12 +5674,19 @@ module.exports = {
  * -----------------------------------------------------------------------------
  * Orchestratore notifiche per ORDINI:
  * - EMAIL (riusa env.MAIL; usa nodemailer direttamente se il tuo mailer non ha metodi “order”)
- * - WHATSAPP (riusa services/whatsapp.service se presente; fallback Twilio diretto)
+ * - WHATSAPP (riusa services/whatsapp.service come UNICO punto di verità)
+ *
+ * ✅ PULIZIA:
+ * - tolto fallback Twilio diretto → niente duplicazione logica / configurazioni
+ * - se WA è disabilitato o misconfigurato → whatsapp.service ritorna {skipped:true,...}
  */
 
 const logger = require('../logger');
 const env = require('../env');
 const nodemailer = require('nodemailer');
+
+// ✅ unico service WhatsApp
+const wa = require('./whatsapp.service');
 
 let cachedTransport = null;
 function getTransport() {
@@ -5154,68 +5802,29 @@ async function sendEmailStatus(order, status) {
 }
 
 async function sendWhatsAppNew(order) {
-  // Prova a riusare il tuo services/whatsapp.service (se presente).
-  try {
-    const wa = require('./whatsapp.service');
-    if (typeof wa.sendText === 'function') {
-      const body = `Nuovo ordine #${order.id}\n${order.customer_name || ''}\nTotale € ${Number(order.total).toFixed(2)}`;
-      return await wa.sendText(order.phone, body);
-    }
-  } catch (_) {}
+  const body = `Nuovo ordine #${order.id}\n${order.customer_name || ''}\nTotale € ${Number(order.total).toFixed(2)}`;
+  const out = await wa.sendText(order.phone, body);
 
-  // Fallback Twilio diretto (se WA_ENABLED e credenziali presenti)
-  if (!env.WA?.enabled) return { ok: false, reason: 'wa_disabled' };
-  const { accountSid, authToken, from } = env.WA;
-  if (!accountSid || !authToken || !from) return { ok: false, reason: 'wa_misconfigured' };
-
-  const twilio = require('twilio')(accountSid, authToken);
-  const to = (order.phone || '').startsWith('whatsapp:') ? order.phone : `whatsapp:${order.phone}`;
-  try {
-    const msg = await twilio.messages.create({
-      from,
-      to,
-      body: `Ciao! Abbiamo ricevuto il tuo ordine #${order.id}. Totale € ${Number(order.total).toFixed(2)}. Ti avviseremo sugli aggiornamenti.`
-    });
-    logger.info('📲 WA NEW ✅', { sid: msg.sid });
-    return { ok: true, sid: msg.sid };
-  } catch (e) {
-    logger.error('📲 WA NEW ❌', { error: String(e) });
-    return { ok: false, reason: String(e) };
+  // log extra “di progetto”
+  if (out?.skipped) {
+    logger.warn('📲 WA NEW SKIP', { id: order.id, reason: out.reason || 'unknown' });
   }
+  return out;
 }
 
 async function sendWhatsAppStatus(order, status) {
-  try {
-    const wa = require('./whatsapp.service');
-    if (typeof wa.sendText === 'function') {
-      const body = `Aggiornamento ordine #${order.id}: ${String(status).toUpperCase()}`;
-      return await wa.sendText(order.phone, body);
-    }
-  } catch (_) {}
+  const body = `Aggiornamento ordine #${order.id}: ${String(status).toUpperCase()}`;
+  const out = await wa.sendText(order.phone, body);
 
-  if (!env.WA?.enabled) return { ok: false, reason: 'wa_disabled' };
-  const { accountSid, authToken, from } = env.WA;
-  if (!accountSid || !authToken || !from) return { ok: false, reason: 'wa_misconfigured' };
-  const twilio = require('twilio')(accountSid, authToken);
-  const to = (order.phone || '').startsWith('whatsapp:') ? order.phone : `whatsapp:${order.phone}`;
-  try {
-    const msg = await twilio.messages.create({
-      from, to,
-      body: `Aggiornamento: il tuo ordine #${order.id} è ora ${String(status).toUpperCase()}.`
-    });
-    logger.info('📲 WA STATUS ✅', { sid: msg.sid, status });
-    return { ok: true, sid: msg.sid };
-  } catch (e) {
-    logger.error('📲 WA STATUS ❌', { error: String(e), status });
-    return { ok: false, reason: String(e) };
+  if (out?.skipped) {
+    logger.warn('📲 WA STATUS SKIP', { id: order.id, status, reason: out.reason || 'unknown' });
   }
+  return out;
 }
 
 module.exports = {
   async onOrderCreated(order) {
-    // Email admin + cliente
     try { await sendEmailNew(order); } catch (e) { logger.error('🔔 email NEW ❌', { error: String(e) }); }
-    // WhatsApp cliente (se configurato)
     try { await sendWhatsAppNew(order); } catch (e) { logger.error('🔔 WA NEW ❌', { error: String(e) }); }
   },
   async onOrderStatus(order, status) {
@@ -7268,37 +7877,128 @@ module.exports = {
 'use strict';
 
 /**
- * WhatsApp service (Twilio) — invio messaggi di stato prenotazione.
- * - Usa template (se WA_TEMPLATE_STATUS_CHANGE_SID è impostato) oppure messaggio libero entro 24h.
- * - Normalizza numero in E.164 con prefisso di default (IT) se manca '+'.
- * - Log verbosi con emoji come il resto del progetto.
+ * services/whatsapp.service.js
+ * -----------------------------------------------------------------------------
+ * ✅ UNICA FONTE DI VERITÀ per WhatsApp nel backend.
+ *
+ * Provider attuale: Twilio.
+ *
+ * Cosa risolve questa “pulizia totale”:
+ * 1) Prima avevi più file simili (whatsapp.service.js / whatsapp-twilio.service.js / whatsapp.twilio.service.jS)
+ *    → ora resta un solo service "vero".
+ * 2) Prima mancava sendText() nel whatsapp.service.js, quindi:
+ *    - /api/notifications/wa/send poteva finire in 501
+ *    - notify.service faceva fallback Twilio diretto duplicando logica
+ *    → ora sendText esiste e viene riusato ovunque.
+ *
+ * API ESPOSTA (stabile):
+ * - sendText(to, text, mediaUrl?)
+ * - sendText({ to, text, mediaUrl?, from? })
+ * - sendMessage(...) alias di sendText (compatibilità)
+ * - sendStatusChange({ to, reservation, status, reason?, mediaLogo? })
+ * - _normalizeToE164(phone)
+ * - health()
+ *
+ * ENV (vedi src/env.js):
+ * - WA_ENABLED=true|false
+ * - TWILIO_ACCOUNT_SID=...
+ * - TWILIO_AUTH_TOKEN=...
+ * - WA_FROM="whatsapp:+39..."           (numero/ID Twilio abilitato)
+ * - WA_DEFAULT_CC="+39"
+ * - WA_MEDIA_LOGO_URL="https://..."
+ * - WA_TEMPLATE_STATUS_CHANGE_SID="HX..." (opzionale, Content API)
  */
 
-const twilio = require('twilio');
 const logger = require('../logger');
 const env    = require('../env');
 
-let client = null;
-function getClient() {
-  if (!env.WA?.enabled) return null;
-  if (!client) {
-    client = twilio(env.WA.accountSid, env.WA.authToken);
-    logger.info('📳 WA client inizializzato', { service: 'server', wa_env: env._debugWaConfig?.() });
+// Caricamento "lazy" di Twilio: se WA è disabilitato, NON vogliamo crash.
+let _twilioFactory = null;
+function _loadTwilioFactory() {
+  if (_twilioFactory) return _twilioFactory;
+  try {
+    // eslint-disable-next-line global-require
+    _twilioFactory = require('twilio');
+    return _twilioFactory;
+  } catch (e) {
+    logger.warn('📲 WA: modulo "twilio" non risolvibile (non installato?)', { error: String(e) });
+    _twilioFactory = null;
+    return null;
   }
-  return client;
 }
 
-/** Grezza normalizzazione in E.164 (default IT): +39 + numero senza spazi */
+let _client = null;
+
+/**
+ * getClient()
+ * - Restituisce un Twilio client singleton
+ * - Se WA non è abilitato o mancano credenziali → null (best-effort)
+ */
+function getClient() {
+  if (!env.WA?.enabled) return null;
+
+  const twilioFactory = _loadTwilioFactory();
+  if (!twilioFactory) return null;
+
+  if (!env.WA.accountSid || !env.WA.authToken) {
+    logger.warn('📲 WA: credenziali Twilio mancanti', { wa_env: env._debugWaConfig?.() });
+    return null;
+  }
+
+  if (!_client) {
+    _client = twilioFactory(env.WA.accountSid, env.WA.authToken);
+    logger.info('📳 WA client inizializzato', { wa_env: env._debugWaConfig?.() });
+  }
+
+  return _client;
+}
+
+/** Rimuove prefisso whatsapp: se presente */
+function _stripWhatsappPrefix(v) {
+  const s = String(v || '').trim();
+  if (!s) return '';
+  return s.startsWith('whatsapp:') ? s.slice('whatsapp:'.length) : s;
+}
+
+/**
+ * Normalizzazione grezza in E.164 (default IT):
+ * - accetta: "333..." / "+39333..." / "0039333..." / "whatsapp:+39333..."
+ * - output: "+39333..."
+ */
 function normalizeToE164(phone) {
   if (!phone) return null;
-  let p = String(phone).trim();
+
+  let p = _stripWhatsappPrefix(phone);
+
+  p = String(p).trim();
   p = p.replace(/[^\d+]/g, '');
+
+  if (!p) return null;
   if (p.startsWith('+')) return p;
   if (p.startsWith('00')) return '+' + p.slice(2);
+
+  // fallback: aggiungo prefisso di default (es: +39)
   return (env.WA.defaultCc || '+39') + p.replace(/^0+/, '');
 }
 
-/** Corpo testo semplice (IT) */
+/**
+ * Normalizza "from" per Twilio:
+ * - input: "whatsapp:+39..." oppure "+39..." oppure "0039..." oppure "333..."
+ * - output: "whatsapp:+39..."
+ */
+function _normalizeFrom(from) {
+  const raw = String(from || '').trim();
+  if (!raw) return '';
+
+  if (raw.startsWith('whatsapp:')) return raw;
+
+  const e164 = normalizeToE164(raw);
+  if (!e164) return '';
+
+  return `whatsapp:${e164}`;
+}
+
+/** Corpo testo semplice (IT) per cambio stato prenotazione */
 function buildStatusText({ status, dateYmd, timeHm, partySize, name, tableName }) {
   const S = String(status || '').toUpperCase();
   const n = name ? ` ${name}` : '';
@@ -7309,8 +8009,105 @@ function buildStatusText({ status, dateYmd, timeHm, partySize, name, tableName }
 }
 
 /**
- * Invia la notifica di cambio stato su WhatsApp.
- * options: { to, reservation, status, reason?, mediaLogo? }
+ * sendText
+ * -----------------------------------------------------------------------------
+ * Firma supportata:
+ *   - sendText(to, text, mediaUrl?)
+ *   - sendText({ to, text, mediaUrl?, from? })
+ *
+ * Ritorno:
+ *   - { ok:true, sid }
+ *   - oppure { skipped:true, reason:"..." } se disabilitato/misconfig/no phone/testo vuoto
+ */
+async function sendText(arg1, arg2, arg3) {
+  // === Parse parametri in modo compatibile ==================================
+  let to = null;
+  let text = null;
+  let mediaUrl = null;
+  let from = null;
+
+  if (arg1 && typeof arg1 === 'object') {
+    to       = arg1.to;
+    text     = arg1.text ?? arg1.body ?? arg1.message ?? null;
+    mediaUrl = arg1.mediaUrl ?? null;
+    from     = arg1.from ?? null;
+  } else {
+    to       = arg1;
+    text     = arg2;
+    mediaUrl = arg3 ?? null;
+  }
+
+  // === Guardie “best-effort” =================================================
+  if (!env.WA?.enabled) {
+    logger.warn('📲 WA SKIPPED (disabled)', { to: String(to || '') });
+    return { skipped: true, reason: 'disabled' };
+  }
+
+  const client = getClient();
+  if (!client) {
+    logger.warn('📲 WA SKIPPED (client_unavailable)', { to: String(to || ''), wa_env: env._debugWaConfig?.() });
+    return { skipped: true, reason: 'client_unavailable' };
+  }
+
+  const phone = normalizeToE164(to);
+  if (!phone) {
+    logger.warn('📲 WA SKIPPED (no_phone)', { to: String(to || '') });
+    return { skipped: true, reason: 'no_phone' };
+  }
+
+  const body = String(text || '').trim();
+  if (!body) {
+    logger.warn('📲 WA SKIPPED (empty_text)', { to: phone });
+    return { skipped: true, reason: 'empty_text' };
+  }
+
+  const waFrom = _normalizeFrom(from || env.WA.from);
+  if (!waFrom) {
+    logger.warn('📲 WA SKIPPED (missing_from)', { wa_env: env._debugWaConfig?.() });
+    return { skipped: true, reason: 'missing_from' };
+  }
+
+  // === Payload Twilio ========================================================
+  const payload = {
+    from: waFrom,
+    to  : `whatsapp:${phone}`,
+    body
+  };
+
+  // mediaUrl può essere string o array
+  if (mediaUrl) {
+    if (Array.isArray(mediaUrl)) {
+      const arr = mediaUrl.map(x => String(x || '').trim()).filter(Boolean);
+      if (arr.length) payload.mediaUrl = arr;
+    } else {
+      const u = String(mediaUrl).trim();
+      if (u) payload.mediaUrl = [u];
+    }
+  }
+
+  logger.info('📲 WA sendText ▶️', { to: phone, hasMedia: !!payload.mediaUrl });
+  try {
+    const msg = await client.messages.create(payload);
+    logger.info('📲 WA sendText OK ✅', { sid: msg.sid, to: phone });
+    return { ok: true, sid: msg.sid };
+  } catch (e) {
+    logger.error('📲 WA sendText ❌', { to: phone, error: String(e) });
+    throw e;
+  }
+}
+
+// Alias compatibilità
+async function sendMessage(...args) {
+  return sendText(...args);
+}
+
+/**
+ * sendStatusChange
+ * -----------------------------------------------------------------------------
+ * Invia la notifica di cambio stato prenotazione su WhatsApp.
+ * Mantiene la logica che avevi già:
+ * - se templateSid → Content API
+ * - altrimenti freeform entro 24h
  */
 async function sendStatusChange({ to, reservation, status, reason, mediaLogo }) {
   if (!env.WA?.enabled) {
@@ -7320,8 +8117,8 @@ async function sendStatusChange({ to, reservation, status, reason, mediaLogo }) 
 
   const client = getClient();
   if (!client) {
-    logger.error('📲 WA KO: client non inizializzato');
-    throw new Error('WA client not initialized');
+    logger.warn('📲 WA SKIPPED (client_unavailable)', { id: reservation?.id, wa_env: env._debugWaConfig?.() });
+    return { skipped: true, reason: 'client_unavailable' };
   }
 
   const phone = normalizeToE164(to || reservation?.contact_phone || reservation?.phone);
@@ -7332,13 +8129,14 @@ async function sendStatusChange({ to, reservation, status, reason, mediaLogo }) 
 
   // Dati testo
   const start = reservation?.start_at ? new Date(reservation.start_at) : null;
-  const ymd = start ? `${start.getFullYear()}-${String(start.getMonth()+1).padStart(2,'0')}-${String(start.getDate()).padStart(2,'0')}` : null;
-  const hm  = start ? `${String(start.getHours()).padStart(2,'0')}:${String(start.getMinutes()).padStart(2,'0')}` : null;
+  const ymd = start ? `${start.getFullYear()}-${String(start.getMonth() + 1).padStart(2, '0')}-${String(start.getDate()).padStart(2, '0')}` : null;
+  const hm  = start ? `${String(start.getHours()).padStart(2, '0')}:${String(start.getMinutes()).padStart(2, '0')}` : null;
+
   const name = reservation?.display_name || [reservation?.customer_first, reservation?.customer_last].filter(Boolean).join(' ');
   const body = buildStatusText({
     status,
-    dateYmd: ymd,
-    timeHm : hm,
+    dateYmd : ymd,
+    timeHm  : hm,
     partySize: reservation?.party_size,
     name,
     tableName: reservation?.table_name
@@ -7355,31 +8153,60 @@ async function sendStatusChange({ to, reservation, status, reason, mediaLogo }) 
       '6': reason || ''
     };
 
+    const waFrom = _normalizeFrom(env.WA.from);
+    if (!waFrom) {
+      logger.warn('📲 WA SKIPPED (missing_from)', { id: reservation?.id, wa_env: env._debugWaConfig?.() });
+      return { skipped: true, reason: 'missing_from' };
+    }
+
     logger.info('📲 WA template send ▶️', { to: phone, templateSid: env.WA.templateSid, vars });
-    const msg = await client.messages.create({
-      from: env.WA.from,
-      to  : `whatsapp:${phone}`,
-      contentSid: env.WA.templateSid,
-      contentVariables: JSON.stringify(vars),
-    });
-    logger.info('📲 WA template OK', { sid: msg.sid, to: phone });
-    return { ok: true, sid: msg.sid, template: true };
+    try {
+      const msg = await client.messages.create({
+        from: waFrom,
+        to  : `whatsapp:${phone}`,
+        contentSid: env.WA.templateSid,
+        contentVariables: JSON.stringify(vars),
+      });
+      logger.info('📲 WA template OK ✅', { sid: msg.sid, to: phone });
+      return { ok: true, sid: msg.sid, template: true };
+    } catch (e) {
+      logger.error('📲 WA template ❌', { to: phone, error: String(e) });
+      throw e;
+    }
   }
 
-  // Freeform (entro 24h)
-  const payload = { from: env.WA.from, to: `whatsapp:${phone}`, body };
-  const media = mediaLogo || env.WA.mediaLogo;
-  if (media) payload.mediaUrl = [media];
+  // Freeform: riuso sendText (così NON duplichiamo logica)
+  const media = mediaLogo || env.WA.mediaLogo || null;
+  const out = await sendText({ to: phone, text: body, mediaUrl: media });
+  return { ...out, template: false };
+}
 
-  logger.info('📲 WA freeform send ▶️', { to: phone, media: !!media });
-  const msg = await client.messages.create(payload);
-  logger.info('📲 WA freeform OK', { sid: msg.sid, to: phone });
-  return { ok: true, sid: msg.sid, template: false };
+/**
+ * health()
+ * Piccola diagnostica “safe” per capire se WA è configurato.
+ */
+function health() {
+  const w = env.WA || {};
+  const hasTwilioModule = !!_loadTwilioFactory();
+  return {
+    enabled: !!w.enabled,
+    hasTwilioModule,
+    hasSid: !!w.accountSid,
+    hasToken: !!w.authToken,
+    hasFrom: !!w.from,
+    hasTemplate: !!w.templateSid,
+    defaultCc: w.defaultCc || '+39',
+    mediaLogo: w.mediaLogo ? '[set]' : '',
+  };
 }
 
 module.exports = {
+  getClient,
+  sendText,
+  sendMessage, // alias compat
   sendStatusChange,
   _normalizeToE164: normalizeToE164,
+  health,
 };
 ```
 
@@ -7388,138 +8215,16 @@ module.exports = {
 'use strict';
 
 /**
- * WhatsApp service (Twilio) — invio messaggi di stato prenotazione.
- * - Usa template (se WA_TEMPLATE_STATUS_CHANGE_SID è impostato) oppure messaggio libero entro 24h.
- * - Normalizza numero in E.164 con prefisso di default (IT) se manca '+'.
- * - Log verbosi con emoji come il resto del progetto.
+ * ⚠️ DEPRECATO / SHIM
+ * -----------------------------------------------------------------------------
+ * Questo file esiste SOLO per retro-compatibilità.
+ * Il service reale è: ./whatsapp.service.js
+ *
+ * ✅ Se vuoi pulizia totale “hard”, puoi anche cancellare questo file
+ *    dopo aver verificato che non esistono require vecchi.
  */
 
-const twilio = require('twilio');
-const logger = require('../logger');
-const env = require('../env');
-
-let client = null;
-function getClient() {
-  if (!env.WA.enabled) {
-    return null;
-  }
-  if (!client) {
-    client = twilio(env.WA.accountSid, env.WA.authToken);
-    logger.info('📳 WA client inizializzato', { service: 'server', wa_env: env._debugWaConfig() });
-  }
-  return client;
-}
-
-/** Grezza normalizzazione in E.164 (default IT): +39 + numero senza spazi */
-function normalizeToE164(phone) {
-  if (!phone) return null;
-  let p = String(phone).trim();
-  // rimuovo spazi e non cifre (tranne +)
-  p = p.replace(/[^\d+]/g, '');
-  if (p.startsWith('+')) return p;
-  // se inizia con 00, converto in +
-  if (p.startsWith('00')) return '+' + p.slice(2);
-  // fallback: aggiungo prefisso di default
-  return (env.WA.defaultCc || '+39') + p.replace(/^0+/, '');
-}
-
-/**
- * buildStatusText: corpo del messaggio in IT
- */
-function buildStatusText({ status, dateYmd, timeHm, partySize, name, tableName }) {
-  const S = String(status || '').toUpperCase();
-  const n = name ? ` ${name}` : '';
-  const when = (dateYmd && timeHm) ? ` per il ${dateYmd} alle ${timeHm}` : '';
-  const pax = partySize ? ` (persone: ${partySize})` : '';
-  const tbl = tableName ? ` • ${tableName}` : '';
-  return `🟢 Aggiornamento prenotazione${n}:\nStato: ${S}${when}${pax}${tbl}\n— ${env.MAIL.bizName}`;
-}
-
-/**
- * Invia la notifica di cambio stato su WhatsApp.
- * options:
- *  - to (telefono cliente)
- *  - reservation (oggetto prenotazione: per testo)
- *  - status (nuovo stato)
- *  - reason (opzionale)
- *  - mediaLogo (URL immagine da allegare — opzionale; se non passato usa env.WA.mediaLogo)
- */
-async function sendStatusChange({ to, reservation, status, reason, mediaLogo }) {
-  if (!env.WA.enabled) {
-    logger.warn('📲 WA SKIPPED (disabled)', { service: 'server', id: reservation?.id });
-    return { skipped: true, reason: 'disabled' };
-  }
-
-  const client = getClient();
-  if (!client) {
-    logger.error('📲 WA KO: client non inizializzato', { service: 'server' });
-    throw new Error('WA client not initialized');
-  }
-
-  const phone = normalizeToE164(to || reservation?.contact_phone || reservation?.phone);
-  if (!phone) {
-    logger.warn('📲 WA SKIPPED (no phone)', { service: 'server', id: reservation?.id });
-    return { skipped: true, reason: 'no_phone' };
-  }
-
-  // Dati testo
-  const start = reservation?.start_at ? new Date(reservation.start_at) : null;
-  const ymd = start ? `${start.getFullYear()}-${String(start.getMonth()+1).padStart(2,'0')}-${String(start.getDate()).padStart(2,'0')}` : null;
-  const hm  = start ? `${String(start.getHours()).padStart(2,'0')}:${String(start.getMinutes()).padStart(2,'0')}` : null;
-  const name = reservation?.display_name || [reservation?.customer_first, reservation?.customer_last].filter(Boolean).join(' ');
-  const body = buildStatusText({
-    status,
-    dateYmd: ymd,
-    timeHm: hm,
-    partySize: reservation?.party_size,
-    name,
-    tableName: reservation?.table_name
-  });
-
-  // Se ho un template SID uso Content API (consigliato per fuori 24h)
-  if (env.WA.templateSid) {
-    const vars = {
-      // es: nel template puoi usare {{1}}, {{2}}, ... (dipende dal tuo template approvato)
-      '1': name || 'Cliente',
-      '2': String(status || '').toUpperCase(),
-      '3': `${ymd || ''} ${hm || ''}`.trim(),
-      '4': String(reservation?.party_size || ''),
-      '5': reservation?.table_name || '',
-      '6': reason || ''
-    };
-    logger.info('📲 WA template send ▶️', { service: 'server', to: phone, templateSid: env.WA.templateSid, vars });
-
-    const msg = await client.messages.create({
-      from: env.WA.from,                 // 'whatsapp:+1XXXX' (tuo numero approvato)
-      to:   `whatsapp:${phone}`,
-      contentSid: env.WA.templateSid,    // template approvato su WhatsApp Manager
-      contentVariables: JSON.stringify(vars),
-    });
-
-    logger.info('📲 WA template OK', { service: 'server', sid: msg.sid, to: phone });
-    return { ok: true, sid: msg.sid, template: true };
-  }
-
-  // Altrimenti messaggio libero (vale solo entro 24h di sessione)
-  const payload = {
-    from: env.WA.from,
-    to  : `whatsapp:${phone}`,
-    body
-  };
-  const media = mediaLogo || env.WA.mediaLogo;
-  if (media) payload.mediaUrl = [media];
-
-  logger.info('📲 WA freeform send ▶️', { service: 'server', to: phone, media: !!media });
-  const msg = await client.messages.create(payload);
-
-  logger.info('📲 WA freeform OK', { service: 'server', sid: msg.sid, to: phone });
-  return { ok: true, sid: msg.sid, template: false };
-}
-
-module.exports = {
-  sendStatusChange,
-  _normalizeToE164: normalizeToE164,
-};
+module.exports = require('./whatsapp.service');
 ```
 
 ### ./src/services/whatsender.service.js
@@ -7990,96 +8695,174 @@ module.exports = { mount, emitCreated, emitStatus };
 
 ### ./src/utils/customers.resolve.js
 ```
-// server/src/utils/customers.resolve.js
-// ============================================================================
-// Risoluzione "customer_user_id" partendo da email/phone.
-// - Normalizza il telefono rimuovendo TUTTO tranne le cifre (0-9)
-// - Confronta l'email in maniera case-insensitive (LOWER(email))
-// - Cerca il cliente nella tabella `users` (quella che usi per i "customers")
-// - Ritorna l'id se trovato, altrimenti null
-// ============================================================================
+// src/utils/customers.resolve.js
+// -----------------------------------------------------------------------------
+// resolveCustomerUserId(db, { email, phone, displayName? })
+//
+// - db: oggetto con .query (pool mysql2, conn mysql2 o wrapper { query }).
+// - Se trova un utente per email/telefono → restituisce id.
+// - Se non trova ma abbiamo almeno email/phone → crea un utente "cliente".
+// - Non gestisce ancora OTP: phone_verified_at e verification_channel li useremo
+//   nello STEP 2 (quando introdurremo la verifica).
+// -----------------------------------------------------------------------------
 
 'use strict';
 
-const log = require('../logger') || console;
+const logger = require('../logger');
 
-// normalizza un telefono in modo conservativo → tengo solo le cifre
-function normalizePhone(v) {
-  const s = String(v || '').trim();
-  if (!s) return null;
-  const digits = s.replace(/[^\d]/g, ''); // rimuove spazi, +, -, punti, ecc.
-  return digits || null;
+function trimOrNull(v) {
+  if (v === undefined || v === null) return null;
+  const s = String(v).trim();
+  return s || null;
 }
 
-module.exports = async function resolveCustomerUserId(db, { email, phone }) {
-  // email normalizzata a minuscole
-  const emailNorm = (email || '').trim().toLowerCase() || null;
-  const phoneNorm = normalizePhone(phone);
+// Normalizzazione molto conservativa: togli spazi, trattini, punti
+function normalizePhone(v) {
+  const s = trimOrNull(v);
+  if (!s) return null;
+  return s.replace(/[\s\-\.]/g, '');
+}
 
-  // nessun dato utile → non cerco
-  if (!emailNorm && !phoneNorm) {
-    log.info('👥 resolveCustomerUserId: nessuna email/phone, skip');
+// Normalizza risultato di db.query():
+// - mysql2/promise conn/pool → [rows, fields] → ritorniamo rows
+// - wrapper { query }        → ritorna già rows
+async function runQuery(db, sql, params = []) {
+  if (!db || typeof db.query !== 'function') {
+    throw new Error('resolveCustomerUserId: db.query mancante');
+  }
+  const res = await db.query(sql, params);
+  if (Array.isArray(res) && Array.isArray(res[0])) return res[0];
+  return res;
+}
+
+async function resolveCustomerUserId(db, payload = {}) {
+  const email       = trimOrNull(payload.email);
+  const phone       = trimOrNull(payload.phone);
+  const displayName = trimOrNull(payload.displayName);
+  const phoneNorm   = normalizePhone(phone);
+
+  if (!email && !phone) {
+    logger.info('👥 resolveCustomerUserId: skip (no email/phone)');
     return null;
   }
 
-  // --------------------------------------------------------------------------
-  // Costruisco WHERE dinamico in base a cosa ho (email, phone o entrambi)
-  // --------------------------------------------------------------------------
-  const where = [];
-  const params = [];
+  // 1) Tenta di trovare un utente esistente
+  try {
+    let row = null;
 
-  if (emailNorm) {
-    where.push('LOWER(email) = ?');
-    params.push(emailNorm);
-  }
+    if (email) {
+      const rows = await runQuery(
+        db,
+        'SELECT id, email, phone FROM users WHERE email = ? LIMIT 1',
+        [email],
+      );
+      row = rows?.[0] || null;
+    }
 
-  if (phoneNorm) {
-    // lato DB tolgo gli stessi caratteri "rumorosi" dal telefono salvato
-    where.push(`
-      REPLACE(
-        REPLACE(
-          REPLACE(
-            REPLACE(phone, ' ', ''),
-            '+', ''
-          ),
-          '-', ''
-        ),
-        '.', ''
-      ) = ?
-    `);
-    params.push(phoneNorm);
-  }
+    if (!row && phone) {
+      const rows = await runQuery(
+        db,
+        `
+          SELECT id, email, phone
+          FROM users
+          WHERE REPLACE(REPLACE(REPLACE(phone, ' ', ''), '-', ''), '.', '')
+                = REPLACE(REPLACE(REPLACE(?, ' ', ''), '-', ''), '.', '')
+          LIMIT 1
+        `,
+        [phone],
+      );
+      row = rows?.[0] || null;
+    }
 
-  const sql = `
-    SELECT id
-    FROM users
-    WHERE ${where.join(' OR ')}
-    ORDER BY id DESC
-    LIMIT 1
-  `;
+    if (row) {
+      // Best-effort: aggiorna phone_normalized (se la colonna c'è, dopo migrazione 007)
+      if (phoneNorm) {
+        try {
+          await runQuery(
+            db,
+            'UPDATE users SET phone = COALESCE(phone, ?), phone_normalized = ? WHERE id = ?',
+            [phone, phoneNorm, row.id],
+          );
+        } catch (e) {
+          logger.warn('👥 resolveCustomerUserId: update phone_normalized KO (continuo)', {
+            id: row.id,
+            error: String(e),
+          });
+        }
+      }
 
-  // Nota: mysql2/promise ritorna [rows, fields]; in alcuni punti puoi avere
-  // direttamente rows. La normalizzazione sotto copre entrambi i casi.
-  const rows = await db.query(sql, params);
-  const list = Array.isArray(rows) && Array.isArray(rows[0]) ? rows[0] : rows;
-
-  const foundId = list?.[0]?.id || null;
-
-  if (foundId) {
-    log.info('👥 resolveCustomerUserId HIT', {
-      id: foundId,
-      email: emailNorm,
-      phoneNorm,
+      logger.info('👥 resolveCustomerUserId: hit existing user', {
+        id   : row.id,
+        email: row.email,
+        phone: row.phone,
+      });
+      return row.id;
+    }
+  } catch (e) {
+    logger.warn('👥 resolveCustomerUserId: lookup KO (continuo senza customer_user_id)', {
+      error: String(e),
+      email,
+      phone,
     });
-  } else {
-    log.info('👥 resolveCustomerUserId MISS', {
-      email: emailNorm,
-      phoneNorm,
-    });
+    return null;
   }
 
-  return foundId;
-};
+  // 2) Nessun utente trovato → creiamo un nuovo "cliente"
+  try {
+    let first = null;
+    let last  = null;
+
+    if (displayName) {
+      const parts = displayName.split(/\s+/);
+      first = parts[0] || null;
+      if (parts.length > 1) {
+        last = parts.slice(1).join(' ') || null;
+      }
+    }
+
+    const now = new Date();
+
+    const result = await runQuery(
+      db,
+      `
+        INSERT INTO users
+          (first_name, last_name, email, phone, phone_normalized, trust_score, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      `,
+      [
+        first,
+        last,
+        email,
+        phone,
+        phoneNorm,
+        50,    // trust_score di default (cliente "neutro")
+        now,
+        now,
+      ],
+    );
+
+    const id = result && result.insertId ? result.insertId : null;
+
+    logger.info('👥 resolveCustomerUserId: created new customer user', {
+      id,
+      email,
+      phone,
+      displayName,
+    });
+
+    return id;
+  } catch (e) {
+    logger.error('👥 resolveCustomerUserId: INSERT user KO, continuo senza customer_user_id', {
+      error: String(e),
+      email,
+      phone,
+      displayName,
+    });
+    return null;
+  }
+}
+
+module.exports = resolveCustomerUserId;
 ```
 
 ### ./src/utils/print-order.js

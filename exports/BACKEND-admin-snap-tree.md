@@ -1,6 +1,6 @@
 # 📁 Project tree (.)
 
-_Generato: Mon, Nov 24, 2025 11:00:11 AM_
+_Generato: Tue, Jan 20, 2026 11:46:48 PM_
 
 ```text
 .
@@ -10,6 +10,8 @@ _Generato: Mon, Nov 24, 2025 11:00:11 AM_
 .git
 .gitignore
 assets
+docs
+docs/canvas-backend.md
 exports
 logs
 node_modules

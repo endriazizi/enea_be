@@ -5,12 +5,19 @@
  * -----------------------------------------------------------------------------
  * Orchestratore notifiche per ORDINI:
  * - EMAIL (riusa env.MAIL; usa nodemailer direttamente se il tuo mailer non ha metodi “order”)
- * - WHATSAPP (riusa services/whatsapp.service se presente; fallback Twilio diretto)
+ * - WHATSAPP (riusa services/whatsapp.service come UNICO punto di verità)
+ *
+ * ✅ PULIZIA:
+ * - tolto fallback Twilio diretto → niente duplicazione logica / configurazioni
+ * - se WA è disabilitato o misconfigurato → whatsapp.service ritorna {skipped:true,...}
  */
 
 const logger = require('../logger');
 const env = require('../env');
 const nodemailer = require('nodemailer');
+
+// ✅ unico service WhatsApp
+const wa = require('./whatsapp.service');
 
 let cachedTransport = null;
 function getTransport() {
@@ -126,68 +133,29 @@ async function sendEmailStatus(order, status) {
 }
 
 async function sendWhatsAppNew(order) {
-  // Prova a riusare il tuo services/whatsapp.service (se presente).
-  try {
-    const wa = require('./whatsapp.service');
-    if (typeof wa.sendText === 'function') {
-      const body = `Nuovo ordine #${order.id}\n${order.customer_name || ''}\nTotale € ${Number(order.total).toFixed(2)}`;
-      return await wa.sendText(order.phone, body);
-    }
-  } catch (_) {}
+  const body = `Nuovo ordine #${order.id}\n${order.customer_name || ''}\nTotale € ${Number(order.total).toFixed(2)}`;
+  const out = await wa.sendText(order.phone, body);
 
-  // Fallback Twilio diretto (se WA_ENABLED e credenziali presenti)
-  if (!env.WA?.enabled) return { ok: false, reason: 'wa_disabled' };
-  const { accountSid, authToken, from } = env.WA;
-  if (!accountSid || !authToken || !from) return { ok: false, reason: 'wa_misconfigured' };
-
-  const twilio = require('twilio')(accountSid, authToken);
-  const to = (order.phone || '').startsWith('whatsapp:') ? order.phone : `whatsapp:${order.phone}`;
-  try {
-    const msg = await twilio.messages.create({
-      from,
-      to,
-      body: `Ciao! Abbiamo ricevuto il tuo ordine #${order.id}. Totale € ${Number(order.total).toFixed(2)}. Ti avviseremo sugli aggiornamenti.`
-    });
-    logger.info('📲 WA NEW ✅', { sid: msg.sid });
-    return { ok: true, sid: msg.sid };
-  } catch (e) {
-    logger.error('📲 WA NEW ❌', { error: String(e) });
-    return { ok: false, reason: String(e) };
+  // log extra “di progetto”
+  if (out?.skipped) {
+    logger.warn('📲 WA NEW SKIP', { id: order.id, reason: out.reason || 'unknown' });
   }
+  return out;
 }
 
 async function sendWhatsAppStatus(order, status) {
-  try {
-    const wa = require('./whatsapp.service');
-    if (typeof wa.sendText === 'function') {
-      const body = `Aggiornamento ordine #${order.id}: ${String(status).toUpperCase()}`;
-      return await wa.sendText(order.phone, body);
-    }
-  } catch (_) {}
+  const body = `Aggiornamento ordine #${order.id}: ${String(status).toUpperCase()}`;
+  const out = await wa.sendText(order.phone, body);
 
-  if (!env.WA?.enabled) return { ok: false, reason: 'wa_disabled' };
-  const { accountSid, authToken, from } = env.WA;
-  if (!accountSid || !authToken || !from) return { ok: false, reason: 'wa_misconfigured' };
-  const twilio = require('twilio')(accountSid, authToken);
-  const to = (order.phone || '').startsWith('whatsapp:') ? order.phone : `whatsapp:${order.phone}`;
-  try {
-    const msg = await twilio.messages.create({
-      from, to,
-      body: `Aggiornamento: il tuo ordine #${order.id} è ora ${String(status).toUpperCase()}.`
-    });
-    logger.info('📲 WA STATUS ✅', { sid: msg.sid, status });
-    return { ok: true, sid: msg.sid };
-  } catch (e) {
-    logger.error('📲 WA STATUS ❌', { error: String(e), status });
-    return { ok: false, reason: String(e) };
+  if (out?.skipped) {
+    logger.warn('📲 WA STATUS SKIP', { id: order.id, status, reason: out.reason || 'unknown' });
   }
+  return out;
 }
 
 module.exports = {
   async onOrderCreated(order) {
-    // Email admin + cliente
     try { await sendEmailNew(order); } catch (e) { logger.error('🔔 email NEW ❌', { error: String(e) }); }
-    // WhatsApp cliente (se configurato)
     try { await sendWhatsAppNew(order); } catch (e) { logger.error('🔔 WA NEW ❌', { error: String(e) }); }
   },
   async onOrderStatus(order, status) {

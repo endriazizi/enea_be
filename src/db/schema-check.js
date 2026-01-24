@@ -42,14 +42,25 @@ const EXPECTED = {
   },
 
   users: {
-  id:         { data_type: 'bigint',   nullable: 'NO'  },
-  first_name: { data_type: 'varchar',  nullable: 'YES' },
-  last_name:  { data_type: 'varchar',  nullable: 'YES' },
-  email:      { data_type: 'varchar',  nullable: 'YES' },
-  phone:      { data_type: 'varchar',  nullable: 'YES' },
-  created_at: { data_type: 'timestamp',nullable: 'NO'  },
-  updated_at: { data_type: 'timestamp',nullable: 'YES' },
-},
+    id:         { data_type: 'bigint',   nullable: 'NO'  },
+    first_name: { data_type: 'varchar',  nullable: 'YES' },
+    last_name:  { data_type: 'varchar',  nullable: 'YES' },
+    email:      { data_type: 'varchar',  nullable: 'YES' },
+    phone:      { data_type: 'varchar',  nullable: 'YES' },
+
+    // 🆕 STEP 1 — modello clienti
+    phone_normalized: { data_type: 'varchar',  nullable: 'YES' },
+    phone_verified_at: { data_type: 'datetime', nullable: 'YES' },
+    verification_channel: {
+      data_type: 'enum',
+      nullable: 'YES',
+      column_type: "enum('otp_sms','otp_whatsapp','manual_call','other')",
+    },
+    trust_score: { data_type: 'tinyint', nullable: 'NO' },
+
+    created_at: { data_type: 'timestamp', nullable: 'NO'  },
+    updated_at: { data_type: 'timestamp', nullable: 'YES' },
+  },
 
   reservations: {
     id: { data_type: 'bigint', nullable: 'NO' },

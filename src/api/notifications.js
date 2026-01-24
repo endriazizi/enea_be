@@ -7,22 +7,25 @@
  * Obiettivo: MAI passare ad Express handler undefined.
  *
  * Stile: log con emoji, requireAuth con fallback DEV, guardie robuste.
+ *
+ * ✅ PULIZIA WA:
+ * - Usiamo SOLO ../services/whatsapp.service come unico punto WA
+ * - Niente più doppioni whatsapp-twilio.service
  */
 
 const express = require('express');
 const router  = express.Router();
 
 const logger = require('../logger');
-const env    = require('../env');
 
 // === requireAuth con fallback DEV (stile già usato altrove) ==================
 let requireAuth;
 try {
-  ({ requireAuth } = require('./auth'));
+  ({ requireAuth } = require('../middleware/auth'));
   if (typeof requireAuth !== 'function') throw new Error('requireAuth non è una funzione');
-  logger.info('🔐 requireAuth caricato da ./auth');
+  logger.info('🔐 requireAuth caricato da ../middleware/auth');
 } catch (e) {
-  logger.warn('⚠️ requireAuth non disponibile. Uso FALLBACK DEV (solo locale).');
+  logger.warn('⚠️ requireAuth non disponibile. Uso FALLBACK DEV (solo locale).', { error: String(e) });
   requireAuth = (req, _res, next) => {
     req.user = {
       id: Number(process.env.AUTH_DEV_ID || 0),
@@ -35,7 +38,6 @@ try {
 // === Carico servizi (con fallback a null) ====================================
 let mailer = null;
 try {
-  // Il tuo progetto ha src/services/mailer.service.js
   mailer = require('../services/mailer.service');
   logger.info('📧 mailer.service caricato');
 } catch {
@@ -44,31 +46,14 @@ try {
 
 let waSvc = null;
 try {
-  // Preferisci un "aggregatore" già esistente (whatsapp.service)
   waSvc = require('../services/whatsapp.service');
-  logger.info('📲 whatsapp.service caricato');
+  logger.info('📲 whatsapp.service caricato (UNICO)');
 } catch {
-  // In alternativa prova il provider Twilio o Whatsender se esistono
-  try {
-    waSvc = require('../services/whatsapp-twilio.service.js');
-    logger.info('📲 whatsapp-twilio.service caricato');
-  } catch {
-    try {
-      waSvc = require('../services/whatsender.service.js');
-      logger.info('📲 whatsender.service caricato');
-    } catch {
-      logger.warn('📲 Nessun servizio WhatsApp disponibile');
-      waSvc = null;
-    }
-  }
+  logger.warn('📲 whatsapp.service non disponibile');
+  waSvc = null;
 }
 
 // === Helper: wrapper sicuro per route handler ================================
-/**
- * safeRoute(handlerName, impl)
- * Ritorna sempre una funzione (req,res) valida per Express.
- * Se impl non è una funzione, risponde 501 e logga chiaramente.
- */
 function safeRoute(handlerName, impl) {
   return async (req, res) => {
     if (typeof impl !== 'function') {
@@ -90,17 +75,11 @@ router.get('/health', (_req, res) => {
     ok: true,
     mailer: !!mailer,
     whatsapp: !!waSvc,
-    providerHint: process.env.WA_PROVIDER || process.env.TWILIO_ENABLED || process.env.WHATSENDER_ENABLED || null
+    waHealth: waSvc?.health ? waSvc.health() : null
   });
 });
 
 // === EMAIL ===================================================================
-
-/**
- * POST /api/notifications/email/test
- * body: { to, subject?, text?, html? }
- * Nota: cerchiamo metodi noti nel tuo mailer: sendMail / sendSimple / sendTestEmail
- */
 router.post(
   '/email/test',
   requireAuth,
@@ -114,7 +93,6 @@ router.post(
 
     if (!to) return res.status(400).json({ error: 'missing_to' });
 
-    // Prova in ordine i metodi più comuni del tuo mailer
     const sendFn =
       mailer.sendMail ||
       mailer.sendSimple ||
@@ -137,7 +115,6 @@ router.post(
 /**
  * POST /api/notifications/wa/test
  * body: { to, text? }
- * Cerca metodi comuni: sendText / sendMessage / sendStatusChange
  */
 router.post(
   '/wa/test',
@@ -149,34 +126,16 @@ router.post(
     const text = (req.body?.text || 'Ciao 👋 questo è un messaggio di test').toString();
     if (!to) return res.status(400).json({ error: 'missing_to' });
 
-    // Trova una funzione invio compatibile nel service
-    const sendFn =
-      waSvc.sendText ||
-      waSvc.sendMessage ||
-      null;
-
-    // Alcuni tuoi service hanno invece 'sendStatusChange({to, status, ...})'
-    const sendStatusChange = waSvc.sendStatusChange || null;
-
-    let out = null;
-    if (sendFn) {
-      out = await sendFn({ to, text });
-    } else if (sendStatusChange) {
-      // fallback: uso un "finto" status-change per test (non cambia stato, solo invia testo)
-      out = await sendStatusChange({ to, reservation: { id: 0, customer_name: 'Test' }, status: 'confirmed', reason: text });
-    } else {
-      return res.status(501).json({ error: 'wa_send_method_not_found' });
-    }
-
-    logger.info('📲 WA test inviato ✅', { to, sid: out?.sid || null });
-    res.json({ ok: true, sid: out?.sid || null });
+    // Ora sendText è GARANTITO dal service unico
+    const out = await waSvc.sendText({ to, text });
+    logger.info('📲 WA test inviato ✅', { to, sid: out?.sid || null, skipped: !!out?.skipped });
+    res.json({ ok: true, sid: out?.sid || null, skipped: out?.skipped || false, reason: out?.reason || null });
   })
 );
 
 /**
  * POST /api/notifications/wa/send
  * body: { to, text, mediaUrl? }
- * Canale semplice "text" (opzionale media).
  */
 router.post(
   '/wa/send',
@@ -190,16 +149,9 @@ router.post(
 
     if (!to || !text) return res.status(400).json({ error: 'missing_params', need: 'to,text' });
 
-    const sendFn =
-      waSvc.sendText ||
-      waSvc.sendMessage ||
-      null;
-
-    if (!sendFn) return res.status(501).json({ error: 'wa_send_method_not_found' });
-
-    const out = await sendFn({ to, text, mediaUrl });
-    logger.info('📲 WA inviato ✅', { to, sid: out?.sid || null, hasMedia: !!mediaUrl });
-    res.json({ ok: true, sid: out?.sid || null });
+    const out = await waSvc.sendText({ to, text, mediaUrl });
+    logger.info('📲 WA inviato ✅', { to, sid: out?.sid || null, hasMedia: !!mediaUrl, skipped: !!out?.skipped });
+    res.json({ ok: true, sid: out?.sid || null, skipped: out?.skipped || false, reason: out?.reason || null });
   })
 );
 

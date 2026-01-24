@@ -1099,16 +1099,22 @@ router.post('/', async (req, res) => {
     // customer_user_id opzionale via helper (se disponibile)
     const email = dto.email || (dto.customer && dto.customer.email) || null;
     const phone = dto.phone || (dto.customer && dto.customer.phone) || null;
+    const displayName =
+      dto.customer_name ||
+      (dto.customer && (dto.customer.name || dto.customer.display_name)) ||
+      null;
+
     let customer_user_id = null;
     try {
       customer_user_id = await resolveCustomerUserId(
         { query },
-        { email, phone },
+        { email, phone, displayName },
       );
       if (customer_user_id) {
         logger.info('🧩 [Orders] mapped customer_user_id', {
           email,
           phone,
+          displayName,
           customer_user_id,
         });
       }
@@ -1117,6 +1123,7 @@ router.post('/', async (req, res) => {
         error: String((e && e.message) || e),
       });
     }
+
 
     // table_id dal payload, con fallback su reservation_id → reservations.table_id
     let tableIdFinal =
