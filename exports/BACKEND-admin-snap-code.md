@@ -1,6 +1,6 @@
 # 🧩 Project code (file ammessi in .)
 
-_Generato: Tue, Jan 20, 2026 11:46:49 PM_
+_Generato: Sat, Jan 24, 2026  5:01:00 PM_
 
 ### ./docs/canvas-backend.md
 ```
@@ -1545,157 +1545,238 @@ module.exports = router;
 'use strict';
 
 /**
- * API NOTIFICATIONS
- * -----------------
- * Rotte per invio email e WhatsApp (test/simple), con fallback sicuri.
- * Obiettivo: MAI passare ad Express handler undefined.
+ * api/notifications.js
+ * -----------------------------------------------------------------------------
+ * Rotte notifiche: Email + WhatsApp (Twilio)
  *
- * Stile: log con emoji, requireAuth con fallback DEV, guardie robuste.
+ * ✅ Nota importante WhatsApp:
+ * - Free-text (body) è consentito SOLO dentro la finestra 24h (sessione).
+ * - Fuori 24h devi usare un TEMPLATE approvato.
+ * - Qui aggiungiamo:
+ *    1) POST /wa/send                       -> free-text (bloccato fuori 24h se abilitato)
+ *    2) POST /wa/template/reservation-confirm -> invio TEMPLATE Quick Reply (apre finestra 24h)
+ *    3) POST /wa/inbound                    -> webhook Twilio inbound (tap bottoni / reply)
+ *    4) POST /wa/status                     -> status callback Twilio (delivered/failed ecc.)
  *
- * ✅ PULIZIA WA:
- * - Usiamo SOLO ../services/whatsapp.service come unico punto WA
- * - Niente più doppioni whatsapp-twilio.service
+ * Stile: log emoji + best-effort + non rompiamo le logiche esistenti.
  */
 
 const express = require('express');
-const router  = express.Router();
+const router = express.Router();
 
 const logger = require('../logger');
+const env    = require('../env');
 
-// === requireAuth con fallback DEV (stile già usato altrove) ==================
-let requireAuth;
+const mailer = require('../services/mailer.service');
+const wa     = require('../services/whatsapp.service');
+
+// Prenotazioni (per aggiornare stato da tap WhatsApp)
+const reservationsSvc     = require('../services/reservations.service');
+const reservationsActions = require('../services/reservations-status.service');
+
+// ----------------------------------------------------------------------------
+// Auth middleware (fallback DEV se non disponibile)
+// ----------------------------------------------------------------------------
+let requireAuth = (req, res, next) => next();
 try {
+  // eslint-disable-next-line global-require
   ({ requireAuth } = require('../middleware/auth'));
-  if (typeof requireAuth !== 'function') throw new Error('requireAuth non è una funzione');
-  logger.info('🔐 requireAuth caricato da ../middleware/auth');
+  logger.info('🔐 requireAuth caricato da ../middleware/auth', { service: 'server' });
 } catch (e) {
-  logger.warn('⚠️ requireAuth non disponibile. Uso FALLBACK DEV (solo locale).', { error: String(e) });
-  requireAuth = (req, _res, next) => {
-    req.user = {
-      id: Number(process.env.AUTH_DEV_ID || 0),
-      email: process.env.AUTH_DEV_USER || 'dev@local'
-    };
-    next();
-  };
+  logger.warn('⚠️ requireAuth NON trovato (DEV bypass).', { service: 'server', error: String(e) });
 }
 
-// === Carico servizi (con fallback a null) ====================================
-let mailer = null;
-try {
-  mailer = require('../services/mailer.service');
-  logger.info('📧 mailer.service caricato');
-} catch {
-  logger.warn('📧 mailer.service non disponibile');
-}
-
-let waSvc = null;
-try {
-  waSvc = require('../services/whatsapp.service');
-  logger.info('📲 whatsapp.service caricato (UNICO)');
-} catch {
-  logger.warn('📲 whatsapp.service non disponibile');
-  waSvc = null;
-}
-
-// === Helper: wrapper sicuro per route handler ================================
-function safeRoute(handlerName, impl) {
+// ----------------------------------------------------------------------------
+// safeRoute helper (stile tuo)
+// ----------------------------------------------------------------------------
+function safeRoute(name, fn) {
   return async (req, res) => {
-    if (typeof impl !== 'function') {
-      logger.warn(`🧯 Handler mancante: ${handlerName} → 501`);
-      return res.status(501).json({ error: 'not_implemented', handler: handlerName });
-    }
     try {
-      await impl(req, res);
-    } catch (err) {
-      logger.error(`💥 Handler ${handlerName} errore`, { error: String(err) });
-      res.status(500).json({ error: 'internal_error', detail: String(err) });
+      const out = await fn(req, res);
+      return out;
+    } catch (e) {
+      logger.error(`❌ notifications.${name} crash`, { service: 'server', error: String(e) });
+      return res.status(500).json({ ok: false, error: String(e) });
     }
   };
 }
 
-// === Health semplice =========================================================
-router.get('/health', (_req, res) => {
-  res.json({
+// ----------------------------------------------------------------------------
+// HEALTH
+// ----------------------------------------------------------------------------
+router.get('/health', safeRoute('health', async (req, res) => {
+  return res.json({
     ok: true,
-    mailer: !!mailer,
-    whatsapp: !!waSvc,
-    waHealth: waSvc?.health ? waSvc.health() : null
+    mail: {
+      enabled: !!env.MAIL?.enabled,
+      host: env.MAIL?.smtpHost ? '[set]' : '',
+    },
+    wa: wa.health ? wa.health() : { note: 'wa.health() missing' }
   });
-});
+}));
 
-// === EMAIL ===================================================================
-router.post(
-  '/email/test',
-  requireAuth,
-  safeRoute('email.test', async (req, res) => {
-    if (!mailer) return res.status(501).json({ error: 'mailer_not_available' });
+// ----------------------------------------------------------------------------
+// MAIL TEST (protetta)
+// ----------------------------------------------------------------------------
+router.post('/mail/test', requireAuth, safeRoute('mail.test', async (req, res) => {
+  const to = req.body?.to || env.MAIL?.replyTo || env.MAIL?.from || null;
+  if (!to) return res.status(400).json({ ok: false, error: 'missing_to' });
 
-    const to      = (req.body?.to || '').toString().trim();
-    const subject = (req.body?.subject || 'Test notifica').toString();
-    const text    = (req.body?.text || `Ciao ${req.user?.email || 'utente'}, questo è un test.`).toString();
-    const html    = (req.body?.html || `<p>${text}</p>`).toString();
+  const out = await mailer.sendTestEmail?.({ to }) // se esiste
+    .catch(() => null);
 
-    if (!to) return res.status(400).json({ error: 'missing_to' });
+  if (!out) {
+    // fallback minimale: invio “status change” finto
+    await mailer.sendStatusChangeEmail?.({
+      to,
+      reservation: { id: 0, start_at: new Date().toISOString(), party_size: 2 },
+      status: 'TEST',
+      reason: 'Email test'
+    });
+  }
 
-    const sendFn =
-      mailer.sendMail ||
-      mailer.sendSimple ||
-      mailer.sendTestEmail ||
-      null;
+  return res.json({ ok: true });
+}));
 
-    if (!sendFn) {
-      logger.warn('📧 Nessun metodo sendMail disponibile nel mailer');
-      return res.status(501).json({ error: 'send_method_not_found' });
+// ----------------------------------------------------------------------------
+// WA FREE TEXT (protetta) - dentro finestra 24h (se blocco attivo)
+// ----------------------------------------------------------------------------
+router.post('/wa/send', requireAuth, safeRoute('wa.send', async (req, res) => {
+  const to       = req.body?.to || null;
+  const text     = req.body?.text || req.body?.body || null;
+  const mediaUrl = req.body?.mediaUrl ?? null;
+
+  // Se vuoi forzare invio anche fuori finestra (sconsigliato): allowOutsideWindow=true
+  const allowOutsideWindow = !!req.body?.allowOutsideWindow;
+
+  const out = await wa.sendText({
+    to,
+    text,
+    mediaUrl,
+    allowOutsideWindow
+  });
+
+  return res.json(out);
+}));
+
+// ----------------------------------------------------------------------------
+// WA TEMPLATE: prenotazione conferma (protetta)
+// ----------------------------------------------------------------------------
+router.post('/wa/template/reservation-confirm', requireAuth, safeRoute('wa.template.reservationConfirm', async (req, res) => {
+  const to           = req.body?.to || null;
+  const name         = req.body?.name || null;
+  const dateStr      = req.body?.dateStr || req.body?.date || null;   // es "mercoledì 21/01/2026"
+  const timeStr      = req.body?.timeStr || req.body?.time || null;   // es "20:30"
+  const peopleStr    = req.body?.peopleStr || req.body?.people || req.body?.partySize || null;
+  const reservationId = req.body?.reservationId || null;
+
+  const out = await wa.sendReservationConfirmTemplate({
+    to,
+    name,
+    dateStr,
+    timeStr,
+    peopleStr,
+    reservationId
+  });
+
+  return res.json(out);
+}));
+
+// ----------------------------------------------------------------------------
+// WEBHOOK Twilio INBOUND (PUBBLICA)
+// ⚠️ Twilio manda x-www-form-urlencoded: usiamo express.urlencoded solo su questa route
+// ----------------------------------------------------------------------------
+router.post('/wa/inbound',
+  express.urlencoded({ extended: false }),
+  safeRoute('wa.inbound', async (req, res) => {
+    const out = await wa.handleInboundWebhook(req.body || {});
+
+    // ✅ Se riconosciamo un tap su template collegato a reservationId -> aggiorniamo stato
+    if (out?.action && out?.reservationId) {
+      const id = Number(out.reservationId);
+      const action = String(out.action);
+
+      logger.info('🧩 WA tap -> aggiorno prenotazione', { service: 'server', id, action });
+
+      // Mapping azioni:
+      // - confirm -> accepted
+      // - cancel  -> cancelled
+      const mappedAction = (action === 'confirm') ? 'accept' : (action === 'cancel' ? 'cancel' : null);
+
+      if (mappedAction) {
+        await reservationsActions.updateStatus({
+          id,
+          action: mappedAction,
+          reason: `WA tap: ${action}`,
+          user_email: 'wa:webhook'
+        });
+
+        // Ricarico la prenotazione “bella” (per broadcast + notify)
+        const reservation = await reservationsSvc.getById(id).catch(() => null);
+
+        if (reservation) {
+          // Best-effort notify (email + WA status change)
+          try {
+            if (reservation.contact_email) {
+              await mailer.sendStatusChangeEmail?.({
+                to: reservation.contact_email,
+                reservation,
+                status: reservation.status,
+                reason: `Confermato da WhatsApp (${action})`
+              });
+            }
+          } catch (e) {
+            logger.warn('⚠️ Email status change fallita (ok)', { service: 'server', error: String(e) });
+          }
+
+          try {
+            if (reservation.contact_phone) {
+              await wa.sendStatusChange({
+                to: reservation.contact_phone,
+                reservation,
+                status: reservation.status,
+                reason: `Confermato da WhatsApp (${action})`
+              });
+            }
+          } catch (e) {
+            logger.warn('⚠️ WA status change fallito (ok)', { service: 'server', error: String(e) });
+          }
+
+          // Broadcast realtime (se io è disponibile)
+          try {
+            const io = req.app?.get('io');
+            if (io) {
+              io.to('admins').emit('reservation-updated', reservation);
+              logger.info('📡 Socket reservation-updated', { service: 'server', id: reservation.id });
+            }
+          } catch (e) {
+            logger.warn('⚠️ Socket broadcast fallito (ok)', { service: 'server', error: String(e) });
+          }
+        }
+      }
     }
 
-    const out = await sendFn({ to, subject, text, html });
-    logger.info('📧 Email test inviata ✅', { to, subject, messageId: out?.messageId || null });
-    res.json({ ok: true, messageId: out?.messageId || null });
+    // ✅ Risposta “safe” per Twilio (va bene anche 200 vuoto, ma così è pulito)
+    res.set('Content-Type', 'text/xml');
+    return res.status(200).send('<Response></Response>');
   })
 );
 
-// === WHATSAPP ================================================================
+// ----------------------------------------------------------------------------
+// STATUS CALLBACK Twilio (PUBBLICA)
+// ----------------------------------------------------------------------------
+router.post('/wa/status',
+  express.urlencoded({ extended: false }),
+  safeRoute('wa.status', async (req, res) => {
+    const messageSid    = req.body?.MessageSid || null;
+    const messageStatus = req.body?.MessageStatus || null;
+    const errorCode     = req.body?.ErrorCode || null;
+    const errorMessage  = req.body?.ErrorMessage || null;
 
-/**
- * POST /api/notifications/wa/test
- * body: { to, text? }
- */
-router.post(
-  '/wa/test',
-  requireAuth,
-  safeRoute('wa.test', async (req, res) => {
-    if (!waSvc) return res.status(501).json({ error: 'wa_not_available' });
+    await wa.updateWaMessageStatus?.(messageSid, messageStatus, errorCode, errorMessage, req.body);
 
-    const to   = (req.body?.to || '').toString().trim();
-    const text = (req.body?.text || 'Ciao 👋 questo è un messaggio di test').toString();
-    if (!to) return res.status(400).json({ error: 'missing_to' });
-
-    // Ora sendText è GARANTITO dal service unico
-    const out = await waSvc.sendText({ to, text });
-    logger.info('📲 WA test inviato ✅', { to, sid: out?.sid || null, skipped: !!out?.skipped });
-    res.json({ ok: true, sid: out?.sid || null, skipped: out?.skipped || false, reason: out?.reason || null });
-  })
-);
-
-/**
- * POST /api/notifications/wa/send
- * body: { to, text, mediaUrl? }
- */
-router.post(
-  '/wa/send',
-  requireAuth,
-  safeRoute('wa.send', async (req, res) => {
-    if (!waSvc) return res.status(501).json({ error: 'wa_not_available' });
-
-    const to       = (req.body?.to || '').toString().trim();
-    const text     = (req.body?.text || '').toString();
-    const mediaUrl = (req.body?.mediaUrl || '').toString().trim() || null;
-
-    if (!to || !text) return res.status(400).json({ error: 'missing_params', need: 'to,text' });
-
-    const out = await waSvc.sendText({ to, text, mediaUrl });
-    logger.info('📲 WA inviato ✅', { to, sid: out?.sid || null, hasMedia: !!mediaUrl, skipped: !!out?.skipped });
-    res.json({ ok: true, sid: out?.sid || null, skipped: out?.skipped || false, reason: out?.reason || null });
+    res.set('Content-Type', 'text/xml');
+    return res.status(200).send('<Response></Response>');
   })
 );
 
@@ -4133,63 +4214,112 @@ WHERE NOT EXISTS (SELECT 1 FROM products WHERE name='Fritto misto');
 
 ### ./src/db/index.js
 ```
-// src/db/index.js
-// ============================================================================
-// MySQL pool (mysql2/promise) con:
-// - multipleStatements: true (migrations/file SQL interi)
-// - SET time_zone = '+00:00' (politica UTC a DB)
-// - SET NAMES utf8mb4 (emoji safe)
-// Stile: commenti lunghi, log con emoji
-// ============================================================================
 'use strict';
 
+/**
+ * src/db/index.js
+ * -----------------------------------------------------------------------------
+ * Pool MySQL (mysql2/promise) + helper query.
+ *
+ * ✅ FIX:
+ * - Leggiamo sempre da src/env.js (che ora carica anche il .env)
+ * - Normalizziamo host "localhost" → "127.0.0.1" per evitare ::1 su Windows
+ * - Logghiamo config “safe” (senza password)
+ */
+
 const mysql = require('mysql2/promise');
-const logger = require('../logger');
+const env = require('../env');
+const logger = require('./logger');
 
-const {
-  DB_HOST, DB_USER, DB_PASSWORD, DB_NAME, DB_PORT = 3306,
-} = process.env;
+let _pool = null;
 
-let pool;
+function normalizeHost(host) {
+  const h = String(host || '').trim();
+  if (!h) return '127.0.0.1';
+  if (h.toLowerCase() === 'localhost') {
+    // Windows spesso risolve localhost su ::1 (IPv6) e MySQL non ascolta lì
+    return '127.0.0.1';
+  }
+  return h;
+}
 
 function getPool() {
-  if (!pool) {
-    pool = mysql.createPool({
-      host: DB_HOST,
-      user: DB_USER,
-      password: DB_PASSWORD,
-      database: DB_NAME,
-      port: Number(DB_PORT || 3306),
-      waitForConnections: true,
-      connectionLimit: 10,
-      queueLimit: 0,
-      multipleStatements: true,
-      timezone: 'Z', // usa UTC in driver
-    });
-    logger.info('🗄️  DB Pool created', { host: DB_HOST, db: DB_NAME });
-  }
-  return pool;
+  if (_pool) return _pool;
+
+  const host = normalizeHost(env.DB.host);
+  const port = env.DB.port || 3306;
+
+  // fallback extra per non avere user/db vuoti (ti evitano log “db:'' user:''”)
+  const user = (env.DB.user && String(env.DB.user).trim()) ? env.DB.user : 'root';
+  const database = (env.DB.database && String(env.DB.database).trim()) ? env.DB.database : 'app';
+
+  _pool = mysql.createPool({
+    host,
+    port,
+    user,
+    password: env.DB.password || '',
+    database,
+    waitForConnections: true,
+    connectionLimit: 10,
+    queueLimit: 0,
+    multipleStatements: true,
+
+    // timeouts “umani”
+    connectTimeout: 10_000,
+  });
+
+  logger.info('🗄️  DB Pool created', {
+    service: 'server',
+    host,
+    port,
+    db: database,
+    user: user ? (String(user).slice(0, 2) + '…') : '',
+    envFileLoaded: env._envFileLoaded || '(none)',
+  });
+
+  return _pool;
 }
 
-async function prime(conn) {
-  await conn.query(`SET time_zone = '+00:00'`);
-  await conn.query(`SET NAMES utf8mb4 COLLATE utf8mb4_unicode_ci`);
-}
-
+/**
+ * Query helper
+ * - Ritorna direttamente rows (come fai già in varie API)
+ * - Logga SQL solo in caso di errore
+ */
 async function query(sql, params = []) {
-  const p = getPool();
-  const conn = await p.getConnection();
+  const pool = getPool();
   try {
-    await prime(conn);
-    const [rows] = await conn.query(sql, params);
+    const [rows] = await pool.query(sql, params);
     return rows;
-  } finally {
-    conn.release();
+  } catch (err) {
+    logger.error('🗄️  DB query ❌', {
+      service: 'server',
+      error: String(err && err.message ? err.message : err),
+      sql: String(sql || '').slice(0, 2000),
+    });
+    throw err;
   }
 }
 
-module.exports = { query };
+module.exports = {
+  getPool,
+  query,
+};
 ```
+
+### ./src/db/logger.js
+```
+'use strict';
+
+/**
+ * src/db/logger.js
+ * -----------------------------------------------------------------------------
+ * Bridge semplice: i file in src/db/ possono continuare a fare:
+ *   const logger = require('./logger');
+ *
+ * e noi reindirizziamo al logger vero in src/logger.js
+ */
+
+module.exports = require('../logger');```
 
 ### ./src/db/migrator.js
 ```
@@ -4460,31 +4590,89 @@ module.exports = { runSchemaCheck };
 'use strict';
 
 /**
- * Loader centralizzato env + piccoli helper.
- * Mantieni questo file dove sta (src/env.js).
+ * src/env.js
+ * -----------------------------------------------------------------------------
+ * Loader centralizzato env + helper.
+ *
+ * 🔥 FIX IMPORTANTE:
+ * - Prima ti funzionava perché caricavi il file .env (dotenv).
+ * - Ora DB_USER/DB_NAME risultano vuoti ⇒ il pool prova 127.0.0.1:3306 e fallisce.
+ *
+ * ✅ Qui rimettiamo un loader robusto:
+ * - prova .env, .env.development, .env.local, ecc.
+ * - se non trova nulla, prova anche ".env copy" / ".env copy 2" (capita spesso su Windows)
+ *
+ * NOTE:
+ * - Non uso logger qui (evito loop/circular dependency).
+ * - Se dotenv non è installato, non crasha: userai solo le env di sistema.
  */
 
+// ----------------------------------------------------------------------------
+// 1) Provo a caricare dotenv (se presente) + scelgo un file env “sensato”
+// ----------------------------------------------------------------------------
 const fs = require('fs');
 const path = require('path');
 
-// Carico .env se presente (non fallire se manca)
-try {
-  const dotenvPath = path.join(process.cwd(), '.env');
-  if (fs.existsSync(dotenvPath)) {
-    require('dotenv').config({ path: dotenvPath });
-  }
-} catch (_) {}
+const NODE_ENV = process.env.NODE_ENV || 'development';
 
-/* === Helpers === */
-function toBool(v, def = false) {
-  if (v === undefined || v === null || String(v).trim() === '') return def;
-  const s = String(v).toLowerCase();
-  return ['1', 'true', 'yes', 'y', 'on'].includes(s);
+function tryLoadDotEnv() {
+  let dotenv;
+  try {
+    dotenv = require('dotenv');
+  } catch (_) {
+    // dotenv non installato → nessun crash
+    return { loaded: false, file: '' };
+  }
+
+  const cwd = process.cwd();
+
+  // ordine: più specifico → più generico
+  const candidates = [
+    `.env.${NODE_ENV}.local`,
+    `.env.${NODE_ENV}`,
+    `.env.local`,
+    `.env`,
+    // fallback “umani” (succede quando ci si salva .env con nome diverso)
+    `.env copy`,
+    `.env copy 2`,
+    `env/.env`,
+    `env/.env.${NODE_ENV}`,
+  ];
+
+  for (const name of candidates) {
+    const full = path.join(cwd, name);
+    try {
+      if (fs.existsSync(full)) {
+        dotenv.config({ path: full });
+        return { loaded: true, file: full };
+      }
+    } catch (_) {}
+  }
+
+  return { loaded: false, file: '' };
 }
-function toInt(v, def = 0) {
-  const n = parseInt(v, 10);
+
+const _dotenvInfo = tryLoadDotEnv();
+
+// ----------------------------------------------------------------------------
+// 2) Helpers
+// ----------------------------------------------------------------------------
+function bool(v, def = false) {
+  if (v === undefined || v === null || v === '') return def;
+  const s = String(v).trim().toLowerCase();
+  return s === '1' || s === 'true' || s === 'yes' || s === 'y' || s === 'on';
+}
+
+function num(v, def = 0) {
+  const n = Number(v);
   return Number.isFinite(n) ? n : def;
 }
+
+function str(v, def = '') {
+  if (v === undefined || v === null) return def;
+  return String(v);
+}
+
 function mask(value, front = 2, back = 2) {
   if (!value) return '';
   const s = String(value);
@@ -4492,109 +4680,144 @@ function mask(value, front = 2, back = 2) {
   return s.slice(0, front) + '*'.repeat(s.length - front - back) + s.slice(-back);
 }
 
-/* === Config === */
+// ----------------------------------------------------------------------------
+// 3) Config
+// ----------------------------------------------------------------------------
 const env = {
-  NODE_ENV: process.env.NODE_ENV || 'development',
-  isProd: (process.env.NODE_ENV || 'development') === 'production',
+  NODE_ENV,
+  isProd: NODE_ENV === 'production',
 
-  PORT: toInt(process.env.PORT, 3000),
+  // (debug) quale file env è stato caricato davvero
+  _envFileLoaded: _dotenvInfo.file || '',
 
-  // CORS (lista separata da virgola)
-  CORS_WHITELIST: (process.env.CORS_WHITELIST || '')
+  // ---------------------------------------------------------------------------
+  // SERVER
+  // ---------------------------------------------------------------------------
+  PORT: num(process.env.PORT, 3000),
+
+  // CORS (separati da virgola)
+  CORS_WHITELIST: (str(process.env.CORS_WHITELIST, ''))
     .split(',')
     .map(s => s.trim())
     .filter(Boolean),
 
+  // ---------------------------------------------------------------------------
+  // DB
+  // ---------------------------------------------------------------------------
   DB: {
-    host: process.env.DB_HOST || '127.0.0.1',
-    port: toInt(process.env.DB_PORT, 3306),
-    user: process.env.DB_USER || 'root',
-    password: process.env.DB_PASSWORD || '',
-    database: process.env.DB_NAME || 'app',
+    // ⚠️ Default “furbi” in dev: evitiamo ::1 e valori vuoti
+    host: str(process.env.DB_HOST, '127.0.0.1'),
+    port: num(process.env.DB_PORT, 3306),
+    user: str(process.env.DB_USER, 'root'),
+    password: str(process.env.DB_PASSWORD, ''),
+    database: str(process.env.DB_NAME, 'app'),
+
+    // alias di compatibilità (se in qualche file usi env.DB.name)
+    get name() { return this.database; }
   },
 
+  // ---------------------------------------------------------------------------
+  // LOG (se lo usi nel tuo logger)
+  // ---------------------------------------------------------------------------
   LOG: {
-    dir: process.env.LOG_DIR || './logs',
-    retentionDays: toInt(process.env.LOG_RETENTION_DAYS, 14),
-    level: process.env.LOG_LEVEL || 'info',
+    dir: str(process.env.LOG_DIR, './logs'),
+    retentionDays: num(process.env.LOG_RETENTION_DAYS, 14),
+    level: str(process.env.LOG_LEVEL, 'info'),
   },
 
-  // 🔐 AUTENTICAZIONE (bypass dev opzionale)
-  AUTH: {
-    devBypass   : toBool(process.env.AUTH_DEV_BYPASS, false),
-    devUserEmail: process.env.AUTH_DEV_USER || 'dev@local',
-    devUserId   : toInt(process.env.AUTH_DEV_ID, 0),
-  },
-
-  // 🔑 JWT per /api/auth (HS256)
+  // ---------------------------------------------------------------------------
+  // AUTH / JWT
+  // ---------------------------------------------------------------------------
   JWT: {
-    secret     : process.env.JWT_SECRET || '',
-    ttlSeconds : toInt(process.env.JWT_TTL_SECONDS, 60 * 60 * 8), // 8h
-    issuer     : process.env.JWT_ISSUER || undefined,             // (facoltativo, non obbligatorio in verify attuale)
-    audience   : process.env.JWT_AUDIENCE || undefined,           // (facoltativo)
+    secret: str(process.env.JWT_SECRET, ''),
+    ttlSeconds: num(process.env.JWT_TTL_SECONDS, 60 * 60 * 8),
+    issuer: process.env.JWT_ISSUER || undefined,
+    audience: process.env.JWT_AUDIENCE || undefined,
   },
 
-  // Prenotazioni
-  RESV: {
-    defaultLunchMinutes : toInt(process.env.RESV_LUNCH_MINUTES, 60),
-    defaultDinnerMinutes: toInt(process.env.RESV_DINNER_MINUTES, 90),
-
-    // override vecchi
-    allowAcceptOverride : toBool(process.env.RESV_ALLOW_ACCEPT_OVERRIDE, false),
-
-    // 🔁 transizioni
-    allowBacktrack      : toBool(process.env.RESV_ALLOW_BACKTRACK, true),
-    allowAnyTransition  : toBool(process.env.RESV_ALLOW_ANY_TRANSITION, true),
-    forceTransitions    : toBool(process.env.RESV_FORCE_TRANSITIONS, false),
-
-    // 📧 notifiche (mail) sempre su cambio stato
-    notifyAlways        : toBool(process.env.RESV_NOTIFY_ALWAYS, true),
+  AUTH: {
+    devBypass: bool(process.env.AUTH_DEV_BYPASS, false),
+    devUser: str(process.env.AUTH_DEV_USER, 'dev@local'),
+    devId: num(process.env.AUTH_DEV_ID, 0),
   },
 
-  // Email / SMTP
+  // ---------------------------------------------------------------------------
+  // MAIL
+  // ---------------------------------------------------------------------------
   MAIL: {
-    enabled: toBool(process.env.MAIL_ENABLED, true),
-    host   : process.env.SMTP_HOST || 'smtp.gmail.com',
-    port   : toInt(process.env.SMTP_PORT, 587),
-    secure : toBool(process.env.SMTP_SECURE, false),
-    user   : process.env.SMTP_USER || '',
-    pass   : process.env.SMTP_PASS || '',
-    from   : process.env.MAIL_FROM || 'Prenotazioni <no-reply@example.com>',
-    replyTo: process.env.MAIL_REPLY_TO || '',
-    bizName: process.env.BIZ_NAME || 'La Mia Attività',
+    enabled: bool(process.env.MAIL_ENABLED, true),
+    host: str(process.env.SMTP_HOST, 'smtp.gmail.com'),
+    port: num(process.env.SMTP_PORT, 587),
+    secure: bool(process.env.SMTP_SECURE, false),
+    user: str(process.env.SMTP_USER, ''),
+    pass: str(process.env.SMTP_PASS, ''),
+    from: str(process.env.MAIL_FROM, 'Prenotazioni <no-reply@example.com>'),
+    replyTo: str(process.env.MAIL_REPLY_TO, ''),
+    bizName: str(process.env.BIZ_NAME, str(process.env.BRAND_NAME, 'La tua attività')),
   },
 
-  // 🟢 WhatsApp via Twilio
+  // ---------------------------------------------------------------------------
+  // WHATSAPP (TWILIO)
+  // ---------------------------------------------------------------------------
   WA: {
-    enabled     : toBool(process.env.WA_ENABLED, false),
-    accountSid  : process.env.TWILIO_ACCOUNT_SID || '',
-    authToken   : process.env.TWILIO_AUTH_TOKEN || '',
-    from        : process.env.WA_FROM || '',           // 'whatsapp:+39....'
-    defaultCc   : process.env.WA_DEFAULT_CC || '+39',
-    mediaLogo   : process.env.WA_MEDIA_LOGO_URL || '',
-    templateSid : process.env.WA_TEMPLATE_STATUS_CHANGE_SID || '',
+    enabled: bool(process.env.WA_ENABLED, false),
+    notifyAlways: bool(process.env.WA_NOTIFY_ALWAYS, false),
+
+    accountSid: str(process.env.TWILIO_ACCOUNT_SID, ''),
+    authToken: str(process.env.TWILIO_AUTH_TOKEN, ''),
+
+    from: str(process.env.WA_FROM, ''),
+    defaultCc: str(process.env.WA_DEFAULT_CC, '+39'),
+    defaultCountry: str(process.env.WA_DEFAULT_COUNTRY, 'IT'),
+
+    mediaLogo: str(process.env.WA_MEDIA_LOGO_URL, ''),
+
+    // template “status change”
+    templateSid: str(process.env.WA_TEMPLATE_STATUS_CHANGE_SID, ''),
+
+    // template “prenotazione conferma” (Quick Reply)
+    templateReservationConfirmSid: str(process.env.WA_TEMPLATE_RESERVATION_CONFIRM_SID, ''),
+
+    // blocco free-text fuori 24h
+    blockFreeTextOutside24h: bool(process.env.WA_BLOCK_FREE_TEXT_OUTSIDE_24H, false),
+
+    // webhook base url (backend pubblico)
+    webhookBaseUrl: str(process.env.WA_WEBHOOK_BASE_URL, ''),
+
+    // apply actions auto (confirm/cancel) dal webhook
+    autoApplyActions: bool(process.env.WA_AUTO_APPLY_ACTIONS, false),
+
+    // log contenuto messaggi (di solito NO)
+    logContent: bool(process.env.WA_LOG_CONTENT, false),
   },
 
-  // Util per debugging a runtime delle variabili
-  _debugMailConfig() {
-    const m = env.MAIL;
+  // ---------------------------------------------------------------------------
+  // Debug helpers (safe: non stampare segreti)
+  // ---------------------------------------------------------------------------
+  _debugDbConfig() {
+    const d = env.DB;
     return {
-      enabled: m.enabled, host: m.host, port: m.port, secure: m.secure,
-      user: mask(m.user, 3, 2), from: m.from, replyTo: m.replyTo,
-      bizName: m.bizName, resvNotifyAlways: env.RESV.notifyAlways,
+      host: d.host,
+      port: d.port,
+      database: d.database,
+      user: mask(d.user, 2, 1),
+      password: d.password ? '[set]' : '',
+      envFileLoaded: env._envFileLoaded || '(none)',
     };
   },
+
   _debugWaConfig() {
     const w = env.WA;
     return {
-      enabled: w.enabled,
-      accountSid: mask(w.accountSid, 4, 3),
-      from: w.from,
-      defaultCc: w.defaultCc,
-      mediaLogo: w.mediaLogo ? '[set]' : '',
-      templateSid: w.templateSid ? mask(w.templateSid, 4, 3) : '',
+      enabled: !!w.enabled,
+      accountSid: w.accountSid ? mask(w.accountSid, 6, 3) : '',
+      authToken: w.authToken ? '[set]' : '',
+      from: w.from || '',
+      templateSid: w.templateSid ? '[set]' : '',
+      templateReservationConfirmSid: w.templateReservationConfirmSid ? '[set]' : '',
+      webhookBaseUrl: w.webhookBaseUrl || '',
     };
-  }
+  },
 };
 
 module.exports = env;
@@ -7879,40 +8102,109 @@ module.exports = {
 /**
  * services/whatsapp.service.js
  * -----------------------------------------------------------------------------
- * ✅ UNICA FONTE DI VERITÀ per WhatsApp nel backend.
+ * ✅ UNICA FONTE DI VERITÀ WhatsApp (Twilio)
  *
- * Provider attuale: Twilio.
+ * Obiettivi:
+ * 1) Inviare TEMPLATE approvato (Quick Reply) per aprire finestra 24h
+ * 2) Gestire inbound webhook Twilio:
+ *    - ButtonPayload / ButtonText / Body
+ *    - OriginalRepliedMessageSid -> risalire a reservation_id
+ * 3) BLOCCARE free-text fuori finestra 24h (evita “200 OK ma non consegnato”)
+ * 4) Salvare tracking su DB (best-effort) + fallback in-memory in DEV
  *
- * Cosa risolve questa “pulizia totale”:
- * 1) Prima avevi più file simili (whatsapp.service.js / whatsapp-twilio.service.js / whatsapp.twilio.service.jS)
- *    → ora resta un solo service "vero".
- * 2) Prima mancava sendText() nel whatsapp.service.js, quindi:
- *    - /api/notifications/wa/send poteva finire in 501
- *    - notify.service faceva fallback Twilio diretto duplicando logica
- *    → ora sendText esiste e viene riusato ovunque.
- *
- * API ESPOSTA (stabile):
- * - sendText(to, text, mediaUrl?)
- * - sendText({ to, text, mediaUrl?, from? })
- * - sendMessage(...) alias di sendText (compatibilità)
- * - sendStatusChange({ to, reservation, status, reason?, mediaLogo? })
- * - _normalizeToE164(phone)
- * - health()
- *
- * ENV (vedi src/env.js):
+ * ENV principali:
  * - WA_ENABLED=true|false
- * - TWILIO_ACCOUNT_SID=...
+ * - TWILIO_ACCOUNT_SID=AC...
  * - TWILIO_AUTH_TOKEN=...
- * - WA_FROM="whatsapp:+39..."           (numero/ID Twilio abilitato)
- * - WA_DEFAULT_CC="+39"
- * - WA_MEDIA_LOGO_URL="https://..."
- * - WA_TEMPLATE_STATUS_CHANGE_SID="HX..." (opzionale, Content API)
+ * - WA_FROM=whatsapp:+1...   (numero WhatsApp abilitato su Twilio)
+ * - WA_DEFAULT_CC=+39
+ *
+ * Template SID:
+ * - WA_TEMPLATE_RESERVATION_CONFIRM_SID=HX...  (QUICK REPLY conferma prenotazione)
+ * - WA_TEMPLATE_STATUS_CHANGE_SID=HX...        (template cambio stato - opzionale)
+ *
+ * Webhook:
+ * - WA_WEBHOOK_BASE_URL=https://.... (PUBBLICO, raggiungibile da Twilio!)
+ * - WA_BLOCK_FREE_TEXT_OUTSIDE_24H=true|false
  */
 
 const logger = require('../logger');
 const env    = require('../env');
 
-// Caricamento "lazy" di Twilio: se WA è disabilitato, NON vogliamo crash.
+// ----------------------------------------------------------------------------
+// DB best-effort (se non c’è, fallback in-memory)
+// ----------------------------------------------------------------------------
+let dbQuery = null;
+try {
+  // eslint-disable-next-line global-require
+  const db = require('../db');
+  dbQuery = db.query || null;
+} catch (e) {
+  dbQuery = null;
+}
+
+// mysql2 compat: a volte query() ritorna [rows, fields]
+async function dbExec(sql, params) {
+  if (!dbQuery) return null;
+  const out = await dbQuery(sql, params);
+  if (Array.isArray(out) && Array.isArray(out[0])) return out[0];
+  return out;
+}
+
+// ----------------------------------------------------------------------------
+// Config letta da env.js + fallback process.env (così NON rompiamo nulla)
+// ----------------------------------------------------------------------------
+function envStr(v, fb = '') {
+  const s = (v === undefined || v === null) ? '' : String(v);
+  return s.trim() || fb;
+}
+function envBool(v, fb = false) {
+  const s = envStr(v, '');
+  if (!s) return fb;
+  return ['1', 'true', 'yes', 'y', 'on'].includes(s.toLowerCase());
+}
+
+const CFG = {
+  enabled : envBool(process.env.WA_ENABLED, !!env.WA?.enabled),
+  sid     : envStr(process.env.TWILIO_ACCOUNT_SID, env.WA?.accountSid || ''),
+  token   : envStr(process.env.TWILIO_AUTH_TOKEN, env.WA?.authToken || ''),
+  from    : envStr(process.env.WA_FROM, env.WA?.from || ''),
+  defaultCc: envStr(process.env.WA_DEFAULT_CC, env.WA?.defaultCc || '+39'),
+
+  templateReservationConfirmSid: envStr(
+    process.env.WA_TEMPLATE_RESERVATION_CONFIRM_SID,
+    env.WA?.templateReservationConfirmSid || ''
+  ),
+  templateStatusChangeSid: envStr(
+    process.env.WA_TEMPLATE_STATUS_CHANGE_SID,
+    // fallback vecchio nome
+    env.WA?.templateStatusChangeSid || env.WA?.templateSid || ''
+  ),
+
+  webhookBaseUrl: envStr(
+    process.env.WA_WEBHOOK_BASE_URL,
+    env.WA?.webhookBaseUrl || env.PUBLIC_BASE_URL || ''
+  ),
+
+  blockFreeTextOutside24h: envBool(
+    process.env.WA_BLOCK_FREE_TEXT_OUTSIDE_24H,
+    !!env.WA?.blockFreeTextOutside24h
+  ),
+
+  logContent: envBool(process.env.WA_LOG_CONTENT, !!env.WA?.logContent),
+};
+
+// ----------------------------------------------------------------------------
+// Fallback in-memory (DEV)
+// ----------------------------------------------------------------------------
+const mem = {
+  lastInboundAtByPhone: new Map(), // phone_e164 -> Date
+  outboundLinkBySid: new Map(),    // templateSid(MessageSid) -> { reservationId, kind, toPhone, createdAt }
+};
+
+// ----------------------------------------------------------------------------
+// Twilio lazy require
+// ----------------------------------------------------------------------------
 let _twilioFactory = null;
 function _loadTwilioFactory() {
   if (_twilioFactory) return _twilioFactory;
@@ -7928,48 +8220,42 @@ function _loadTwilioFactory() {
 }
 
 let _client = null;
-
-/**
- * getClient()
- * - Restituisce un Twilio client singleton
- * - Se WA non è abilitato o mancano credenziali → null (best-effort)
- */
 function getClient() {
-  if (!env.WA?.enabled) return null;
+  if (!CFG.enabled) return null;
 
   const twilioFactory = _loadTwilioFactory();
   if (!twilioFactory) return null;
 
-  if (!env.WA.accountSid || !env.WA.authToken) {
-    logger.warn('📲 WA: credenziali Twilio mancanti', { wa_env: env._debugWaConfig?.() });
+  if (!CFG.sid || !CFG.token) {
+    logger.warn('📲 WA: credenziali Twilio mancanti', {
+      wa_env: { enabled: CFG.enabled, hasSid: !!CFG.sid, hasToken: !!CFG.token, hasFrom: !!CFG.from }
+    });
     return null;
   }
 
   if (!_client) {
-    _client = twilioFactory(env.WA.accountSid, env.WA.authToken);
-    logger.info('📳 WA client inizializzato', { wa_env: env._debugWaConfig?.() });
+    _client = twilioFactory(CFG.sid, CFG.token);
+    logger.info('📳 WA client inizializzato', {
+      wa_env: { enabled: CFG.enabled, hasSid: !!CFG.sid, hasToken: !!CFG.token, from: CFG.from ? '[set]' : '' }
+    });
   }
 
   return _client;
 }
 
-/** Rimuove prefisso whatsapp: se presente */
+// ----------------------------------------------------------------------------
+// Helpers phone
+// ----------------------------------------------------------------------------
 function _stripWhatsappPrefix(v) {
   const s = String(v || '').trim();
   if (!s) return '';
   return s.startsWith('whatsapp:') ? s.slice('whatsapp:'.length) : s;
 }
 
-/**
- * Normalizzazione grezza in E.164 (default IT):
- * - accetta: "333..." / "+39333..." / "0039333..." / "whatsapp:+39333..."
- * - output: "+39333..."
- */
 function normalizeToE164(phone) {
   if (!phone) return null;
 
   let p = _stripWhatsappPrefix(phone);
-
   p = String(p).trim();
   p = p.replace(/[^\d+]/g, '');
 
@@ -7977,15 +8263,22 @@ function normalizeToE164(phone) {
   if (p.startsWith('+')) return p;
   if (p.startsWith('00')) return '+' + p.slice(2);
 
-  // fallback: aggiungo prefisso di default (es: +39)
-  return (env.WA.defaultCc || '+39') + p.replace(/^0+/, '');
+  // fallback: aggiungo prefisso default (es +39)
+  return (CFG.defaultCc || '+39') + p.replace(/^0+/, '');
 }
 
-/**
- * Normalizza "from" per Twilio:
- * - input: "whatsapp:+39..." oppure "+39..." oppure "0039..." oppure "333..."
- * - output: "whatsapp:+39..."
- */
+function toWhatsAppAddress(phoneE164) {
+  const p = normalizeToE164(phoneE164);
+  if (!p) return null;
+  return `whatsapp:${p}`;
+}
+
+function fromWhatsAppAddress(addr) {
+  if (!addr) return null;
+  const a = String(addr);
+  return a.startsWith('whatsapp:') ? a.replace('whatsapp:', '') : a;
+}
+
 function _normalizeFrom(from) {
   const raw = String(from || '').trim();
   if (!raw) return '';
@@ -7994,87 +8287,226 @@ function _normalizeFrom(from) {
 
   const e164 = normalizeToE164(raw);
   if (!e164) return '';
-
   return `whatsapp:${e164}`;
 }
 
-/** Corpo testo semplice (IT) per cambio stato prenotazione */
-function buildStatusText({ status, dateYmd, timeHm, partySize, name, tableName }) {
-  const S = String(status || '').toUpperCase();
-  const n = name ? ` ${name}` : '';
-  const when = (dateYmd && timeHm) ? ` per il ${dateYmd} alle ${timeHm}` : '';
-  const pax = partySize ? ` (persone: ${partySize})` : '';
-  const tbl = tableName ? ` • ${tableName}` : '';
-  return `🟢 Aggiornamento prenotazione${n}:\nStato: ${S}${when}${pax}${tbl}\n— ${env.MAIL?.bizName || 'La tua attività'}`;
+function safeJson(obj) {
+  try { return JSON.stringify(obj); } catch (e) { return '{"_error":"json_stringify_failed"}'; }
 }
 
-/**
- * sendText
- * -----------------------------------------------------------------------------
- * Firma supportata:
- *   - sendText(to, text, mediaUrl?)
- *   - sendText({ to, text, mediaUrl?, from? })
- *
- * Ritorno:
- *   - { ok:true, sid }
- *   - oppure { skipped:true, reason:"..." } se disabilitato/misconfig/no phone/testo vuoto
- */
+// ----------------------------------------------------------------------------
+// DB helpers (best-effort)
+// ----------------------------------------------------------------------------
+async function upsertContactInbound(phoneE164, waId, profileName, inboundAtUtc) {
+  if (!phoneE164) return;
+
+  mem.lastInboundAtByPhone.set(phoneE164, inboundAtUtc);
+
+  if (!dbQuery) return;
+  try {
+    await dbExec(
+      `
+      INSERT INTO wa_contacts (phone_e164, wa_id, profile_name, last_inbound_at)
+      VALUES (?, ?, ?, ?)
+      ON DUPLICATE KEY UPDATE
+        wa_id = VALUES(wa_id),
+        profile_name = VALUES(profile_name),
+        last_inbound_at = VALUES(last_inbound_at)
+      `,
+      [phoneE164, waId || null, profileName || null, inboundAtUtc]
+    );
+  } catch (e) {
+    logger.warn(`⚠️ WA contacts upsert fallito (ok in DEV): ${e.message}`, { service: 'server' });
+  }
+}
+
+async function insertWaMessage(row) {
+  if (!row || !row.sid) return;
+
+  // Fallback in-memory per link (importantissimo per OriginalRepliedMessageSid)
+  if (row.direction === 'out') {
+    mem.outboundLinkBySid.set(row.sid, {
+      reservationId: row.reservation_id || null,
+      kind: row.kind,
+      toPhone: row.to_phone || null,
+      createdAt: new Date(),
+    });
+  }
+
+  if (!dbQuery) return;
+  try {
+    await dbExec(
+      `
+      INSERT INTO wa_messages
+        (sid, direction, kind, to_phone, from_phone, reservation_id, status, payload_json, created_at)
+      VALUES
+        (?,   ?,         ?,    ?,        ?,          ?,             ?,      ?,           UTC_TIMESTAMP())
+      `,
+      [
+        row.sid,
+        row.direction,
+        row.kind,
+        row.to_phone || null,
+        row.from_phone || null,
+        row.reservation_id || null,
+        row.status || null,
+        row.payload_json || null,
+      ]
+    );
+  } catch (e) {
+    logger.warn(`⚠️ WA messages insert fallito (ok in DEV): ${e.message}`, { service: 'server' });
+  }
+}
+
+async function updateWaMessageStatus(messageSid, status, errorCode, errorMessage, payload) {
+  if (!messageSid) return;
+
+  if (!dbQuery) return;
+  try {
+    await dbExec(
+      `
+      UPDATE wa_messages
+      SET status = ?, error_code = ?, error_message = ?, payload_json = COALESCE(payload_json, ?)
+      WHERE sid = ?
+      `,
+      [status || null, errorCode || null, errorMessage || null, payload ? safeJson(payload) : null, messageSid]
+    );
+  } catch (e) {
+    logger.warn(`⚠️ WA status update fallito (ok in DEV): ${e.message}`, { service: 'server' });
+  }
+}
+
+async function getLastInboundAt(phoneE164) {
+  if (!phoneE164) return null;
+
+  if (dbQuery) {
+    try {
+      const rows = await dbExec(`SELECT last_inbound_at FROM wa_contacts WHERE phone_e164 = ? LIMIT 1`, [phoneE164]);
+      const r = Array.isArray(rows) ? rows[0] : null;
+      if (r && r.last_inbound_at) return new Date(r.last_inbound_at);
+    } catch (e) {
+      // ignore
+    }
+  }
+
+  return mem.lastInboundAtByPhone.get(phoneE164) || null;
+}
+
+async function findOutboundLinkBySid(originalSid) {
+  if (!originalSid) return null;
+
+  if (dbQuery) {
+    try {
+      const rows = await dbExec(
+        `
+        SELECT reservation_id, kind, to_phone
+        FROM wa_messages
+        WHERE sid = ? AND direction = 'out'
+        ORDER BY id DESC
+        LIMIT 1
+        `,
+        [originalSid]
+      );
+      const r = Array.isArray(rows) ? rows[0] : null;
+      if (r) {
+        return { reservationId: r.reservation_id || null, kind: r.kind || null, toPhone: r.to_phone || null };
+      }
+    } catch (e) {
+      // ignore
+    }
+  }
+
+  return mem.outboundLinkBySid.get(originalSid) || null;
+}
+
+async function isWithin24hSession(phoneE164) {
+  const last = await getLastInboundAt(phoneE164);
+  if (!last) return false;
+  const diffMs = Date.now() - last.getTime();
+  return diffMs >= 0 && diffMs <= 24 * 60 * 60 * 1000;
+}
+
+// ----------------------------------------------------------------------------
+// URL callback status
+// ----------------------------------------------------------------------------
+function buildStatusCallbackUrl() {
+  const base = envStr(CFG.webhookBaseUrl, '');
+  if (!base) return null;
+  return `${base.replace(/\/$/, '')}/api/notifications/wa/status`;
+}
+
+// ----------------------------------------------------------------------------
+// API: FREE TEXT
+// ----------------------------------------------------------------------------
 async function sendText(arg1, arg2, arg3) {
-  // === Parse parametri in modo compatibile ==================================
+  // Firma compat:
+  // - sendText(to, text, mediaUrl?)
+  // - sendText({ to, text, mediaUrl?, from?, allowOutsideWindow? })
   let to = null;
   let text = null;
   let mediaUrl = null;
   let from = null;
+  let allowOutsideWindow = false;
 
   if (arg1 && typeof arg1 === 'object') {
-    to       = arg1.to;
-    text     = arg1.text ?? arg1.body ?? arg1.message ?? null;
+    to = arg1.to;
+    text = arg1.text ?? arg1.body ?? arg1.message ?? null;
     mediaUrl = arg1.mediaUrl ?? null;
-    from     = arg1.from ?? null;
+    from = arg1.from ?? null;
+    allowOutsideWindow = !!arg1.allowOutsideWindow;
   } else {
-    to       = arg1;
-    text     = arg2;
+    to = arg1;
+    text = arg2;
     mediaUrl = arg3 ?? null;
   }
 
-  // === Guardie “best-effort” =================================================
-  if (!env.WA?.enabled) {
+  if (!CFG.enabled) {
     logger.warn('📲 WA SKIPPED (disabled)', { to: String(to || '') });
-    return { skipped: true, reason: 'disabled' };
+    return { ok: false, skipped: true, reason: 'disabled' };
   }
 
   const client = getClient();
   if (!client) {
-    logger.warn('📲 WA SKIPPED (client_unavailable)', { to: String(to || ''), wa_env: env._debugWaConfig?.() });
-    return { skipped: true, reason: 'client_unavailable' };
+    logger.warn('📲 WA SKIPPED (client_unavailable)', { to: String(to || '') });
+    return { ok: false, skipped: true, reason: 'client_unavailable' };
   }
 
   const phone = normalizeToE164(to);
   if (!phone) {
     logger.warn('📲 WA SKIPPED (no_phone)', { to: String(to || '') });
-    return { skipped: true, reason: 'no_phone' };
+    return { ok: false, skipped: true, reason: 'no_phone' };
   }
 
   const body = String(text || '').trim();
   if (!body) {
     logger.warn('📲 WA SKIPPED (empty_text)', { to: phone });
-    return { skipped: true, reason: 'empty_text' };
+    return { ok: false, skipped: true, reason: 'empty_text' };
   }
 
-  const waFrom = _normalizeFrom(from || env.WA.from);
+  // BLOCCO fuori 24h (se attivo)
+  if (CFG.blockFreeTextOutside24h && !allowOutsideWindow) {
+    const inSession = await isWithin24hSession(phone);
+    if (!inSession) {
+      logger.warn('⛔ WA free-text BLOCCATO (fuori finestra 24h) -> usa TEMPLATE', { service: 'server', to: phone });
+      return { ok: false, skipped: true, reason: 'outside_24h_window_use_template' };
+    }
+  }
+
+  const waFrom = _normalizeFrom(from || CFG.from);
   if (!waFrom) {
-    logger.warn('📲 WA SKIPPED (missing_from)', { wa_env: env._debugWaConfig?.() });
-    return { skipped: true, reason: 'missing_from' };
+    logger.warn('📲 WA SKIPPED (missing_from)', { to: phone });
+    return { ok: false, skipped: true, reason: 'missing_from' };
   }
 
-  // === Payload Twilio ========================================================
   const payload = {
     from: waFrom,
-    to  : `whatsapp:${phone}`,
-    body
+    to: toWhatsAppAddress(phone),
+    body,
   };
 
-  // mediaUrl può essere string o array
+  const cb = buildStatusCallbackUrl();
+  if (cb) payload.statusCallback = cb;
+
   if (mediaUrl) {
     if (Array.isArray(mediaUrl)) {
       const arr = mediaUrl.map(x => String(x || '').trim()).filter(Boolean);
@@ -8085,49 +8517,151 @@ async function sendText(arg1, arg2, arg3) {
     }
   }
 
-  logger.info('📲 WA sendText ▶️', { to: phone, hasMedia: !!payload.mediaUrl });
-  try {
-    const msg = await client.messages.create(payload);
-    logger.info('📲 WA sendText OK ✅', { sid: msg.sid, to: phone });
-    return { ok: true, sid: msg.sid };
-  } catch (e) {
-    logger.error('📲 WA sendText ❌', { to: phone, error: String(e) });
-    throw e;
-  }
+  logger.info('📲 WA sendText ▶️', {
+    service: 'server',
+    to: phone,
+    hasMedia: !!payload.mediaUrl,
+    body: CFG.logContent ? body : '[hidden]'
+  });
+
+  const msg = await client.messages.create(payload);
+
+  logger.info('📲 WA sendText OK ✅', { service: 'server', sid: msg.sid, to: phone });
+
+  await insertWaMessage({
+    sid: msg.sid,
+    direction: 'out',
+    kind: 'free_text',
+    to_phone: phone,
+    from_phone: fromWhatsAppAddress(waFrom),
+    reservation_id: null,
+    status: msg.status || null,
+    payload_json: safeJson({ payload }),
+  });
+
+  return { ok: true, sid: msg.sid, skipped: false, reason: null };
 }
 
-// Alias compatibilità
+// Alias compat
 async function sendMessage(...args) {
   return sendText(...args);
 }
 
-/**
- * sendStatusChange
- * -----------------------------------------------------------------------------
- * Invia la notifica di cambio stato prenotazione su WhatsApp.
- * Mantiene la logica che avevi già:
- * - se templateSid → Content API
- * - altrimenti freeform entro 24h
- */
-async function sendStatusChange({ to, reservation, status, reason, mediaLogo }) {
-  if (!env.WA?.enabled) {
-    logger.warn('📲 WA SKIPPED (disabled)', { id: reservation?.id });
-    return { skipped: true, reason: 'disabled' };
-  }
+// ----------------------------------------------------------------------------
+// API: TEMPLATE (Content API)
+// ----------------------------------------------------------------------------
+async function sendTemplate({ to, contentSid, variables = {}, kind = 'template', reservationId = null }) {
+  const phone = normalizeToE164(to);
+  if (!phone) return { ok: false, skipped: true, reason: 'invalid_to' };
+  if (!contentSid) return { ok: false, skipped: true, reason: 'missing_contentSid' };
+
+  if (!CFG.enabled) return { ok: false, skipped: true, reason: 'disabled' };
 
   const client = getClient();
-  if (!client) {
-    logger.warn('📲 WA SKIPPED (client_unavailable)', { id: reservation?.id, wa_env: env._debugWaConfig?.() });
-    return { skipped: true, reason: 'client_unavailable' };
+  if (!client) return { ok: false, skipped: true, reason: 'client_unavailable' };
+
+  const waFrom = _normalizeFrom(CFG.from);
+  if (!waFrom) return { ok: false, skipped: true, reason: 'missing_from' };
+
+  const payload = {
+    from: waFrom,
+    to: toWhatsAppAddress(phone),
+    contentSid,
+    contentVariables: safeJson(variables),
+  };
+
+  const cb = buildStatusCallbackUrl();
+  if (cb) payload.statusCallback = cb;
+
+  logger.info('📲 WA template send ▶️', {
+    service: 'server',
+    to: phone,
+    kind,
+    reservationId: reservationId || null,
+    contentSid
+  });
+
+  const msg = await client.messages.create(payload);
+
+  logger.info('📲 WA template OK ✅', {
+    service: 'server',
+    sid: msg.sid,
+    to: phone,
+    kind,
+    reservationId: reservationId || null
+  });
+
+  // IMPORTANTISSIMO: link SID template -> reservationId
+  await insertWaMessage({
+    sid: msg.sid,
+    direction: 'out',
+    kind,
+    to_phone: phone,
+    from_phone: fromWhatsAppAddress(waFrom),
+    reservation_id: reservationId,
+    status: msg.status || null,
+    payload_json: safeJson({ payload }),
+  });
+
+  return { ok: true, sid: msg.sid, skipped: false, reason: null };
+}
+
+// ----------------------------------------------------------------------------
+// TEMPLATE: Prenotazione - conferma (quello che hai creato)
+// Variabili:
+//  {{1}} Nome
+//  {{2}} Data
+//  {{3}} Ora
+//  {{4}} Coperti
+// ----------------------------------------------------------------------------
+async function sendReservationConfirmTemplate({ to, name, dateStr, timeStr, peopleStr, reservationId }) {
+  const sid = CFG.templateReservationConfirmSid;
+  if (!sid) {
+    logger.error('❌ WA_TEMPLATE_RESERVATION_CONFIRM_SID mancante in .env', { service: 'server' });
+    return { ok: false, skipped: true, reason: 'missing_env_template_sid' };
+  }
+
+  const vars = {
+    1: String(name || '').trim() || 'Cliente',
+    2: String(dateStr || '').trim() || '-',
+    3: String(timeStr || '').trim() || '-',
+    4: String(peopleStr || '').trim() || '-',
+  };
+
+  return sendTemplate({
+    to,
+    contentSid: sid,
+    variables: vars,
+    kind: 'reservation_confirm',
+    reservationId: reservationId || null,
+  });
+}
+
+// ----------------------------------------------------------------------------
+// STATUS CHANGE (compat + template opzionale)
+// ----------------------------------------------------------------------------
+function buildStatusText({ status, dateYmd, timeHm, partySize, name, tableName }) {
+  const S = String(status || '').toUpperCase();
+  const n = name ? ` ${name}` : '';
+  const when = (dateYmd && timeHm) ? ` per il ${dateYmd} alle ${timeHm}` : '';
+  const pax = partySize ? ` (persone: ${partySize})` : '';
+  const tbl = tableName ? ` • ${tableName}` : '';
+  return `🟢 Aggiornamento prenotazione${n}:\nStato: ${S}${when}${pax}${tbl}\n— ${env.MAIL?.bizName || 'La tua attività'}`;
+}
+
+async function sendStatusChange({ to, reservation, status, reason }) {
+  if (!CFG.enabled) {
+    logger.warn('📲 WA SKIPPED (disabled)', { id: reservation?.id });
+    return { ok: false, skipped: true, reason: 'disabled' };
   }
 
   const phone = normalizeToE164(to || reservation?.contact_phone || reservation?.phone);
   if (!phone) {
     logger.warn('📲 WA SKIPPED (no phone)', { id: reservation?.id });
-    return { skipped: true, reason: 'no_phone' };
+    return { ok: false, skipped: true, reason: 'no_phone' };
   }
 
-  // Dati testo
+  // Ricavo data/ora dal start_at (best-effort)
   const start = reservation?.start_at ? new Date(reservation.start_at) : null;
   const ymd = start ? `${start.getFullYear()}-${String(start.getMonth() + 1).padStart(2, '0')}-${String(start.getDate()).padStart(2, '0')}` : null;
   const hm  = start ? `${String(start.getHours()).padStart(2, '0')}:${String(start.getMinutes()).padStart(2, '0')}` : null;
@@ -8135,15 +8669,15 @@ async function sendStatusChange({ to, reservation, status, reason, mediaLogo }) 
   const name = reservation?.display_name || [reservation?.customer_first, reservation?.customer_last].filter(Boolean).join(' ');
   const body = buildStatusText({
     status,
-    dateYmd : ymd,
-    timeHm  : hm,
+    dateYmd: ymd,
+    timeHm: hm,
     partySize: reservation?.party_size,
     name,
     tableName: reservation?.table_name
   });
 
-  // Template (Content API) se disponibile
-  if (env.WA.templateSid) {
+  // Se hai un template status-change lo uso (fuori finestra va bene)
+  if (CFG.templateStatusChangeSid) {
     const vars = {
       '1': name || 'Cliente',
       '2': String(status || '').toUpperCase(),
@@ -8153,59 +8687,142 @@ async function sendStatusChange({ to, reservation, status, reason, mediaLogo }) 
       '6': reason || ''
     };
 
-    const waFrom = _normalizeFrom(env.WA.from);
-    if (!waFrom) {
-      logger.warn('📲 WA SKIPPED (missing_from)', { id: reservation?.id, wa_env: env._debugWaConfig?.() });
-      return { skipped: true, reason: 'missing_from' };
-    }
-
-    logger.info('📲 WA template send ▶️', { to: phone, templateSid: env.WA.templateSid, vars });
-    try {
-      const msg = await client.messages.create({
-        from: waFrom,
-        to  : `whatsapp:${phone}`,
-        contentSid: env.WA.templateSid,
-        contentVariables: JSON.stringify(vars),
-      });
-      logger.info('📲 WA template OK ✅', { sid: msg.sid, to: phone });
-      return { ok: true, sid: msg.sid, template: true };
-    } catch (e) {
-      logger.error('📲 WA template ❌', { to: phone, error: String(e) });
-      throw e;
-    }
+    return sendTemplate({
+      to: phone,
+      contentSid: CFG.templateStatusChangeSid,
+      variables: vars,
+      kind: 'status_change',
+      reservationId: reservation?.id || null,
+    });
   }
 
-  // Freeform: riuso sendText (così NON duplichiamo logica)
-  const media = mediaLogo || env.WA.mediaLogo || null;
-  const out = await sendText({ to: phone, text: body, mediaUrl: media });
-  return { ...out, template: false };
+  // Freeform: dentro 24h (se blocco attivo)
+  return sendText({ to: phone, text: body });
 }
 
-/**
- * health()
- * Piccola diagnostica “safe” per capire se WA è configurato.
- */
+// ----------------------------------------------------------------------------
+// Webhook inbound: parsing + action detect
+// ----------------------------------------------------------------------------
+function detectAction({ bodyText, buttonText, buttonPayload }) {
+  const t  = String(bodyText || '').trim().toLowerCase();
+  const bt = String(buttonText || '').trim().toLowerCase();
+  const bp = String(buttonPayload || '').trim().toLowerCase();
+  const hay = `${t} ${bt} ${bp}`.trim();
+
+  // Nel tuo caso:
+  // - bottone "CONFERMO" (ID magari "CAMBIA ORARIO") -> confirm
+  // - bottone "ANNULLA" (ID "cancel") -> cancel
+  if (hay.includes('confermo') || hay.includes('confirm') || hay.includes('cambia orario')) return 'confirm';
+  if (hay.includes('annulla') || hay.includes('cancel')) return 'cancel';
+
+  return null;
+}
+
+async function handleInboundWebhook(form) {
+  const messageSid = form.MessageSid || form.SmsSid || null;
+  const fromAddr   = form.From || null; // whatsapp:+39...
+  const toAddr     = form.To || null;
+
+  const fromPhone = normalizeToE164(fromWhatsAppAddress(fromAddr));
+  const toPhone   = normalizeToE164(fromWhatsAppAddress(toAddr));
+
+  const bodyText      = form.Body || '';
+  const buttonText    = form.ButtonText || '';
+  const buttonPayload = form.ButtonPayload || '';
+
+  const originalSid = form.OriginalRepliedMessageSid || null;
+
+  const profileName = form.ProfileName || null;
+  const waId        = form.WaId || null;
+
+  // 1) aggiorno inbound (apre finestra 24h)
+  await upsertContactInbound(fromPhone, waId, profileName, new Date());
+
+  // 2) salvo inbound in tabella
+  if (messageSid) {
+    await insertWaMessage({
+      sid: messageSid,
+      direction: 'in',
+      kind: 'inbound',
+      to_phone: toPhone,
+      from_phone: fromPhone,
+      reservation_id: null,
+      status: null,
+      payload_json: safeJson(form),
+    });
+  }
+
+  // 3) azione
+  const action = detectAction({ bodyText, buttonText, buttonPayload });
+
+  // 4) link reservation via OriginalRepliedMessageSid
+  let link = null;
+  if (action && originalSid) {
+    link = await findOutboundLinkBySid(originalSid);
+  }
+
+  const out = {
+    ok: true,
+    messageSid,
+    fromPhone,
+    toPhone,
+    bodyText,
+    buttonText,
+    buttonPayload,
+    originalSid,
+    action, // 'confirm' | 'cancel' | null
+    reservationId: link ? link.reservationId : null,
+    linkedKind: link ? link.kind : null,
+  };
+
+  logger.info('📩 WA inbound', {
+    service: 'server',
+    from: fromPhone,
+    action: out.action,
+    reservationId: out.reservationId,
+    originalSid: out.originalSid,
+  });
+
+  return out;
+}
+
+// ----------------------------------------------------------------------------
+// Health
+// ----------------------------------------------------------------------------
 function health() {
-  const w = env.WA || {};
   const hasTwilioModule = !!_loadTwilioFactory();
   return {
-    enabled: !!w.enabled,
+    enabled: !!CFG.enabled,
     hasTwilioModule,
-    hasSid: !!w.accountSid,
-    hasToken: !!w.authToken,
-    hasFrom: !!w.from,
-    hasTemplate: !!w.templateSid,
-    defaultCc: w.defaultCc || '+39',
-    mediaLogo: w.mediaLogo ? '[set]' : '',
+    hasSid: !!CFG.sid,
+    hasToken: !!CFG.token,
+    hasFrom: !!CFG.from,
+    defaultCc: CFG.defaultCc || '+39',
+    webhookBaseUrl: CFG.webhookBaseUrl ? '[set]' : '',
+    blockFreeTextOutside24h: !!CFG.blockFreeTextOutside24h,
+    hasTemplateReservationConfirm: !!CFG.templateReservationConfirmSid,
+    hasTemplateStatusChange: !!CFG.templateStatusChangeSid,
   };
 }
 
 module.exports = {
   getClient,
+
+  // Send
   sendText,
-  sendMessage, // alias compat
+  sendMessage,
+  sendTemplate,
+  sendReservationConfirmTemplate,
   sendStatusChange,
+
+  // Webhook
+  handleInboundWebhook,
+  updateWaMessageStatus,
+
+  // Utils
   _normalizeToE164: normalizeToE164,
+
+  // Debug
   health,
 };
 ```
@@ -8215,16 +8832,36 @@ module.exports = {
 'use strict';
 
 /**
- * ⚠️ DEPRECATO / SHIM
- * -----------------------------------------------------------------------------
- * Questo file esiste SOLO per retro-compatibilità.
- * Il service reale è: ./whatsapp.service.js
+ * whatsapp-twilio.service.js
+ * ---------------------------------------------------------
+ * 🎯 SCOPO:
+ * - Qui dentro teniamo SOLO la creazione del client Twilio.
+ * - Zero logiche business.
+ * - Zero parsing webhook.
  *
- * ✅ Se vuoi pulizia totale “hard”, puoi anche cancellare questo file
- *    dopo aver verificato che non esistono require vecchi.
+ * ✅ In questo modo:
+ * - whatsapp.service.js = logica WA (template, finestra 24h, tracking, ecc.)
+ * - whatsapp-twilio.service.js = adapter Twilio
  */
 
-module.exports = require('./whatsapp.service');
+const twilio = require('twilio');
+const env = require('../env');
+
+function createClient() {
+  const accountSid = process.env.TWILIO_ACCOUNT_SID || env.TWILIO_ACCOUNT_SID;
+  const authToken = process.env.TWILIO_AUTH_TOKEN || env.TWILIO_AUTH_TOKEN;
+
+  if (!accountSid || !authToken) {
+    // Non logghiamo qui: la logica + log sta in whatsapp.service.js
+    return null;
+  }
+
+  return twilio(accountSid, authToken);
+}
+
+module.exports = {
+  createClient,
+};
 ```
 
 ### ./src/services/whatsender.service.js

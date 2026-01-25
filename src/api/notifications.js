@@ -1,157 +1,238 @@
 'use strict';
 
 /**
- * API NOTIFICATIONS
- * -----------------
- * Rotte per invio email e WhatsApp (test/simple), con fallback sicuri.
- * Obiettivo: MAI passare ad Express handler undefined.
+ * api/notifications.js
+ * -----------------------------------------------------------------------------
+ * Rotte notifiche: Email + WhatsApp (Twilio)
  *
- * Stile: log con emoji, requireAuth con fallback DEV, guardie robuste.
+ * ✅ Nota importante WhatsApp:
+ * - Free-text (body) è consentito SOLO dentro la finestra 24h (sessione).
+ * - Fuori 24h devi usare un TEMPLATE approvato.
+ * - Qui aggiungiamo:
+ *    1) POST /wa/send                       -> free-text (bloccato fuori 24h se abilitato)
+ *    2) POST /wa/template/reservation-confirm -> invio TEMPLATE Quick Reply (apre finestra 24h)
+ *    3) POST /wa/inbound                    -> webhook Twilio inbound (tap bottoni / reply)
+ *    4) POST /wa/status                     -> status callback Twilio (delivered/failed ecc.)
  *
- * ✅ PULIZIA WA:
- * - Usiamo SOLO ../services/whatsapp.service come unico punto WA
- * - Niente più doppioni whatsapp-twilio.service
+ * Stile: log emoji + best-effort + non rompiamo le logiche esistenti.
  */
 
 const express = require('express');
-const router  = express.Router();
+const router = express.Router();
 
 const logger = require('../logger');
+const env    = require('../env');
 
-// === requireAuth con fallback DEV (stile già usato altrove) ==================
-let requireAuth;
+const mailer = require('../services/mailer.service');
+const wa     = require('../services/whatsapp.service');
+
+// Prenotazioni (per aggiornare stato da tap WhatsApp)
+const reservationsSvc     = require('../services/reservations.service');
+const reservationsActions = require('../services/reservations-status.service');
+
+// ----------------------------------------------------------------------------
+// Auth middleware (fallback DEV se non disponibile)
+// ----------------------------------------------------------------------------
+let requireAuth = (req, res, next) => next();
 try {
+  // eslint-disable-next-line global-require
   ({ requireAuth } = require('../middleware/auth'));
-  if (typeof requireAuth !== 'function') throw new Error('requireAuth non è una funzione');
-  logger.info('🔐 requireAuth caricato da ../middleware/auth');
+  logger.info('🔐 requireAuth caricato da ../middleware/auth', { service: 'server' });
 } catch (e) {
-  logger.warn('⚠️ requireAuth non disponibile. Uso FALLBACK DEV (solo locale).', { error: String(e) });
-  requireAuth = (req, _res, next) => {
-    req.user = {
-      id: Number(process.env.AUTH_DEV_ID || 0),
-      email: process.env.AUTH_DEV_USER || 'dev@local'
-    };
-    next();
-  };
+  logger.warn('⚠️ requireAuth NON trovato (DEV bypass).', { service: 'server', error: String(e) });
 }
 
-// === Carico servizi (con fallback a null) ====================================
-let mailer = null;
-try {
-  mailer = require('../services/mailer.service');
-  logger.info('📧 mailer.service caricato');
-} catch {
-  logger.warn('📧 mailer.service non disponibile');
-}
-
-let waSvc = null;
-try {
-  waSvc = require('../services/whatsapp.service');
-  logger.info('📲 whatsapp.service caricato (UNICO)');
-} catch {
-  logger.warn('📲 whatsapp.service non disponibile');
-  waSvc = null;
-}
-
-// === Helper: wrapper sicuro per route handler ================================
-function safeRoute(handlerName, impl) {
+// ----------------------------------------------------------------------------
+// safeRoute helper (stile tuo)
+// ----------------------------------------------------------------------------
+function safeRoute(name, fn) {
   return async (req, res) => {
-    if (typeof impl !== 'function') {
-      logger.warn(`🧯 Handler mancante: ${handlerName} → 501`);
-      return res.status(501).json({ error: 'not_implemented', handler: handlerName });
-    }
     try {
-      await impl(req, res);
-    } catch (err) {
-      logger.error(`💥 Handler ${handlerName} errore`, { error: String(err) });
-      res.status(500).json({ error: 'internal_error', detail: String(err) });
+      const out = await fn(req, res);
+      return out;
+    } catch (e) {
+      logger.error(`❌ notifications.${name} crash`, { service: 'server', error: String(e) });
+      return res.status(500).json({ ok: false, error: String(e) });
     }
   };
 }
 
-// === Health semplice =========================================================
-router.get('/health', (_req, res) => {
-  res.json({
+// ----------------------------------------------------------------------------
+// HEALTH
+// ----------------------------------------------------------------------------
+router.get('/health', safeRoute('health', async (req, res) => {
+  return res.json({
     ok: true,
-    mailer: !!mailer,
-    whatsapp: !!waSvc,
-    waHealth: waSvc?.health ? waSvc.health() : null
+    mail: {
+      enabled: !!env.MAIL?.enabled,
+      host: env.MAIL?.smtpHost ? '[set]' : '',
+    },
+    wa: wa.health ? wa.health() : { note: 'wa.health() missing' }
   });
-});
+}));
 
-// === EMAIL ===================================================================
-router.post(
-  '/email/test',
-  requireAuth,
-  safeRoute('email.test', async (req, res) => {
-    if (!mailer) return res.status(501).json({ error: 'mailer_not_available' });
+// ----------------------------------------------------------------------------
+// MAIL TEST (protetta)
+// ----------------------------------------------------------------------------
+router.post('/mail/test', requireAuth, safeRoute('mail.test', async (req, res) => {
+  const to = req.body?.to || env.MAIL?.replyTo || env.MAIL?.from || null;
+  if (!to) return res.status(400).json({ ok: false, error: 'missing_to' });
 
-    const to      = (req.body?.to || '').toString().trim();
-    const subject = (req.body?.subject || 'Test notifica').toString();
-    const text    = (req.body?.text || `Ciao ${req.user?.email || 'utente'}, questo è un test.`).toString();
-    const html    = (req.body?.html || `<p>${text}</p>`).toString();
+  const out = await mailer.sendTestEmail?.({ to }) // se esiste
+    .catch(() => null);
 
-    if (!to) return res.status(400).json({ error: 'missing_to' });
+  if (!out) {
+    // fallback minimale: invio “status change” finto
+    await mailer.sendStatusChangeEmail?.({
+      to,
+      reservation: { id: 0, start_at: new Date().toISOString(), party_size: 2 },
+      status: 'TEST',
+      reason: 'Email test'
+    });
+  }
 
-    const sendFn =
-      mailer.sendMail ||
-      mailer.sendSimple ||
-      mailer.sendTestEmail ||
-      null;
+  return res.json({ ok: true });
+}));
 
-    if (!sendFn) {
-      logger.warn('📧 Nessun metodo sendMail disponibile nel mailer');
-      return res.status(501).json({ error: 'send_method_not_found' });
+// ----------------------------------------------------------------------------
+// WA FREE TEXT (protetta) - dentro finestra 24h (se blocco attivo)
+// ----------------------------------------------------------------------------
+router.post('/wa/send', requireAuth, safeRoute('wa.send', async (req, res) => {
+  const to       = req.body?.to || null;
+  const text     = req.body?.text || req.body?.body || null;
+  const mediaUrl = req.body?.mediaUrl ?? null;
+
+  // Se vuoi forzare invio anche fuori finestra (sconsigliato): allowOutsideWindow=true
+  const allowOutsideWindow = !!req.body?.allowOutsideWindow;
+
+  const out = await wa.sendText({
+    to,
+    text,
+    mediaUrl,
+    allowOutsideWindow
+  });
+
+  return res.json(out);
+}));
+
+// ----------------------------------------------------------------------------
+// WA TEMPLATE: prenotazione conferma (protetta)
+// ----------------------------------------------------------------------------
+router.post('/wa/template/reservation-confirm', requireAuth, safeRoute('wa.template.reservationConfirm', async (req, res) => {
+  const to           = req.body?.to || null;
+  const name         = req.body?.name || null;
+  const dateStr      = req.body?.dateStr || req.body?.date || null;   // es "mercoledì 21/01/2026"
+  const timeStr      = req.body?.timeStr || req.body?.time || null;   // es "20:30"
+  const peopleStr    = req.body?.peopleStr || req.body?.people || req.body?.partySize || null;
+  const reservationId = req.body?.reservationId || null;
+
+  const out = await wa.sendReservationConfirmTemplate({
+    to,
+    name,
+    dateStr,
+    timeStr,
+    peopleStr,
+    reservationId
+  });
+
+  return res.json(out);
+}));
+
+// ----------------------------------------------------------------------------
+// WEBHOOK Twilio INBOUND (PUBBLICA)
+// ⚠️ Twilio manda x-www-form-urlencoded: usiamo express.urlencoded solo su questa route
+// ----------------------------------------------------------------------------
+router.post('/wa/inbound',
+  express.urlencoded({ extended: false }),
+  safeRoute('wa.inbound', async (req, res) => {
+    const out = await wa.handleInboundWebhook(req.body || {});
+
+    // ✅ Se riconosciamo un tap su template collegato a reservationId -> aggiorniamo stato
+    if (out?.action && out?.reservationId) {
+      const id = Number(out.reservationId);
+      const action = String(out.action);
+
+      logger.info('🧩 WA tap -> aggiorno prenotazione', { service: 'server', id, action });
+
+      // Mapping azioni:
+      // - confirm -> accepted
+      // - cancel  -> cancelled
+      const mappedAction = (action === 'confirm') ? 'accept' : (action === 'cancel' ? 'cancel' : null);
+
+      if (mappedAction) {
+        await reservationsActions.updateStatus({
+          id,
+          action: mappedAction,
+          reason: `WA tap: ${action}`,
+          user_email: 'wa:webhook'
+        });
+
+        // Ricarico la prenotazione “bella” (per broadcast + notify)
+        const reservation = await reservationsSvc.getById(id).catch(() => null);
+
+        if (reservation) {
+          // Best-effort notify (email + WA status change)
+          try {
+            if (reservation.contact_email) {
+              await mailer.sendStatusChangeEmail?.({
+                to: reservation.contact_email,
+                reservation,
+                status: reservation.status,
+                reason: `Confermato da WhatsApp (${action})`
+              });
+            }
+          } catch (e) {
+            logger.warn('⚠️ Email status change fallita (ok)', { service: 'server', error: String(e) });
+          }
+
+          try {
+            if (reservation.contact_phone) {
+              await wa.sendStatusChange({
+                to: reservation.contact_phone,
+                reservation,
+                status: reservation.status,
+                reason: `Confermato da WhatsApp (${action})`
+              });
+            }
+          } catch (e) {
+            logger.warn('⚠️ WA status change fallito (ok)', { service: 'server', error: String(e) });
+          }
+
+          // Broadcast realtime (se io è disponibile)
+          try {
+            const io = req.app?.get('io');
+            if (io) {
+              io.to('admins').emit('reservation-updated', reservation);
+              logger.info('📡 Socket reservation-updated', { service: 'server', id: reservation.id });
+            }
+          } catch (e) {
+            logger.warn('⚠️ Socket broadcast fallito (ok)', { service: 'server', error: String(e) });
+          }
+        }
+      }
     }
 
-    const out = await sendFn({ to, subject, text, html });
-    logger.info('📧 Email test inviata ✅', { to, subject, messageId: out?.messageId || null });
-    res.json({ ok: true, messageId: out?.messageId || null });
+    // ✅ Risposta “safe” per Twilio (va bene anche 200 vuoto, ma così è pulito)
+    res.set('Content-Type', 'text/xml');
+    return res.status(200).send('<Response></Response>');
   })
 );
 
-// === WHATSAPP ================================================================
+// ----------------------------------------------------------------------------
+// STATUS CALLBACK Twilio (PUBBLICA)
+// ----------------------------------------------------------------------------
+router.post('/wa/status',
+  express.urlencoded({ extended: false }),
+  safeRoute('wa.status', async (req, res) => {
+    const messageSid    = req.body?.MessageSid || null;
+    const messageStatus = req.body?.MessageStatus || null;
+    const errorCode     = req.body?.ErrorCode || null;
+    const errorMessage  = req.body?.ErrorMessage || null;
 
-/**
- * POST /api/notifications/wa/test
- * body: { to, text? }
- */
-router.post(
-  '/wa/test',
-  requireAuth,
-  safeRoute('wa.test', async (req, res) => {
-    if (!waSvc) return res.status(501).json({ error: 'wa_not_available' });
+    await wa.updateWaMessageStatus?.(messageSid, messageStatus, errorCode, errorMessage, req.body);
 
-    const to   = (req.body?.to || '').toString().trim();
-    const text = (req.body?.text || 'Ciao 👋 questo è un messaggio di test').toString();
-    if (!to) return res.status(400).json({ error: 'missing_to' });
-
-    // Ora sendText è GARANTITO dal service unico
-    const out = await waSvc.sendText({ to, text });
-    logger.info('📲 WA test inviato ✅', { to, sid: out?.sid || null, skipped: !!out?.skipped });
-    res.json({ ok: true, sid: out?.sid || null, skipped: out?.skipped || false, reason: out?.reason || null });
-  })
-);
-
-/**
- * POST /api/notifications/wa/send
- * body: { to, text, mediaUrl? }
- */
-router.post(
-  '/wa/send',
-  requireAuth,
-  safeRoute('wa.send', async (req, res) => {
-    if (!waSvc) return res.status(501).json({ error: 'wa_not_available' });
-
-    const to       = (req.body?.to || '').toString().trim();
-    const text     = (req.body?.text || '').toString();
-    const mediaUrl = (req.body?.mediaUrl || '').toString().trim() || null;
-
-    if (!to || !text) return res.status(400).json({ error: 'missing_params', need: 'to,text' });
-
-    const out = await waSvc.sendText({ to, text, mediaUrl });
-    logger.info('📲 WA inviato ✅', { to, sid: out?.sid || null, hasMedia: !!mediaUrl, skipped: !!out?.skipped });
-    res.json({ ok: true, sid: out?.sid || null, skipped: out?.skipped || false, reason: out?.reason || null });
+    res.set('Content-Type', 'text/xml');
+    return res.status(200).send('<Response></Response>');
   })
 );
 

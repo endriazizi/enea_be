@@ -1,6 +1,6 @@
 # 📁 Project tree (.)
 
-_Generato: Tue, Jan 20, 2026 11:46:48 PM_
+_Generato: Sat, Jan 24, 2026  5:00:59 PM_
 
 ```text
 .
@@ -47,6 +47,7 @@ src/controllers/productsContreller.js
 src/cors.js
 src/db
 src/db/index.js
+src/db/logger.js
 src/db/migrations
 src/db/migrator.js
 src/db/schema-check.js
