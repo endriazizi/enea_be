@@ -13,6 +13,7 @@
 const { query } = require('../db');
 const logger = require('../logger');
 const env    = require('../env');
+const google = require('./google.service');
 
 // --- Helpers -----------------------------------------------------------------
 function trimOrNull(s) { const v = (s ?? '').toString().trim(); return v ? v : null; }
@@ -139,13 +140,52 @@ function normalizeStatusAction(actionOrStatus) {
 // 📋 LIST / GET
 // ============================================================================
 
-async function list({ status, from, to } = {}) {
+async function list({ status, from, to, q } = {}) {
   const where = [];
   const params = [];
 
   if (status && status !== 'all') {
     where.push('r.status = ?');
     params.push(status);
+  }
+
+  const qNorm = trimOrNull(q);
+  if (qNorm) {
+    const raw = qNorm;
+    const clean = raw.replace(/\s+/g, ' ').trim();
+    const tokens = clean.split(' ').filter(Boolean);
+
+    // Caso rapido: #123 oppure solo numeri → match ID diretto
+    const idCandidate = clean.replace(/^#/, '');
+    if (/^\d+$/.test(idCandidate)) {
+      where.push('r.id = ?');
+      params.push(Number(idCandidate));
+    }
+
+    // Per ogni token costruisco un OR "ampio" e lo metto in AND
+    for (const t of tokens) {
+      const like = `%${t}%`;
+      const tDigits = t.replace(/\D+/g, '');
+      const likeDigits = tDigits ? `%${tDigits}%` : null;
+      where.push(
+        '(' +
+        'r.customer_first COLLATE utf8mb4_unicode_ci LIKE ? OR ' +
+        'r.customer_last COLLATE utf8mb4_unicode_ci LIKE ? OR ' +
+        "CONCAT_WS(' ', r.customer_first, r.customer_last) COLLATE utf8mb4_unicode_ci LIKE ? OR " +
+        'r.phone COLLATE utf8mb4_unicode_ci LIKE ? OR ' +
+        'r.email COLLATE utf8mb4_unicode_ci LIKE ? OR ' +
+        'r.notes COLLATE utf8mb4_unicode_ci LIKE ? OR ' +
+        'r.status_note COLLATE utf8mb4_unicode_ci LIKE ? OR ' +
+        't.table_number LIKE ?' +
+        (likeDigits ? ' OR REPLACE(REPLACE(REPLACE(REPLACE(r.phone, " ", ""), "+", ""), "-", ""), "/", "") LIKE ?' : '') +
+        ')'
+      );
+      if (likeDigits) {
+        params.push(like, like, like, like, like, like, like, like, likeDigits);
+      } else {
+        params.push(like, like, like, like, like, like, like, like);
+      }
+    }
   }
 
   const range = toDayRange(from, to);
@@ -249,6 +289,75 @@ async function ensureUser({ first, last, email, phone }) {
   return res.insertId;
 }
 
+async function updateUserById(id, { first, last, email, phone }) {
+  if (!id) return;
+  const fields = [];
+  const params = [];
+
+  if (first !== undefined && first !== null) { fields.push('first_name=?'); params.push(trimOrNull(first)); }
+  if (last  !== undefined && last  !== null) { fields.push('last_name=?');  params.push(trimOrNull(last)); }
+  if (email !== undefined && email !== null) { fields.push('email=?');      params.push(trimOrNull(email)); }
+  if (phone !== undefined && phone !== null) { fields.push('phone=?');      params.push(trimOrNull(phone)); }
+
+  if (!fields.length) return;
+  params.push(id);
+  await query(`UPDATE users SET ${fields.join(', ')} WHERE id=?`, params);
+}
+
+function normPhone(p) { return String(p || '').replace(/\D/g, ''); }
+function isPhoneMatch(a, b) {
+  const na = normPhone(a);
+  const nb = normPhone(b);
+  if (!na || !nb) return false;
+  if (na === nb) return true;
+  if (na.length >= 8 && nb.length >= 8) return na.slice(-8) === nb.slice(-8);
+  return false;
+}
+
+async function syncGoogleContactOnCreate(dto, userId) {
+  const phone = trimOrNull(dto.phone);
+  if (!phone) return;
+
+  let items = [];
+  try {
+    items = await google.searchContacts(phone, 5);
+  } catch (e) {
+    logger.warn('👤⚠️ [Google] search failed', { error: String(e) });
+    return;
+  }
+
+  const match = (items || []).find((it) => isPhoneMatch(phone, it.phone));
+  if (!match?.resourceName) return;
+
+  // Aggiorna DB (utente locale) con dati recenti se abbiamo match Google
+  try {
+    await updateUserById(userId, {
+      first: dto.customer_first,
+      last : dto.customer_last,
+      email: dto.email,
+      phone: dto.phone,
+    });
+  } catch (e) {
+    logger.warn('👤⚠️ [DB] user update failed', { error: String(e), userId });
+  }
+
+  // Aggiorna il contatto Google (best-effort)
+  try {
+    await google.updateContact({
+      resourceName: match.resourceName,
+      etag: match.etag,
+      givenName: trimOrNull(dto.customer_first),
+      familyName: trimOrNull(dto.customer_last),
+      displayName: `${dto.customer_first || ''} ${dto.customer_last || ''}`.trim() || null,
+      email: trimOrNull(dto.email),
+      phone: trimOrNull(dto.phone),
+      note: trimOrNull(dto.google_note) || trimOrNull(dto.notes),
+    });
+  } catch (e) {
+    logger.warn('👤⚠️ [Google] update failed', { error: String(e), resourceName: match.resourceName });
+  }
+}
+
 // ============================================================================
 // ➕ CREATE
 // ============================================================================
@@ -261,6 +370,7 @@ async function create(dto, { user } = {}) {
     phone: dto.phone,
   });
 
+  const noteValue = trimOrNull(dto.google_note) || trimOrNull(dto.notes);
   const startIso = dto.start_at;
   const endIso   = dto.end_at || null;
 
@@ -279,10 +389,18 @@ async function create(dto, { user } = {}) {
       trimOrNull(dto.phone), trimOrNull(dto.email),
       userId, Number(dto.party_size) || 1, startMysql, endMysql,
       dto.room_id || null, dto.table_id || null,
-      trimOrNull(dto.notes), trimOrNull(user?.email) || null
+      noteValue, trimOrNull(user?.email) || null
     ]);
   const created = await getById(res.insertId);
   logger.info('🆕 reservation created', { id: created.id, by: user?.email || null });
+
+  // Best-effort sync: se il numero matcha un contatto Google, aggiorno DB+Google
+  try {
+    await syncGoogleContactOnCreate(dto, userId);
+  } catch (e) {
+    logger.warn('👤⚠️ [Google] sync failed', { error: String(e) });
+  }
+
   return created;
 }
 
@@ -320,7 +438,10 @@ async function update(id, dto, { user } = {}) {
   if (endMysql           !== null)      { fields.push('end_at=?');         pr.push(endMysql);                      }
   if (dto.room_id  !== undefined) { fields.push('room_id=?');  pr.push(dto.room_id || null); }
   if (dto.table_id !== undefined) { fields.push('table_id=?'); pr.push(dto.table_id || null); }
-  if (dto.notes    !== undefined) { fields.push('notes=?');    pr.push(trimOrNull(dto.notes)); }
+  if (dto.notes !== undefined || dto.google_note !== undefined) {
+    fields.push('notes=?');
+    pr.push(trimOrNull(dto.google_note) || trimOrNull(dto.notes));
+  }
   if (dto.checkin_at  !== undefined) {
     fields.push('checkin_at=?');
     pr.push(dto.checkin_at ? isoToMysql(dto.checkin_at) : null);

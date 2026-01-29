@@ -57,13 +57,17 @@ function broadcastOrderUpdated(order) {
   try {
     const io = sockets.io();
     io.of('/').emit('order-updated', {
-      id    : order && order.id,
-      status: order && order.status,
+      id         : order && order.id,
+      status     : order && order.status,
+      table_id   : order && order.table_id,
+      fulfillment: order && order.fulfillment,
     });
 
     logger.info('📡 order-updated ▶️ broadcast', {
-      id    : order && order.id,
-      status: order && order.status,
+      id         : order && order.id,
+      status     : order && order.status,
+      table_id   : order && order.table_id,
+      fulfillment: order && order.fulfillment,
     });
   } catch (err) {
     logger.warn('📡 order-updated broadcast KO', { error: String(err) });

@@ -134,7 +134,7 @@ async function searchContacts(q, limit = 12) {
   const resp = await people.people.searchContacts({
     query: q,
     pageSize: Math.min(50, Math.max(1, limit)),
-    readMask: 'names,emailAddresses,phoneNumbers',
+    readMask: 'names,emailAddresses,phoneNumbers,biographies',
   });
 
   const items = (resp.data.results || []).map((r) => {
@@ -142,13 +142,17 @@ async function searchContacts(q, limit = 12) {
     const name  = p.names?.[0];
     const email = p.emailAddresses?.[0];
     const phone = p.phoneNumbers?.[0];
+    const bio   = p.biographies?.[0];
 
     return {
+      resourceName: p.resourceName || r.person?.resourceName || null,
+      etag:         p.etag || r.person?.etag || null,
       displayName: name?.displayName || null,
       givenName:   name?.givenName || null,
       familyName:  name?.familyName || null,
       email:       email?.value || null,
       phone:       phone?.value || null,
+      note:        bio?.value || null,
     };
   });
 
@@ -156,7 +160,7 @@ async function searchContacts(q, limit = 12) {
 }
 
 // Crea un contatto (serve scope write: https://www.googleapis.com/auth/contacts)
-async function createContact({ givenName, familyName, displayName, email, phone }) {
+async function createContact({ givenName, familyName, displayName, email, phone, note }) {
   const auth = await ensureAuth();            // può lanciare consent_required
   const people = peopleClient(auth);
 
@@ -165,6 +169,7 @@ async function createContact({ givenName, familyName, displayName, email, phone 
       names: [{ givenName: givenName || undefined, familyName: familyName || undefined, displayName: displayName || undefined }],
       emailAddresses: email ? [{ value: email }] : undefined,
       phoneNumbers:   phone ? [{ value: phone }] : undefined,
+      biographies:    note ? [{ value: note, contentType: 'TEXT_PLAIN' }] : undefined,
     };
 
     const resp = await people.people.createContact({ requestBody });
@@ -184,11 +189,62 @@ async function createContact({ givenName, familyName, displayName, email, phone 
   }
 }
 
+// Aggiorna un contatto esistente (best-effort)
+async function updateContact({ resourceName, etag, givenName, familyName, displayName, email, phone, note }) {
+  if (!resourceName) {
+    const err = new Error('resourceName_required');
+    err.code = 'resource_name_required';
+    throw err;
+  }
+  const auth = await ensureAuth();
+  const people = peopleClient(auth);
+
+  let contactEtag = etag;
+  if (!contactEtag) {
+    const got = await people.people.get({
+      resourceName,
+      personFields: 'names,emailAddresses,phoneNumbers,biographies',
+    });
+    contactEtag = got?.data?.etag || null;
+  }
+
+  const nameValue = (displayName || `${givenName || ''} ${familyName || ''}`.trim() || null);
+  const requestBody = {
+    resourceName,
+    etag: contactEtag || undefined,
+    names: nameValue ? [{ displayName: nameValue, givenName: givenName || undefined, familyName: familyName || undefined }] : undefined,
+    emailAddresses: email ? [{ value: email }] : undefined,
+    phoneNumbers:   phone ? [{ value: phone }] : undefined,
+    biographies:    note ? [{ value: note, contentType: 'TEXT_PLAIN' }] : undefined,
+  };
+
+  const updateFields = [];
+  if (requestBody.names) updateFields.push('names');
+  if (requestBody.emailAddresses) updateFields.push('emailAddresses');
+  if (requestBody.phoneNumbers) updateFields.push('phoneNumbers');
+  if (requestBody.biographies) updateFields.push('biographies');
+
+  if (!updateFields.length) {
+    return { ok: false, reason: 'no_fields' };
+  }
+
+  const resp = await people.people.updateContact({
+    resourceName,
+    updatePersonFields: updateFields.join(','),
+    requestBody,
+  });
+
+  const updated = resp?.data || {};
+  logger.info('👤 [Google] contact updated', { resourceName, fields: updateFields });
+  return { ok: true, resourceName: updated.resourceName || resourceName };
+}
+
 module.exports = {
   exchangeCode,
   ensureAuth,
   peopleClient,
   searchContacts,
   createContact,
+  updateContact,
   revokeForOwner,
 };

@@ -41,12 +41,12 @@ router.get('/search', async (req, res) => {
 });
 
 // POST /api/google/people/create
-// body: { displayName?, givenName?, familyName?, email?, phone? }
+// body: { displayName?, givenName?, familyName?, email?, phone?, note? }
 router.post('/create', express.json(), async (req, res) => {
-  const { displayName, givenName, familyName, email, phone } = req.body || {};
+  const { displayName, givenName, familyName, email, phone, note } = req.body || {};
 
   try {
-    const out = await createContact({ displayName, givenName, familyName, email, phone });
+    const out = await createContact({ displayName, givenName, familyName, email, phone, note });
     return res.json(out);
   } catch (e) {
     const code = e?.code || '';

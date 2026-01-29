@@ -143,6 +143,25 @@ function extractRoomLabel(order) {
   return null;
 }
 
+// --- Modalità ordine (fulfillment) -------------------------------------------
+function resolveFulfillment(order) {
+  const v = (order.fulfillment || '').toString().trim().toLowerCase();
+  if (v === 'table' || v === 'takeaway' || v === 'delivery') return v;
+  // Fallback compat: se ho table_id considero "table", altrimenti "takeaway".
+  return order.table_id ? 'table' : 'takeaway';
+}
+
+function extractDeliveryAddressLine(order) {
+  const addr = order.delivery_address || order.deliveryAddress || null;
+  if (addr) return String(addr).trim();
+  // Fallback minimo: provo ad usare note o telefono se mancano i campi dedicati.
+  const note = order.delivery_note || order.note || null;
+  if (note) return String(note).trim();
+  const phone = order.delivery_phone || order.phone || null;
+  if (phone) return `Tel: ${String(phone).trim()}`;
+  return null;
+}
+
 // --- Formattazione orario stile “DOMENICA 10/11/2025  ore 04:42” -------------
 function fmtComandaDate(iso) {
   try{
@@ -176,6 +195,20 @@ async function printSlip(title, order) {
   if (order.phone) write(Buffer.from(`${sanitizeForEscpos(order.phone)}\n`,'latin1'));
   if (order.people) write(Buffer.from(`Coperti: ${order.people}\n`,'latin1'));
   if (order.scheduled_at) write(Buffer.from(`Orario: ${fmtComandaDate(order.scheduled_at)}\n`,'latin1'));
+  // Modalità ordine (senza cambiare le logiche esistenti: aggiungo solo righe info)
+  const fulfillment = resolveFulfillment(order);
+  if (fulfillment === 'table') {
+    const room = extractRoomLabel(order);
+    const table = extractTableLabel(order);
+    if (room)  write(Buffer.from(`${sanitizeForEscpos(room)}\n`, 'latin1'));
+    if (table) write(Buffer.from(`${sanitizeForEscpos(table)}\n`, 'latin1'));
+  } else if (fulfillment === 'takeaway') {
+    write(Buffer.from('ASPORTO\n', 'latin1'));
+  } else if (fulfillment === 'delivery') {
+    write(Buffer.from('DOMICILIO\n', 'latin1'));
+    const line = extractDeliveryAddressLine(order);
+    if (line) write(Buffer.from(`${sanitizeForEscpos(line)}\n`, 'latin1'));
+  }
   write(Buffer.from('------------------------------\n','latin1'));
 
   for (const it of order.items) {
@@ -230,6 +263,19 @@ async function printComandaSlip(title, order) {
   const table = extractTableLabel(order);
   if (room) { sizeBig(sock); boldOn(sock); writeLine(sock, room); boldOff(sock); }
   if (table){ sizeBig(sock); boldOn(sock); writeLine(sock, table); boldOff(sock); }
+
+  // Modalità ordine: per asporto/domicilio aggiungo una riga grande e leggibile
+  const fulfillment = resolveFulfillment(order);
+  if (fulfillment === 'takeaway') {
+    sizeBig(sock); boldOn(sock); writeLine(sock, 'ASPORTO'); boldOff(sock);
+  } else if (fulfillment === 'delivery') {
+    sizeBig(sock); boldOn(sock); writeLine(sock, 'DOMICILIO'); boldOff(sock);
+    const line = extractDeliveryAddressLine(order);
+    if (line) {
+      const lines = wrapText(line, COMANDA_MAX_COLS);
+      for (const ln of lines) writeLine(sock, ln);
+    }
+  }
 
   // Sub-intestazione compatta
   sizeNormal(sock);
@@ -330,6 +376,11 @@ async function printOrderDual(orderFull) {
     scheduled_at: orderFull.scheduled_at,
     total: orderFull.total,
     note: orderFull.note,                 // per eventuale 'Tavolo ...'
+    fulfillment: orderFull.fulfillment,
+    delivery_name: orderFull.delivery_name,
+    delivery_phone: orderFull.delivery_phone,
+    delivery_address: orderFull.delivery_address,
+    delivery_note: orderFull.delivery_note,
     table_name: orderFull.table_name,     // se forniti dal chiamante
     table_number: orderFull.table_number, // idem
     table_id: orderFull.table_id,         // idem
@@ -362,6 +413,11 @@ async function printOrderForCenter(orderFull, center = 'PIZZERIA') {
     scheduled_at: orderFull.scheduled_at,
     total: orderFull.total,
     note: orderFull.note,
+    fulfillment: orderFull.fulfillment,
+    delivery_name: orderFull.delivery_name,
+    delivery_phone: orderFull.delivery_phone,
+    delivery_address: orderFull.delivery_address,
+    delivery_note: orderFull.delivery_note,
     table_name: orderFull.table_name,
     table_number: orderFull.table_number,
     table_id: orderFull.table_id,

@@ -154,6 +154,22 @@ function parseLocationHintsFromNote(noteRaw) {
 }
 
 /**
+ * 🔁 Normalizza la modalità ordine (fulfillment)
+ * ---------------------------------------------------------------------------
+ * Accetta valori legacy o varianti FE/BE:
+ * - fulfillment / order_type / orderType / serviceType
+ * - IT/EN: "table/tavolo", "takeaway/asporto", "delivery/domicilio"
+ */
+function normalizeFulfillment(raw) {
+  const v = String(raw || '').trim().toLowerCase();
+  if (!v) return null;
+  if (v === 'table' || v === 'tavolo') return 'table';
+  if (v === 'takeaway' || v === 'asporto' || v === 'take-away') return 'takeaway';
+  if (v === 'delivery' || v === 'domicilio') return 'delivery';
+  return null;
+}
+
+/**
  * 🔍 Risolve meta "location" per stampa / preview:
  *
  * 1) Se l'ordine ha già table_id → JOIN diretta su tables/rooms.
@@ -281,7 +297,12 @@ async function getOrderFullById(id) {
        o.status,
        o.total,
        o.channel,
+       o.fulfillment,
        o.table_id,    -- colonna aggiunta da 007_add_table_id_to_orders.sql
+       o.delivery_name,
+       o.delivery_phone,
+       o.delivery_address,
+       o.delivery_note,
        o.note,
        o.created_at,
        o.updated_at,
@@ -319,11 +340,16 @@ async function getOrderFullById(id) {
 
   return {
     ...o,
+    fulfillment : o.fulfillment || (resolvedTableId ? 'table' : 'takeaway'),
     table_id    : resolvedTableId,
     table_number: meta.table ? meta.table.number : null,
     table_name  : meta.table ? meta.table.label  : null,
     room_id     : meta.room ? meta.room.id       : null,
     room_name   : meta.room ? meta.room.name     : null,
+    delivery_name   : o.delivery_name || null,
+    delivery_phone  : o.delivery_phone || null,
+    delivery_address: o.delivery_address || null,
+    delivery_note   : o.delivery_note || null,
     reservation : meta.reservation
       ? {
           id      : meta.reservation.id,
@@ -712,7 +738,12 @@ router.get('/', async (req, res) => {
          o.status,
          o.total,
          o.channel,
+         o.fulfillment,
          o.table_id,
+         o.delivery_name,
+         o.delivery_phone,
+         o.delivery_address,
+         o.delivery_note,
          o.note,
          o.created_at,
          o.updated_at,
@@ -1155,6 +1186,59 @@ router.post('/', async (req, res) => {
       }
     }
 
+    // === fulfillment + delivery_* ==========================================
+    const fulfillmentRaw =
+      dto.fulfillment ||
+      dto.order_type ||
+      dto.orderType ||
+      dto.serviceType ||
+      null;
+    let fulfillment = normalizeFulfillment(fulfillmentRaw);
+
+    const deliveryName =
+      dto.delivery_name ||
+      dto.deliveryName ||
+      null;
+    const deliveryPhone =
+      dto.delivery_phone ||
+      dto.deliveryPhone ||
+      null;
+    const deliveryAddress =
+      dto.delivery_address ||
+      dto.deliveryAddress ||
+      null;
+    const deliveryNote =
+      dto.delivery_note ||
+      dto.deliveryNote ||
+      null;
+
+    // fallback compat: se non specificato, inferisco
+    if (!fulfillment) {
+      fulfillment = tableIdFinal ? 'table' : 'takeaway';
+    }
+
+    // Validazioni minime (senza rompere i client legacy)
+    if (fulfillment === 'table' && !tableIdFinal) {
+      return res.status(400).json({
+        ok   : false,
+        error: 'table_id_required_for_fulfillment_table',
+      });
+    }
+    if (fulfillment === 'delivery') {
+      if (!deliveryAddress) {
+        return res.status(400).json({
+          ok   : false,
+          error: 'delivery_address_required',
+        });
+      }
+      if (!deliveryPhone && !phone) {
+        return res.status(400).json({
+          ok   : false,
+          error: 'delivery_phone_or_phone_required',
+        });
+      }
+    }
+
     const r = await query(
       `INSERT INTO orders (
          customer_name,
@@ -1162,21 +1246,31 @@ router.post('/', async (req, res) => {
          email,
          people,
          scheduled_at,
+         fulfillment,
          table_id,
+         delivery_name,
+         delivery_phone,
+         delivery_address,
+         delivery_note,
          note,
          channel,
          status,
          total,
          customer_user_id
        )
-       VALUES (?,?,?,?,?,?,?,?,?,?,?)`,
+       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
       [
         (dto.customer_name || 'Cliente').toString().trim(),
         phone || null,
         email || null,
         dto.people || null,
         scheduled,
+        fulfillment,
         tableIdFinal || null,
+        deliveryName || null,
+        deliveryPhone || phone || null,
+        deliveryAddress || null,
+        deliveryNote || null,
         dto.note || null,
         dto.channel || 'admin',
         'pending',

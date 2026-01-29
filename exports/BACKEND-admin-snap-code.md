@@ -1,6 +1,6 @@
 # 🧩 Project code (file ammessi in .)
 
-_Generato: Sat, Jan 24, 2026  5:01:00 PM_
+_Generato: Tue, Jan 27, 2026  2:22:30 PM_
 
 ### ./docs/canvas-backend.md
 ```
@@ -269,6 +269,7 @@ Stato, regole e roadmap del backend ordini + prenotazioni + NFC + stampa.
         "dev": "cross-env NODE_ENV=development nodemon server.js"
     },
     "dependencies": {
+        "@ngrok/ngrok": "1.7.0",
         "bcryptjs": "3.0.2",
         "cors": "^2.8.5",
         "dotenv": "^16.4.5",
@@ -293,7 +294,14 @@ Stato, regole e roadmap del backend ordini + prenotazioni + NFC + stampa.
         "nodemon": "^3.1.0",
         "tree-cli": "0.6.7"
     },
-    "overrides": {}
+    "overrides": {},
+    "description": "Eliminare node_modules (progetto corrente)\r rmdir /s /q node_modules",
+    "directories": {
+        "doc": "docs"
+    },
+    "keywords": [],
+    "author": "",
+    "license": "ISC"
 }
 ```
 

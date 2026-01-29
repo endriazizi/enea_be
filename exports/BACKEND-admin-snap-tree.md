@@ -1,12 +1,10 @@
 # 📁 Project tree (.)
 
-_Generato: Sat, Jan 24, 2026  5:00:59 PM_
+_Generato: Tue, Jan 27, 2026  2:22:30 PM_
 
 ```text
 .
 .env
-.env copy
-.env copy 2
 .git
 .gitignore
 assets
