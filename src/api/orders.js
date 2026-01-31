@@ -169,6 +169,210 @@ function normalizeFulfillment(raw) {
   return null;
 }
 
+// ============================================================================
+// 🆕 Impostazioni pubbliche /asporto (DB)
+// ============================================================================
+
+const PUBLIC_ASPORTO_DEFAULTS = {
+  enable_public_asporto      : true,
+  public_whatsapp_to         : '0737642142',
+  asporto_start_time         : '07:00',
+  asporto_step_minutes       : 15,
+  asporto_end_time           : '23:00',
+  asporto_lead_minutes       : 20,
+  public_asporto_allow_takeaway: true,
+  public_asporto_allow_delivery: false,
+};
+
+function normalizePublicAsportoSettings(raw) {
+  const src = raw || {};
+  const enable = typeof src.enable_public_asporto === 'boolean'
+    ? src.enable_public_asporto
+    : !!Number(src.enable_public_asporto ?? PUBLIC_ASPORTO_DEFAULTS.enable_public_asporto);
+  const allowTakeaway = typeof src.public_asporto_allow_takeaway === 'boolean'
+    ? src.public_asporto_allow_takeaway
+    : !!Number(src.public_asporto_allow_takeaway ?? PUBLIC_ASPORTO_DEFAULTS.public_asporto_allow_takeaway);
+  const allowDelivery = typeof src.public_asporto_allow_delivery === 'boolean'
+    ? src.public_asporto_allow_delivery
+    : !!Number(src.public_asporto_allow_delivery ?? PUBLIC_ASPORTO_DEFAULTS.public_asporto_allow_delivery);
+
+  const publicWhatsapp = String(
+    src.public_whatsapp_to ?? PUBLIC_ASPORTO_DEFAULTS.public_whatsapp_to,
+  ).trim() || PUBLIC_ASPORTO_DEFAULTS.public_whatsapp_to;
+
+  const start = String(
+    src.asporto_start_time ?? PUBLIC_ASPORTO_DEFAULTS.asporto_start_time,
+  ).trim() || PUBLIC_ASPORTO_DEFAULTS.asporto_start_time;
+
+  const end = String(
+    src.asporto_end_time ?? PUBLIC_ASPORTO_DEFAULTS.asporto_end_time,
+  ).trim() || PUBLIC_ASPORTO_DEFAULTS.asporto_end_time;
+
+  const stepNum = Number(
+    src.asporto_step_minutes ?? PUBLIC_ASPORTO_DEFAULTS.asporto_step_minutes,
+  );
+  const step = Number.isFinite(stepNum) && stepNum > 0
+    ? stepNum
+    : PUBLIC_ASPORTO_DEFAULTS.asporto_step_minutes;
+  const leadNum = Number(
+    src.asporto_lead_minutes ?? PUBLIC_ASPORTO_DEFAULTS.asporto_lead_minutes,
+  );
+  const lead = Number.isFinite(leadNum) && leadNum >= 0
+    ? leadNum
+    : PUBLIC_ASPORTO_DEFAULTS.asporto_lead_minutes;
+
+  return {
+    enable_public_asporto: enable,
+    public_whatsapp_to: publicWhatsapp,
+    asporto_start_time: start,
+    asporto_step_minutes: step,
+    asporto_end_time: end,
+    asporto_lead_minutes: lead,
+    public_asporto_allow_takeaway: allowTakeaway,
+    public_asporto_allow_delivery: allowDelivery,
+  };
+}
+
+async function getPublicAsportoSettings() {
+  try {
+    const rows = await query(
+      `SELECT
+         enable_public_asporto,
+         public_whatsapp_to,
+         asporto_start_time,
+         asporto_step_minutes,
+         asporto_end_time,
+         asporto_lead_minutes,
+         public_asporto_allow_takeaway,
+         public_asporto_allow_delivery
+       FROM public_asporto_settings
+       ORDER BY id ASC
+       LIMIT 1`,
+    );
+    const raw = rows && rows[0] ? rows[0] : null;
+    return normalizePublicAsportoSettings(raw || PUBLIC_ASPORTO_DEFAULTS);
+  } catch (e) {
+    logger.warn('⚠️ public_asporto_settings load KO', { error: String(e) });
+    return normalizePublicAsportoSettings(PUBLIC_ASPORTO_DEFAULTS);
+  }
+}
+
+async function savePublicAsportoSettings(next) {
+  const p = normalizePublicAsportoSettings(next);
+  await query(
+    `INSERT INTO public_asporto_settings (
+       id,
+       enable_public_asporto,
+       public_whatsapp_to,
+       asporto_start_time,
+       asporto_step_minutes,
+       asporto_end_time,
+       asporto_lead_minutes,
+       public_asporto_allow_takeaway,
+       public_asporto_allow_delivery
+     ) VALUES (
+       1, ?, ?, ?, ?, ?, ?, ?, ?
+     )
+     ON DUPLICATE KEY UPDATE
+       enable_public_asporto = VALUES(enable_public_asporto),
+       public_whatsapp_to = VALUES(public_whatsapp_to),
+       asporto_start_time = VALUES(asporto_start_time),
+       asporto_step_minutes = VALUES(asporto_step_minutes),
+       asporto_end_time = VALUES(asporto_end_time),
+       asporto_lead_minutes = VALUES(asporto_lead_minutes),
+       public_asporto_allow_takeaway = VALUES(public_asporto_allow_takeaway),
+       public_asporto_allow_delivery = VALUES(public_asporto_allow_delivery)`,
+    [
+      p.enable_public_asporto ? 1 : 0,
+      p.public_whatsapp_to,
+      p.asporto_start_time,
+      p.asporto_step_minutes,
+      p.asporto_end_time,
+      p.asporto_lead_minutes,
+      p.public_asporto_allow_takeaway ? 1 : 0,
+      p.public_asporto_allow_delivery ? 1 : 0,
+    ],
+  );
+  return p;
+}
+
+// ============================================================================
+// 🆕 Visibilità categorie per contesto (DB)
+// ============================================================================
+
+const CATEGORY_CONTEXTS = ['order_new', 'asporto', 'domicilio'];
+
+function normalizeCategoryList(raw) {
+  if (raw == null) return null;
+  if (!Array.isArray(raw)) return null;
+  const cleaned = Array.from(
+    new Set(
+      raw
+        .map((x) => String(x || '').trim())
+        .filter(Boolean),
+    ),
+  );
+  return cleaned;
+}
+
+function normalizeCategoryVisibilityMap(input) {
+  const out = {};
+  for (const ctx of CATEGORY_CONTEXTS) {
+    out[ctx] = null;
+  }
+  if (!input || typeof input !== 'object') return out;
+  for (const ctx of CATEGORY_CONTEXTS) {
+    if (Object.prototype.hasOwnProperty.call(input, ctx)) {
+      out[ctx] = normalizeCategoryList(input[ctx]);
+    }
+  }
+  return out;
+}
+
+async function getCategoryVisibilityMap() {
+  try {
+    const rows = await query(
+      `SELECT context, categories_json
+       FROM order_category_visibility`,
+    );
+    const map = normalizeCategoryVisibilityMap({});
+    for (const r of rows || []) {
+      const ctx = String(r.context || '').trim();
+      if (!CATEGORY_CONTEXTS.includes(ctx)) continue;
+      if (r.categories_json == null) {
+        map[ctx] = null;
+        continue;
+      }
+      try {
+        const parsed = JSON.parse(String(r.categories_json || ''));
+        map[ctx] = normalizeCategoryList(parsed);
+      } catch {
+        map[ctx] = null;
+      }
+    }
+    return map;
+  } catch (e) {
+    logger.warn('⚠️ category_visibility load KO', { error: String(e) });
+    return normalizeCategoryVisibilityMap({});
+  }
+}
+
+async function saveCategoryVisibilityContext(context, categories) {
+  const ctx = String(context || '').trim();
+  if (!CATEGORY_CONTEXTS.includes(ctx)) {
+    throw new Error('invalid_context');
+  }
+  const list = normalizeCategoryList(categories);
+  const payload = list == null ? null : JSON.stringify(list);
+  await query(
+    `INSERT INTO order_category_visibility (context, categories_json)
+     VALUES (?, ?)
+     ON DUPLICATE KEY UPDATE categories_json = VALUES(categories_json)`,
+    [ctx, payload],
+  );
+  return { context: ctx, categories: list };
+}
+
 /**
  * 🔍 Risolve meta "location" per stampa / preview:
  *
@@ -1530,6 +1734,63 @@ async function handlePrintComanda(req, res) {
 // Alias: /print/comanda (nuovo) e /print-comanda (compat)
 router.post('/:id(\\d+)/print/comanda', handlePrintComanda);
 router.post('/:id(\\d+)/print-comanda', handlePrintComanda);
+
+// ============================================================================
+// /public-asporto-settings (GET pubblico, PUT protetto)
+// ============================================================================
+
+router.get('/public-asporto-settings', async (_req, res) => {
+  try {
+    const data = await getPublicAsportoSettings();
+    res.set('Cache-Control', 'no-store');
+    return res.json(data);
+  } catch (e) {
+    logger.error('⚠️ public_asporto_settings GET KO', { error: String(e) });
+    return res.status(500).json({ ok: false, error: 'public_asporto_settings_get_error' });
+  }
+});
+
+router.put('/public-asporto-settings', requireAuth, async (req, res) => {
+  try {
+    const next = await savePublicAsportoSettings(req.body || {});
+    res.set('Cache-Control', 'no-store');
+    return res.json(next);
+  } catch (e) {
+    logger.error('⚠️ public_asporto_settings PUT KO', { error: String(e) });
+    return res.status(500).json({ ok: false, error: 'public_asporto_settings_put_error' });
+  }
+});
+
+// ============================================================================
+// /category-visibility (GET pubblico, PUT protetto)
+// ============================================================================
+
+router.get('/category-visibility', async (_req, res) => {
+  try {
+    const map = await getCategoryVisibilityMap();
+    res.set('Cache-Control', 'no-store');
+    return res.json(map);
+  } catch (e) {
+    logger.error('⚠️ category_visibility GET KO', { error: String(e) });
+    return res.status(500).json({ ok: false, error: 'category_visibility_get_error' });
+  }
+});
+
+router.put('/category-visibility', requireAuth, async (req, res) => {
+  try {
+    const body = req.body || {};
+    const context = body.context;
+    const categories = body.categories;
+    const saved = await saveCategoryVisibilityContext(context, categories);
+    res.set('Cache-Control', 'no-store');
+    return res.json(saved);
+  } catch (e) {
+    const code = String(e && e.message ? e.message : e);
+    const status = code === 'invalid_context' ? 400 : 500;
+    logger.error('⚠️ category_visibility PUT KO', { error: String(e) });
+    return res.status(status).json({ ok: false, error: 'category_visibility_put_error' });
+  }
+});
 
 // ============================================================================
 // EXPORT

@@ -190,10 +190,344 @@ module.exports = (app) => {
     }
   });
 
+  // ---- MARKETING CONSENTS (Gift Vouchers) ---------------------------------
+  router.get('/marketing-consents', async (req, res) => {
+    try {
+      const from = req.query.from ? String(req.query.from) : null; // YYYY-MM-DD
+      const to   = req.query.to ? String(req.query.to) : null;
+      const status = String(req.query.status || 'all').toLowerCase();
+
+      const conds = [];
+      const params = [];
+      if (from) { conds.push('DATE(c.created_at) >= DATE(?)'); params.push(from); }
+      if (to)   { conds.push('DATE(c.created_at) <= DATE(?)'); params.push(to); }
+      if (status === 'opted_in')  conds.push("o.status = 'confirmed'");
+      if (status === 'pending')   conds.push("o.status = 'pending'");
+      if (status === 'opted_out') conds.push('c.opt_out_at IS NOT NULL');
+
+      const where = conds.length ? `WHERE ${conds.join(' AND ')}` : '';
+
+      const rows = await q(
+        `SELECT
+           c.id AS contact_id,
+           c.customer_first,
+           c.customer_last,
+           c.phone,
+           c.email,
+           c.city,
+           c.birthday,
+           c.consent_marketing,
+           c.source_tag,
+           c.utm_source,
+           c.utm_medium,
+           c.utm_campaign,
+           c.created_at,
+           c.opt_out_at,
+           c.opt_out_channel,
+           v.code AS voucher_code,
+           v.value_cents,
+           v.valid_until,
+           v.status AS voucher_status,
+           o.status AS optin_status,
+           o.requested_at AS optin_requested_at,
+           o.confirmed_at AS optin_confirmed_at
+         FROM gift_voucher_contacts c
+         LEFT JOIN gift_vouchers v ON v.id = c.voucher_id
+         LEFT JOIN gift_voucher_optins o
+           ON o.id = (
+             SELECT id FROM gift_voucher_optins
+             WHERE contact_id = c.id
+             ORDER BY requested_at DESC
+             LIMIT 1
+           )
+         ${where}
+         ORDER BY c.id DESC
+         LIMIT 500`,
+        params,
+      );
+
+      res.json(rows || []);
+    } catch (e) {
+      log.error('❌ /api/customers marketing-consents', { error: String(e) });
+      res.status(500).json({ ok:false, error: 'marketing_consents_error' });
+    }
+  });
+
+  // ---- EXPORT CSV ---------------------------------------------------------
+  router.get('/marketing-consents/export', async (req, res) => {
+    try {
+      const from = req.query.from ? String(req.query.from) : null;
+      const to   = req.query.to ? String(req.query.to) : null;
+      const status = String(req.query.status || 'all').toLowerCase();
+
+      const conds = [];
+      const params = [];
+      if (from) { conds.push('DATE(c.created_at) >= DATE(?)'); params.push(from); }
+      if (to)   { conds.push('DATE(c.created_at) <= DATE(?)'); params.push(to); }
+      if (status === 'opted_in')  conds.push("o.status = 'confirmed'");
+      if (status === 'pending')   conds.push("o.status = 'pending'");
+      if (status === 'opted_out') conds.push('c.opt_out_at IS NOT NULL');
+
+      const where = conds.length ? `WHERE ${conds.join(' AND ')}` : '';
+
+      const rows = await q(
+        `SELECT
+           c.id AS contact_id,
+           c.customer_first,
+           c.customer_last,
+           c.phone,
+           c.email,
+           c.city,
+           c.birthday,
+           c.consent_marketing,
+           c.source_tag,
+           c.utm_source,
+           c.utm_medium,
+           c.utm_campaign,
+           c.created_at,
+           c.opt_out_at,
+           c.opt_out_channel,
+           v.code AS voucher_code,
+           v.value_cents,
+           v.valid_until,
+           v.status AS voucher_status,
+           o.status AS optin_status,
+           o.requested_at AS optin_requested_at,
+           o.confirmed_at AS optin_confirmed_at
+         FROM gift_voucher_contacts c
+         LEFT JOIN gift_vouchers v ON v.id = c.voucher_id
+         LEFT JOIN gift_voucher_optins o
+           ON o.id = (
+             SELECT id FROM gift_voucher_optins
+             WHERE contact_id = c.id
+             ORDER BY requested_at DESC
+             LIMIT 1
+           )
+         ${where}
+         ORDER BY c.id DESC
+         LIMIT 2000`,
+        params,
+      );
+
+      const esc = (v) => {
+        const s = (v == null) ? '' : String(v);
+        if (s.includes(',') || s.includes('"') || s.includes('\n')) {
+          return `"${s.replace(/"/g, '""')}"`;
+        }
+        return s;
+      };
+
+      const header = [
+        'contact_id','customer_first','customer_last','phone','email','city','birthday',
+        'consent_marketing','source_tag','utm_source','utm_medium','utm_campaign','created_at',
+        'opt_out_at','opt_out_channel','voucher_code','value_cents','valid_until','voucher_status',
+        'optin_status','optin_requested_at','optin_confirmed_at'
+      ].join(',');
+
+      const lines = (rows || []).map((r) => ([
+        r.contact_id, r.customer_first, r.customer_last, r.phone, r.email, r.city, r.birthday,
+        r.consent_marketing, r.source_tag, r.utm_source, r.utm_medium, r.utm_campaign, r.created_at,
+        r.opt_out_at, r.opt_out_channel, r.voucher_code, r.value_cents, r.valid_until, r.voucher_status,
+        r.optin_status, r.optin_requested_at, r.optin_confirmed_at
+      ].map(esc).join(',')));
+
+      const csv = [header, ...lines].join('\n');
+      res.set('Content-Type', 'text/csv; charset=utf-8');
+      res.set('Content-Disposition', 'attachment; filename="marketing-consents.csv"');
+      res.send(csv);
+    } catch (e) {
+      log.error('❌ /api/customers marketing-consents export', { error: String(e) });
+      res.status(500).json({ ok:false, error: 'marketing_consents_export_error' });
+    }
+  });
+
   // 🔧 sanity ping
   router.get('/_debug/ping', (_req, res) => {
     res.set('x-route', 'customers:debug');
     res.json({ ok: true, who: 'customers-router' });
+  });
+
+  // -------------------------------------------------------------------------
+  // MARKETING CONSENTS (Gift Voucher)
+  // GET /api/customers/marketing-consents?from=&to=&status=&q=
+  // -------------------------------------------------------------------------
+  router.get('/marketing-consents', async (req, res) => {
+    try {
+      const from = req.query.from ? new Date(String(req.query.from)) : null;
+      const to   = req.query.to ? new Date(String(req.query.to)) : null;
+      const status = String(req.query.status || 'all').toLowerCase();
+      const qRaw = String(req.query.q || '').trim().toLowerCase();
+
+      const conds = [];
+      const params = [];
+
+      if (from) { conds.push('c.created_at >= ?'); params.push(from); }
+      if (to)   { conds.push('c.created_at <= ?'); params.push(to); }
+
+      if (status === 'pending') {
+        conds.push("oi.status = 'pending'");
+      } else if (status === 'opted_in') {
+        conds.push("oi.status = 'confirmed'");
+      } else if (status === 'opted_out') {
+        conds.push('c.opt_out_at IS NOT NULL');
+      }
+
+      if (qRaw) {
+        conds.push(`(
+          LOWER(c.customer_first) LIKE ?
+          OR LOWER(c.customer_last) LIKE ?
+          OR LOWER(c.email) LIKE ?
+          OR REPLACE(REPLACE(REPLACE(COALESCE(c.phone,''),' ',''),'+',''),'-','') LIKE ?
+        )`);
+        const like = `%${qRaw}%`;
+        params.push(like, like, like, qRaw.replace(/\s+/g, ''));
+      }
+
+      const where = conds.length ? `WHERE ${conds.join(' AND ')}` : '';
+
+      const rows = await q(
+        `SELECT
+           c.id AS contact_id,
+           c.customer_first,
+           c.customer_last,
+           c.phone,
+           c.email,
+           c.city,
+           c.birthday,
+           c.consent_marketing,
+           c.source_tag,
+           c.utm_source,
+           c.utm_medium,
+           c.utm_campaign,
+           c.created_at,
+           c.opt_out_at,
+           c.opt_out_channel,
+           c.voucher_code,
+           gv.value_cents,
+           gv.valid_until,
+           gv.status AS voucher_status,
+           oi.status AS optin_status,
+           oi.requested_at AS optin_requested_at,
+           oi.confirmed_at AS optin_confirmed_at
+         FROM gift_voucher_contacts c
+         LEFT JOIN gift_vouchers gv ON gv.id = c.voucher_id
+         LEFT JOIN (
+           SELECT t1.*
+           FROM gift_voucher_optins t1
+           INNER JOIN (
+             SELECT contact_id, MAX(id) AS max_id
+             FROM gift_voucher_optins
+             GROUP BY contact_id
+           ) t2 ON t1.id = t2.max_id
+         ) oi ON oi.contact_id = c.id
+         ${where}
+         ORDER BY c.created_at DESC
+         LIMIT 2000`,
+        params,
+      );
+
+      res.json(rows || []);
+    } catch (e) {
+      log.error('❌ /api/customers/marketing-consents', { error: String(e) });
+      res.status(500).json([]);
+    }
+  });
+
+  // -------------------------------------------------------------------------
+  // MARKETING CONSENTS EXPORT (CSV)
+  // GET /api/customers/marketing-consents/export?from=&to=&status=&q=
+  // -------------------------------------------------------------------------
+  router.get('/marketing-consents/export', async (req, res) => {
+    try {
+      const from = req.query.from ? new Date(String(req.query.from)) : null;
+      const to   = req.query.to ? new Date(String(req.query.to)) : null;
+      const status = String(req.query.status || 'all').toLowerCase();
+      const qRaw = String(req.query.q || '').trim().toLowerCase();
+
+      const conds = [];
+      const params = [];
+      if (from) { conds.push('c.created_at >= ?'); params.push(from); }
+      if (to)   { conds.push('c.created_at <= ?'); params.push(to); }
+      if (status === 'pending') conds.push("oi.status = 'pending'");
+      else if (status === 'opted_in') conds.push("oi.status = 'confirmed'");
+      else if (status === 'opted_out') conds.push('c.opt_out_at IS NOT NULL');
+
+      if (qRaw) {
+        conds.push(`(
+          LOWER(c.customer_first) LIKE ?
+          OR LOWER(c.customer_last) LIKE ?
+          OR LOWER(c.email) LIKE ?
+          OR REPLACE(REPLACE(REPLACE(COALESCE(c.phone,''),' ',''),'+',''),'-','') LIKE ?
+        )`);
+        const like = `%${qRaw}%`;
+        params.push(like, like, like, qRaw.replace(/\s+/g, ''));
+      }
+
+      const where = conds.length ? `WHERE ${conds.join(' AND ')}` : '';
+
+      const rows = await q(
+        `SELECT
+           c.customer_first,
+           c.customer_last,
+           c.phone,
+           c.email,
+           c.city,
+           c.birthday,
+           c.consent_marketing,
+           c.source_tag,
+           c.utm_source,
+           c.utm_medium,
+           c.utm_campaign,
+           c.created_at,
+           c.opt_out_at,
+           c.opt_out_channel,
+           c.voucher_code,
+           gv.value_cents,
+           gv.valid_until,
+           gv.status AS voucher_status,
+           oi.status AS optin_status,
+           oi.requested_at AS optin_requested_at,
+           oi.confirmed_at AS optin_confirmed_at
+         FROM gift_voucher_contacts c
+         LEFT JOIN gift_vouchers gv ON gv.id = c.voucher_id
+         LEFT JOIN (
+           SELECT t1.*
+           FROM gift_voucher_optins t1
+           INNER JOIN (
+             SELECT contact_id, MAX(id) AS max_id
+             FROM gift_voucher_optins
+             GROUP BY contact_id
+           ) t2 ON t1.id = t2.max_id
+         ) oi ON oi.contact_id = c.id
+         ${where}
+         ORDER BY c.created_at DESC`,
+        params,
+      );
+
+      const esc = (v) => `"${String(v ?? '').replace(/"/g, '""')}"`;
+      const header = [
+        'customer_first','customer_last','phone','email','city','birthday',
+        'consent_marketing','source_tag','utm_source','utm_medium','utm_campaign',
+        'created_at','opt_out_at','opt_out_channel',
+        'voucher_code','value_cents','valid_until','voucher_status',
+        'optin_status','optin_requested_at','optin_confirmed_at'
+      ].join(',');
+      const lines = (rows || []).map((r) => [
+        r.customer_first, r.customer_last, r.phone, r.email, r.city, r.birthday,
+        r.consent_marketing, r.source_tag, r.utm_source, r.utm_medium, r.utm_campaign,
+        r.created_at, r.opt_out_at, r.opt_out_channel,
+        r.voucher_code, r.value_cents, r.valid_until, r.voucher_status,
+        r.optin_status, r.optin_requested_at, r.optin_confirmed_at
+      ].map(esc).join(','));
+
+      const csv = [header, ...lines].join('\n');
+      res.set('Content-Type', 'text/csv; charset=utf-8');
+      res.set('Content-Disposition', 'attachment; filename="marketing-consents.csv"');
+      res.send(csv);
+    } catch (e) {
+      log.error('❌ /api/customers/marketing-consents/export', { error: String(e) });
+      res.status(500).send('error');
+    }
   });
 
   return router;

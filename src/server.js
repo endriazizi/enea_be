@@ -90,6 +90,14 @@ if (ensureExists('api/nfc-session', 'API /api/nfc-session')) {
 if (ensureExists('api/customers', 'API /api/customers'))
   app.use('/api/customers', require('./api/customers')(app));
 
+// 🆕 Gift Vouchers (Buoni Regalo)
+if (ensureExists('api/gift-vouchers', 'API /api/gift-vouchers'))
+  app.use('/api/gift-vouchers', require('./api/gift-vouchers')(app));
+
+// 🆕 Public voucher activation (no-auth)
+if (ensureExists('api/public-voucher', 'API /api/public/voucher'))
+  app.use('/api/public', require('./api/public-voucher')(app));
+
 // Health
 if (ensureExists('api/health', 'API /api/health'))
   app.use('/api/health', require('./api/health'));
