@@ -1,6 +1,6 @@
 # 🧩 Project code (file ammessi in .)
 
-_Generato: Tue, Jan 27, 2026  2:22:30 PM_
+_Generato: Mon, Feb  2, 2026  1:27:24 PM_
 
 ### ./docs/canvas-backend.md
 ```
@@ -444,6 +444,124 @@ router.get('/me', requireAuth, async (req, res) => {
 module.exports = router;
 ```
 
+### ./src/api/centralino.js
+```
+// src/api/centralino.js
+// ============================================================================
+// Centralino → apertura /asporto con prefill caller
+// - GET /api/centralino/call?key=...&callerid=...&remark=...
+// - Se remark == "tasto1" → redirect a /asporto con query precompilata
+// ============================================================================
+'use strict';
+
+const express = require('express');
+const router = express.Router();
+
+module.exports = (app) => {
+  const db = app?.get('db') || require('../db');
+  const log = app?.get('logger') || console;
+  const env = require('../env');
+
+  async function q(sql, params = []) {
+    const res = await db.query(sql, params);
+    return (Array.isArray(res) && Array.isArray(res[0])) ? res[0] : res;
+  }
+
+  const normDigits = (v) => String(v || '').replace(/\D+/g, '');
+
+  function isTasto1(raw) {
+    const s = String(raw || '').trim().toLowerCase();
+    return s === 'tasto1' || s === 'tasto 1' || s === 'tasto_1';
+  }
+
+  async function lookupCustomerByPhone(phoneRaw) {
+    const digits = normDigits(phoneRaw);
+    if (!digits) return null;
+    const like = `%${digits}`;
+    const rows = await q(
+      `SELECT id, full_name, first_name, last_name, phone
+       FROM users
+       WHERE REPLACE(REPLACE(REPLACE(COALESCE(phone,''),' ',''),'+',''),'-','') LIKE ?
+       ORDER BY id DESC
+       LIMIT 1`,
+      [like],
+    );
+    const r = rows && rows[0] ? rows[0] : null;
+    if (!r) return null;
+    const full =
+      (r.full_name || '').trim() ||
+      `${r.first_name || ''} ${r.last_name || ''}`.trim();
+    return {
+      id: r.id,
+      full_name: full || null,
+      first_name: r.first_name || null,
+      last_name: r.last_name || null,
+      phone: r.phone || phoneRaw || null,
+    };
+  }
+
+  router.get('/call', async (req, res) => {
+    const key = String(req.query.key || '');
+    if (!env.CENTRALINO_KEY || key !== env.CENTRALINO_KEY) {
+      return res.status(403).json({ ok: false, error: 'invalid_key' });
+    }
+
+    const callerid = String(req.query.callerid || '');
+    const remark = String(req.query.remark || '');
+    const remark2 = String(req.query.remark2 || '');
+    const remark3 = String(req.query.remark3 || '');
+    const calledid = String(req.query.calledid || '');
+    const uniqueid = String(req.query.uniqueid || '');
+
+    log.info('📞 [Centralino] call', {
+      callerid,
+      calledid,
+      uniqueid,
+      remark,
+      remark2,
+      remark3,
+    });
+
+    if (!isTasto1(remark)) {
+      return res.json({ ok: true, action: 'ignore' });
+    }
+
+    let customer = null;
+    try {
+      customer = await lookupCustomerByPhone(callerid);
+    } catch (e) {
+      log.warn('⚠️ [Centralino] lookup KO', { error: String(e) });
+    }
+
+    const base =
+      (env.CENTRALINO_REDIRECT_BASE || '').trim() ||
+      `${req.protocol}://${req.get('host')}`;
+
+    const params = new URLSearchParams();
+    if (callerid) params.set('callerid', callerid);
+    if (customer?.full_name) params.set('customer_name', customer.full_name);
+    if (customer?.first_name) params.set('customer_first', customer.first_name);
+    if (customer?.last_name) params.set('customer_last', customer.last_name);
+
+    const url = `${base}/asporto?${params.toString()}`;
+    return res.redirect(302, url);
+  });
+
+  // Optional: lookup JSON (per FE)
+  router.get('/lookup', async (req, res) => {
+    const key = String(req.query.key || '');
+    if (!env.CENTRALINO_KEY || key !== env.CENTRALINO_KEY) {
+      return res.status(403).json({ ok: false, error: 'invalid_key' });
+    }
+    const callerid = String(req.query.callerid || '');
+    const customer = await lookupCustomerByPhone(callerid);
+    res.json({ ok: true, callerid, customer });
+  });
+
+  return router;
+};
+```
+
 ### ./src/api/customers.js
 ```
 // ============================================================================
@@ -638,10 +756,790 @@ module.exports = (app) => {
     }
   });
 
+  // ---- MARKETING CONSENTS (Gift Vouchers) ---------------------------------
+  router.get('/marketing-consents', async (req, res) => {
+    try {
+      const from = req.query.from ? String(req.query.from) : null; // YYYY-MM-DD
+      const to   = req.query.to ? String(req.query.to) : null;
+      const status = String(req.query.status || 'all').toLowerCase();
+
+      const conds = [];
+      const params = [];
+      if (from) { conds.push('DATE(c.created_at) >= DATE(?)'); params.push(from); }
+      if (to)   { conds.push('DATE(c.created_at) <= DATE(?)'); params.push(to); }
+      if (status === 'opted_in')  conds.push("o.status = 'confirmed'");
+      if (status === 'pending')   conds.push("o.status = 'pending'");
+      if (status === 'opted_out') conds.push('c.opt_out_at IS NOT NULL');
+
+      const where = conds.length ? `WHERE ${conds.join(' AND ')}` : '';
+
+      const rows = await q(
+        `SELECT
+           c.id AS contact_id,
+           c.customer_first,
+           c.customer_last,
+           c.phone,
+           c.email,
+           c.city,
+           c.birthday,
+           c.consent_marketing,
+           c.source_tag,
+           c.utm_source,
+           c.utm_medium,
+           c.utm_campaign,
+           c.created_at,
+           c.opt_out_at,
+           c.opt_out_channel,
+           v.code AS voucher_code,
+           v.value_cents,
+           v.valid_until,
+           v.status AS voucher_status,
+           o.status AS optin_status,
+           o.requested_at AS optin_requested_at,
+           o.confirmed_at AS optin_confirmed_at
+         FROM gift_voucher_contacts c
+         LEFT JOIN gift_vouchers v ON v.id = c.voucher_id
+         LEFT JOIN gift_voucher_optins o
+           ON o.id = (
+             SELECT id FROM gift_voucher_optins
+             WHERE contact_id = c.id
+             ORDER BY requested_at DESC
+             LIMIT 1
+           )
+         ${where}
+         ORDER BY c.id DESC
+         LIMIT 500`,
+        params,
+      );
+
+      res.json(rows || []);
+    } catch (e) {
+      log.error('❌ /api/customers marketing-consents', { error: String(e) });
+      res.status(500).json({ ok:false, error: 'marketing_consents_error' });
+    }
+  });
+
+  // ---- EXPORT CSV ---------------------------------------------------------
+  router.get('/marketing-consents/export', async (req, res) => {
+    try {
+      const from = req.query.from ? String(req.query.from) : null;
+      const to   = req.query.to ? String(req.query.to) : null;
+      const status = String(req.query.status || 'all').toLowerCase();
+
+      const conds = [];
+      const params = [];
+      if (from) { conds.push('DATE(c.created_at) >= DATE(?)'); params.push(from); }
+      if (to)   { conds.push('DATE(c.created_at) <= DATE(?)'); params.push(to); }
+      if (status === 'opted_in')  conds.push("o.status = 'confirmed'");
+      if (status === 'pending')   conds.push("o.status = 'pending'");
+      if (status === 'opted_out') conds.push('c.opt_out_at IS NOT NULL');
+
+      const where = conds.length ? `WHERE ${conds.join(' AND ')}` : '';
+
+      const rows = await q(
+        `SELECT
+           c.id AS contact_id,
+           c.customer_first,
+           c.customer_last,
+           c.phone,
+           c.email,
+           c.city,
+           c.birthday,
+           c.consent_marketing,
+           c.source_tag,
+           c.utm_source,
+           c.utm_medium,
+           c.utm_campaign,
+           c.created_at,
+           c.opt_out_at,
+           c.opt_out_channel,
+           v.code AS voucher_code,
+           v.value_cents,
+           v.valid_until,
+           v.status AS voucher_status,
+           o.status AS optin_status,
+           o.requested_at AS optin_requested_at,
+           o.confirmed_at AS optin_confirmed_at
+         FROM gift_voucher_contacts c
+         LEFT JOIN gift_vouchers v ON v.id = c.voucher_id
+         LEFT JOIN gift_voucher_optins o
+           ON o.id = (
+             SELECT id FROM gift_voucher_optins
+             WHERE contact_id = c.id
+             ORDER BY requested_at DESC
+             LIMIT 1
+           )
+         ${where}
+         ORDER BY c.id DESC
+         LIMIT 2000`,
+        params,
+      );
+
+      const esc = (v) => {
+        const s = (v == null) ? '' : String(v);
+        if (s.includes(',') || s.includes('"') || s.includes('\n')) {
+          return `"${s.replace(/"/g, '""')}"`;
+        }
+        return s;
+      };
+
+      const header = [
+        'contact_id','customer_first','customer_last','phone','email','city','birthday',
+        'consent_marketing','source_tag','utm_source','utm_medium','utm_campaign','created_at',
+        'opt_out_at','opt_out_channel','voucher_code','value_cents','valid_until','voucher_status',
+        'optin_status','optin_requested_at','optin_confirmed_at'
+      ].join(',');
+
+      const lines = (rows || []).map((r) => ([
+        r.contact_id, r.customer_first, r.customer_last, r.phone, r.email, r.city, r.birthday,
+        r.consent_marketing, r.source_tag, r.utm_source, r.utm_medium, r.utm_campaign, r.created_at,
+        r.opt_out_at, r.opt_out_channel, r.voucher_code, r.value_cents, r.valid_until, r.voucher_status,
+        r.optin_status, r.optin_requested_at, r.optin_confirmed_at
+      ].map(esc).join(',')));
+
+      const csv = [header, ...lines].join('\n');
+      res.set('Content-Type', 'text/csv; charset=utf-8');
+      res.set('Content-Disposition', 'attachment; filename="marketing-consents.csv"');
+      res.send(csv);
+    } catch (e) {
+      log.error('❌ /api/customers marketing-consents export', { error: String(e) });
+      res.status(500).json({ ok:false, error: 'marketing_consents_export_error' });
+    }
+  });
+
   // 🔧 sanity ping
   router.get('/_debug/ping', (_req, res) => {
     res.set('x-route', 'customers:debug');
     res.json({ ok: true, who: 'customers-router' });
+  });
+
+  // -------------------------------------------------------------------------
+  // MARKETING CONSENTS (Gift Voucher)
+  // GET /api/customers/marketing-consents?from=&to=&status=&q=
+  // -------------------------------------------------------------------------
+  router.get('/marketing-consents', async (req, res) => {
+    try {
+      const from = req.query.from ? new Date(String(req.query.from)) : null;
+      const to   = req.query.to ? new Date(String(req.query.to)) : null;
+      const status = String(req.query.status || 'all').toLowerCase();
+      const qRaw = String(req.query.q || '').trim().toLowerCase();
+
+      const conds = [];
+      const params = [];
+
+      if (from) { conds.push('c.created_at >= ?'); params.push(from); }
+      if (to)   { conds.push('c.created_at <= ?'); params.push(to); }
+
+      if (status === 'pending') {
+        conds.push("oi.status = 'pending'");
+      } else if (status === 'opted_in') {
+        conds.push("oi.status = 'confirmed'");
+      } else if (status === 'opted_out') {
+        conds.push('c.opt_out_at IS NOT NULL');
+      }
+
+      if (qRaw) {
+        conds.push(`(
+          LOWER(c.customer_first) LIKE ?
+          OR LOWER(c.customer_last) LIKE ?
+          OR LOWER(c.email) LIKE ?
+          OR REPLACE(REPLACE(REPLACE(COALESCE(c.phone,''),' ',''),'+',''),'-','') LIKE ?
+        )`);
+        const like = `%${qRaw}%`;
+        params.push(like, like, like, qRaw.replace(/\s+/g, ''));
+      }
+
+      const where = conds.length ? `WHERE ${conds.join(' AND ')}` : '';
+
+      const rows = await q(
+        `SELECT
+           c.id AS contact_id,
+           c.customer_first,
+           c.customer_last,
+           c.phone,
+           c.email,
+           c.city,
+           c.birthday,
+           c.consent_marketing,
+           c.source_tag,
+           c.utm_source,
+           c.utm_medium,
+           c.utm_campaign,
+           c.created_at,
+           c.opt_out_at,
+           c.opt_out_channel,
+           c.voucher_code,
+           gv.value_cents,
+           gv.valid_until,
+           gv.status AS voucher_status,
+           oi.status AS optin_status,
+           oi.requested_at AS optin_requested_at,
+           oi.confirmed_at AS optin_confirmed_at
+         FROM gift_voucher_contacts c
+         LEFT JOIN gift_vouchers gv ON gv.id = c.voucher_id
+         LEFT JOIN (
+           SELECT t1.*
+           FROM gift_voucher_optins t1
+           INNER JOIN (
+             SELECT contact_id, MAX(id) AS max_id
+             FROM gift_voucher_optins
+             GROUP BY contact_id
+           ) t2 ON t1.id = t2.max_id
+         ) oi ON oi.contact_id = c.id
+         ${where}
+         ORDER BY c.created_at DESC
+         LIMIT 2000`,
+        params,
+      );
+
+      res.json(rows || []);
+    } catch (e) {
+      log.error('❌ /api/customers/marketing-consents', { error: String(e) });
+      res.status(500).json([]);
+    }
+  });
+
+  // -------------------------------------------------------------------------
+  // MARKETING CONSENTS EXPORT (CSV)
+  // GET /api/customers/marketing-consents/export?from=&to=&status=&q=
+  // -------------------------------------------------------------------------
+  router.get('/marketing-consents/export', async (req, res) => {
+    try {
+      const from = req.query.from ? new Date(String(req.query.from)) : null;
+      const to   = req.query.to ? new Date(String(req.query.to)) : null;
+      const status = String(req.query.status || 'all').toLowerCase();
+      const qRaw = String(req.query.q || '').trim().toLowerCase();
+
+      const conds = [];
+      const params = [];
+      if (from) { conds.push('c.created_at >= ?'); params.push(from); }
+      if (to)   { conds.push('c.created_at <= ?'); params.push(to); }
+      if (status === 'pending') conds.push("oi.status = 'pending'");
+      else if (status === 'opted_in') conds.push("oi.status = 'confirmed'");
+      else if (status === 'opted_out') conds.push('c.opt_out_at IS NOT NULL');
+
+      if (qRaw) {
+        conds.push(`(
+          LOWER(c.customer_first) LIKE ?
+          OR LOWER(c.customer_last) LIKE ?
+          OR LOWER(c.email) LIKE ?
+          OR REPLACE(REPLACE(REPLACE(COALESCE(c.phone,''),' ',''),'+',''),'-','') LIKE ?
+        )`);
+        const like = `%${qRaw}%`;
+        params.push(like, like, like, qRaw.replace(/\s+/g, ''));
+      }
+
+      const where = conds.length ? `WHERE ${conds.join(' AND ')}` : '';
+
+      const rows = await q(
+        `SELECT
+           c.customer_first,
+           c.customer_last,
+           c.phone,
+           c.email,
+           c.city,
+           c.birthday,
+           c.consent_marketing,
+           c.source_tag,
+           c.utm_source,
+           c.utm_medium,
+           c.utm_campaign,
+           c.created_at,
+           c.opt_out_at,
+           c.opt_out_channel,
+           c.voucher_code,
+           gv.value_cents,
+           gv.valid_until,
+           gv.status AS voucher_status,
+           oi.status AS optin_status,
+           oi.requested_at AS optin_requested_at,
+           oi.confirmed_at AS optin_confirmed_at
+         FROM gift_voucher_contacts c
+         LEFT JOIN gift_vouchers gv ON gv.id = c.voucher_id
+         LEFT JOIN (
+           SELECT t1.*
+           FROM gift_voucher_optins t1
+           INNER JOIN (
+             SELECT contact_id, MAX(id) AS max_id
+             FROM gift_voucher_optins
+             GROUP BY contact_id
+           ) t2 ON t1.id = t2.max_id
+         ) oi ON oi.contact_id = c.id
+         ${where}
+         ORDER BY c.created_at DESC`,
+        params,
+      );
+
+      const esc = (v) => `"${String(v ?? '').replace(/"/g, '""')}"`;
+      const header = [
+        'customer_first','customer_last','phone','email','city','birthday',
+        'consent_marketing','source_tag','utm_source','utm_medium','utm_campaign',
+        'created_at','opt_out_at','opt_out_channel',
+        'voucher_code','value_cents','valid_until','voucher_status',
+        'optin_status','optin_requested_at','optin_confirmed_at'
+      ].join(',');
+      const lines = (rows || []).map((r) => [
+        r.customer_first, r.customer_last, r.phone, r.email, r.city, r.birthday,
+        r.consent_marketing, r.source_tag, r.utm_source, r.utm_medium, r.utm_campaign,
+        r.created_at, r.opt_out_at, r.opt_out_channel,
+        r.voucher_code, r.value_cents, r.valid_until, r.voucher_status,
+        r.optin_status, r.optin_requested_at, r.optin_confirmed_at
+      ].map(esc).join(','));
+
+      const csv = [header, ...lines].join('\n');
+      res.set('Content-Type', 'text/csv; charset=utf-8');
+      res.set('Content-Disposition', 'attachment; filename="marketing-consents.csv"');
+      res.send(csv);
+    } catch (e) {
+      log.error('❌ /api/customers/marketing-consents/export', { error: String(e) });
+      res.status(500).send('error');
+    }
+  });
+
+  return router;
+};
+```
+
+### ./src/api/gift-vouchers.js
+```
+// ============================================================================
+// /api/gift-vouchers — CRUD + stampa buoni regalo
+// - Stile progetto: commenti lunghi 🇮🇹 + log con emoji
+// - Update solo se status=active (e non scaduto)
+// - Delete soft → status=void
+// - Print → ESC/POS + audit (success/fail)
+// ============================================================================
+
+'use strict';
+
+const express = require('express');
+const router  = express.Router();
+
+const logger = require('../logger');
+const { printGiftVoucherSlip, buildQrText } = require('../services/gift-voucher-printer.service');
+
+module.exports = (app) => {
+  const db  = app?.get('db') || require('../db');
+  const log = app?.get('logger') || logger;
+
+  // Normalizza risultato db.query():
+  async function q(sql, params = []) {
+    const res = await db.query(sql, params);
+    return (Array.isArray(res) && Array.isArray(res[0])) ? res[0] : res;
+  }
+
+  const toNum = (v, def = 0) => {
+    const n = Number(v);
+    return Number.isFinite(n) ? n : def;
+  };
+  const toDate = (v) => (v ? new Date(v) : null);
+
+  const CODE_ALPHABET = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+  function generateCode(len = 8) {
+    let out = '';
+    for (let i = 0; i < len; i += 1) {
+      out += CODE_ALPHABET[Math.floor(Math.random() * CODE_ALPHABET.length)];
+    }
+    return out;
+  }
+
+  function mapRow(r) {
+    if (!r) return null;
+    return {
+      id           : r.id,
+      code         : r.code,
+      value_cents  : Number(r.value_cents || 0),
+      event_title  : r.event_title,
+      description  : r.description || null,
+      valid_from   : r.valid_from,
+      valid_until  : r.valid_until,
+      status       : r.status,
+      status_db    : r.status_db || r.status,
+      redeemed_at  : r.redeemed_at || null,
+      redeemed_note: r.redeemed_note || null,
+      created_at   : r.created_at,
+      updated_at   : r.updated_at || null,
+      qr_text      : r.qr_text || null,
+    };
+  }
+
+  // =========================================================================
+  // GET /api/gift-vouchers?status=&q=&from=&to=
+  // =========================================================================
+  router.get('/', async (req, res) => {
+    try {
+      const { status, q: qRaw, from, to } = req.query || {};
+      const qStr = String(qRaw || '').trim();
+      const conds = [];
+      const params = [];
+
+      if (from) {
+        conds.push('gv.created_at >= ?');
+        params.push(toDate(from));
+      }
+      if (to) {
+        conds.push('gv.created_at <= ?');
+        params.push(toDate(to));
+      }
+
+      const statusStr = String(status || '').toLowerCase();
+      if (statusStr && statusStr !== 'all') {
+        if (statusStr === 'expired') {
+          conds.push(`gv.status = 'active' AND gv.valid_until < UTC_TIMESTAMP()`);
+        } else if (statusStr === 'active') {
+          conds.push(`gv.status = 'active' AND gv.valid_until >= UTC_TIMESTAMP()`);
+        } else {
+          conds.push('gv.status = ?');
+          params.push(statusStr);
+        }
+      }
+
+      if (qStr) {
+        conds.push(`(
+          gv.code LIKE ?
+          OR gv.event_title LIKE ?
+          OR gv.description LIKE ?
+        )`);
+        const like = `%${qStr}%`;
+        params.push(like, like, like);
+      }
+
+      const where = conds.length ? `WHERE ${conds.join(' AND ')}` : '';
+
+      const rows = await q(
+        `SELECT
+           gv.*,
+           gv.status AS status_db,
+           CASE
+             WHEN gv.status = 'active' AND gv.valid_until < UTC_TIMESTAMP() THEN 'expired'
+             ELSE gv.status
+           END AS status
+         FROM gift_vouchers gv
+         ${where}
+         ORDER BY gv.id DESC
+         LIMIT 500`,
+        params,
+      );
+
+      const out = (rows || []).map(mapRow);
+      log.info('🎁 [GiftVouchers] list', { count: out.length, status: statusStr || 'all', q: qStr || null });
+      res.json(out);
+    } catch (e) {
+      log.error('🎁 gift-vouchers list ❌', { error: String(e) });
+      res.status(500).json({ ok: false, error: 'gift_vouchers_list_error' });
+    }
+  });
+
+  // =========================================================================
+  // GET /api/gift-vouchers/:id
+  // =========================================================================
+  router.get('/:id(\\d+)', async (req, res) => {
+    try {
+      const id = toNum(req.params.id);
+      const rows = await q(
+        `SELECT
+           gv.*,
+           gv.status AS status_db,
+           CASE
+             WHEN gv.status = 'active' AND gv.valid_until < UTC_TIMESTAMP() THEN 'expired'
+             ELSE gv.status
+           END AS status
+         FROM gift_vouchers gv
+         WHERE gv.id = ?
+         LIMIT 1`,
+        [id],
+      );
+      const row = rows && rows[0] ? rows[0] : null;
+      if (!row) return res.status(404).json({ ok: false, error: 'not_found' });
+
+      const qrText = buildQrText(row.code);
+      res.json(mapRow({ ...row, qr_text: qrText }));
+    } catch (e) {
+      log.error('🎁 gift-vouchers get ❌', { error: String(e) });
+      res.status(500).json({ ok: false, error: 'gift_vouchers_get_error' });
+    }
+  });
+
+  // =========================================================================
+  // POST /api/gift-vouchers
+  // =========================================================================
+  router.post('/', async (req, res) => {
+    const dto = req.body || {};
+    try {
+      const valueCents = toNum(dto.value_cents || dto.valueCents);
+      if (!valueCents || valueCents <= 0) {
+        return res.status(400).json({ ok: false, error: 'value_cents_invalid' });
+      }
+      const eventTitle = String(dto.event_title || '').trim();
+      if (!eventTitle) {
+        return res.status(400).json({ ok: false, error: 'event_title_required' });
+      }
+      const validUntil = dto.valid_until ? toDate(dto.valid_until) : null;
+      if (!validUntil || isNaN(validUntil.getTime())) {
+        return res.status(400).json({ ok: false, error: 'valid_until_required' });
+      }
+      const validFrom = dto.valid_from ? toDate(dto.valid_from) : null;
+
+      let insertedId = null;
+      let code = null;
+
+      for (let i = 0; i < 5; i += 1) {
+        code = generateCode(8);
+        try {
+          const r = await q(
+            `INSERT INTO gift_vouchers (
+               code,
+               value_cents,
+               event_title,
+               description,
+               valid_from,
+               valid_until,
+               status,
+               created_at,
+               updated_at
+             ) VALUES (?,?,?,?,IFNULL(?, UTC_TIMESTAMP()),?,'active',UTC_TIMESTAMP(),UTC_TIMESTAMP())`,
+            [
+              code,
+              valueCents,
+              eventTitle,
+              dto.description || null,
+              validFrom,
+              validUntil,
+            ],
+          );
+          insertedId = r?.insertId;
+          break;
+        } catch (e) {
+          if (String(e?.code || '').toLowerCase() === 'er_dup_entry') {
+            log.warn('🎁 [GiftVouchers] code collision, retry', { attempt: i + 1 });
+            continue;
+          }
+          throw e;
+        }
+      }
+
+      if (!insertedId) {
+        return res.status(500).json({ ok: false, error: 'code_generation_failed' });
+      }
+
+      const rows = await q(
+        `SELECT
+           gv.*,
+           gv.status AS status_db,
+           gv.status AS status
+         FROM gift_vouchers gv
+         WHERE gv.id = ?
+         LIMIT 1`,
+        [insertedId],
+      );
+      log.info('🎁 [GiftVouchers] create OK', { id: insertedId, code });
+      res.status(201).json(mapRow(rows[0]));
+    } catch (e) {
+      log.error('🎁 gift-vouchers create ❌', { error: String(e) });
+      res.status(500).json({ ok: false, error: 'gift_vouchers_create_error' });
+    }
+  });
+
+  // =========================================================================
+  // PUT /api/gift-vouchers/:id  (solo active + non scaduto)
+  // =========================================================================
+  router.put('/:id(\\d+)', async (req, res) => {
+    const id = toNum(req.params.id);
+    const dto = req.body || {};
+    try {
+      const rows = await q(
+        `SELECT
+           id, status, valid_until
+         FROM gift_vouchers
+         WHERE id = ?
+         LIMIT 1`,
+        [id],
+      );
+      const existing = rows && rows[0] ? rows[0] : null;
+      if (!existing) return res.status(404).json({ ok: false, error: 'not_found' });
+
+      const isExpired = existing.status === 'active' && new Date(existing.valid_until) < new Date();
+      if (existing.status !== 'active' || isExpired) {
+        return res.status(409).json({ ok: false, error: 'voucher_not_editable' });
+      }
+
+      const valueCents = dto.value_cents != null || dto.valueCents != null
+        ? toNum(dto.value_cents || dto.valueCents)
+        : null;
+      if (valueCents != null && valueCents <= 0) {
+        return res.status(400).json({ ok: false, error: 'value_cents_invalid' });
+      }
+
+      const eventTitle = dto.event_title != null ? String(dto.event_title || '').trim() : null;
+      if (eventTitle !== null && !eventTitle) {
+        return res.status(400).json({ ok: false, error: 'event_title_required' });
+      }
+
+      const validUntil = dto.valid_until ? toDate(dto.valid_until) : null;
+      if (dto.valid_until && (!validUntil || isNaN(validUntil.getTime()))) {
+        return res.status(400).json({ ok: false, error: 'valid_until_required' });
+      }
+
+      const validFrom = dto.valid_from ? toDate(dto.valid_from) : null;
+
+      await q(
+        `UPDATE gift_vouchers SET
+           value_cents = COALESCE(?, value_cents),
+           event_title = COALESCE(?, event_title),
+           description = COALESCE(?, description),
+           valid_from  = COALESCE(?, valid_from),
+           valid_until = COALESCE(?, valid_until),
+           updated_at  = UTC_TIMESTAMP()
+         WHERE id = ?`,
+        [
+          valueCents,
+          eventTitle,
+          dto.description != null ? dto.description : null,
+          validFrom,
+          validUntil,
+          id,
+        ],
+      );
+
+      const outRows = await q(
+        `SELECT
+           gv.*,
+           gv.status AS status_db,
+           CASE
+             WHEN gv.status = 'active' AND gv.valid_until < UTC_TIMESTAMP() THEN 'expired'
+             ELSE gv.status
+           END AS status
+         FROM gift_vouchers gv
+         WHERE gv.id = ?
+         LIMIT 1`,
+        [id],
+      );
+
+      log.info('🎁 [GiftVouchers] update OK', { id });
+      res.json(mapRow(outRows[0]));
+    } catch (e) {
+      log.error('🎁 gift-vouchers update ❌', { error: String(e) });
+      res.status(500).json({ ok: false, error: 'gift_vouchers_update_error' });
+    }
+  });
+
+  // =========================================================================
+  // DELETE /api/gift-vouchers/:id  (soft delete → status=void)
+  // =========================================================================
+  router.delete('/:id(\\d+)', async (req, res) => {
+    const id = toNum(req.params.id);
+    try {
+      const rows = await q('SELECT id, status FROM gift_vouchers WHERE id = ? LIMIT 1', [id]);
+      const row = rows && rows[0] ? rows[0] : null;
+      if (!row) return res.status(404).json({ ok: false, error: 'not_found' });
+
+      await q(
+        `UPDATE gift_vouchers
+           SET status = 'void', updated_at = UTC_TIMESTAMP()
+         WHERE id = ?`,
+        [id],
+      );
+
+      log.warn('🎁 [GiftVouchers] void OK', { id });
+      res.json({ ok: true });
+    } catch (e) {
+      log.error('🎁 gift-vouchers void ❌', { error: String(e) });
+      res.status(500).json({ ok: false, error: 'gift_vouchers_void_error' });
+    }
+  });
+
+  // =========================================================================
+  // POST /api/gift-vouchers/:id/print
+  // =========================================================================
+  router.post('/:id(\\d+)/print', async (req, res) => {
+    const id = toNum(req.params.id);
+    const userEmail =
+      (req.user && (req.user.email || req.user.username || req.user.id)) ||
+      (req.body && req.body.user_email) ||
+      null;
+    let printerIp = null;
+    let printerPort = null;
+    let qrText = null;
+
+    try {
+      const rows = await q('SELECT * FROM gift_vouchers WHERE id = ? LIMIT 1', [id]);
+      const voucher = rows && rows[0] ? rows[0] : null;
+      if (!voucher) return res.status(404).json({ ok: false, error: 'not_found' });
+
+      qrText = buildQrText(voucher.code);
+
+      try {
+        const out = await printGiftVoucherSlip({ voucher, qrText });
+        printerIp = out?.printer?.ip || null;
+        printerPort = out?.printer?.port || null;
+
+        await q(
+          `INSERT INTO gift_voucher_print_jobs
+            (voucher_id, status, error, printer_ip, printer_port, qr_text, created_by)
+           VALUES (?,?,?,?,?,?,?)`,
+          [id, 'success', null, printerIp, printerPort, qrText, userEmail],
+        );
+
+        log.info('🧾 [GiftVouchers] print OK', { id });
+        return res.json({ ok: true });
+      } catch (e) {
+        const reason = String((e && e.message) || e);
+        await q(
+          `INSERT INTO gift_voucher_print_jobs
+            (voucher_id, status, error, printer_ip, printer_port, qr_text, created_by)
+           VALUES (?,?,?,?,?,?,?)`,
+          [id, 'failed', reason, printerIp, printerPort, qrText, userEmail],
+        );
+
+        log.warn('🧾 [GiftVouchers] print KO', { id, error: reason });
+        return res.status(502).json({ ok: false, error: 'printer_error', reason });
+      }
+    } catch (e) {
+      log.error('🧾 gift-vouchers print ❌', { error: String(e) });
+      return res.status(500).json({ ok: false, error: 'gift_vouchers_print_error' });
+    }
+  });
+
+  // =========================================================================
+  // (opzionale) POST /api/gift-vouchers/:id/redeem
+  // =========================================================================
+  router.post('/:id(\\d+)/redeem', async (req, res) => {
+    const id = toNum(req.params.id);
+    const note = req.body?.note || null;
+    try {
+      const rows = await q('SELECT id, status FROM gift_vouchers WHERE id = ? LIMIT 1', [id]);
+      const row = rows && rows[0] ? rows[0] : null;
+      if (!row) return res.status(404).json({ ok: false, error: 'not_found' });
+      if (row.status !== 'active') {
+        return res.status(409).json({ ok: false, error: 'voucher_not_redeemable' });
+      }
+
+      await q(
+        `UPDATE gift_vouchers
+           SET status = 'redeemed',
+               redeemed_at = UTC_TIMESTAMP(),
+               redeemed_note = ?,
+               updated_at = UTC_TIMESTAMP()
+         WHERE id = ?`,
+        [note, id],
+      );
+
+      const outRows = await q(
+        `SELECT
+           gv.*,
+           gv.status AS status_db,
+           gv.status AS status
+         FROM gift_vouchers gv
+         WHERE gv.id = ?
+         LIMIT 1`,
+        [id],
+      );
+      log.info('🎁 [GiftVouchers] redeem OK', { id });
+      res.json(mapRow(outRows[0]));
+    } catch (e) {
+      log.error('🎁 gift-vouchers redeem ❌', { error: String(e) });
+      res.status(500).json({ ok: false, error: 'gift_vouchers_redeem_error' });
+    }
   });
 
   return router;
@@ -782,12 +1680,12 @@ router.get('/search', async (req, res) => {
 });
 
 // POST /api/google/people/create
-// body: { displayName?, givenName?, familyName?, email?, phone? }
+// body: { displayName?, givenName?, familyName?, email?, phone?, note? }
 router.post('/create', express.json(), async (req, res) => {
-  const { displayName, givenName, familyName, email, phone } = req.body || {};
+  const { displayName, givenName, familyName, email, phone, note } = req.body || {};
 
   try {
-    const out = await createContact({ displayName, givenName, familyName, email, phone });
+    const out = await createContact({ displayName, givenName, familyName, email, phone, note });
     return res.json(out);
   } catch (e) {
     const code = e?.code || '';
@@ -1949,6 +2847,235 @@ function parseLocationHintsFromNote(noteRaw) {
 }
 
 /**
+ * 🔁 Normalizza la modalità ordine (fulfillment)
+ * ---------------------------------------------------------------------------
+ * Accetta valori legacy o varianti FE/BE:
+ * - fulfillment / order_type / orderType / serviceType
+ * - IT/EN: "table/tavolo", "takeaway/asporto", "delivery/domicilio"
+ */
+function normalizeFulfillment(raw) {
+  const v = String(raw || '').trim().toLowerCase();
+  if (!v) return null;
+  if (v === 'table' || v === 'tavolo') return 'table';
+  if (v === 'takeaway' || v === 'asporto' || v === 'take-away') return 'takeaway';
+  if (v === 'delivery' || v === 'domicilio') return 'delivery';
+  return null;
+}
+
+// ============================================================================
+// 🆕 Impostazioni pubbliche /asporto (DB)
+// ============================================================================
+
+const PUBLIC_ASPORTO_DEFAULTS = {
+  enable_public_asporto      : true,
+  public_whatsapp_to         : '0737642142',
+  asporto_start_time         : '07:00',
+  asporto_step_minutes       : 15,
+  asporto_end_time           : '23:00',
+  asporto_lead_minutes       : 20,
+  whatsapp_show_prices       : true,
+  public_asporto_allow_takeaway: true,
+  public_asporto_allow_delivery: false,
+};
+
+function normalizePublicAsportoSettings(raw) {
+  const src = raw || {};
+  const enable = typeof src.enable_public_asporto === 'boolean'
+    ? src.enable_public_asporto
+    : !!Number(src.enable_public_asporto ?? PUBLIC_ASPORTO_DEFAULTS.enable_public_asporto);
+  const allowTakeaway = typeof src.public_asporto_allow_takeaway === 'boolean'
+    ? src.public_asporto_allow_takeaway
+    : !!Number(src.public_asporto_allow_takeaway ?? PUBLIC_ASPORTO_DEFAULTS.public_asporto_allow_takeaway);
+  const allowDelivery = typeof src.public_asporto_allow_delivery === 'boolean'
+    ? src.public_asporto_allow_delivery
+    : !!Number(src.public_asporto_allow_delivery ?? PUBLIC_ASPORTO_DEFAULTS.public_asporto_allow_delivery);
+  const showPrices = typeof src.whatsapp_show_prices === 'boolean'
+    ? src.whatsapp_show_prices
+    : !!Number(src.whatsapp_show_prices ?? PUBLIC_ASPORTO_DEFAULTS.whatsapp_show_prices);
+
+  const publicWhatsapp = String(
+    src.public_whatsapp_to ?? PUBLIC_ASPORTO_DEFAULTS.public_whatsapp_to,
+  ).trim() || PUBLIC_ASPORTO_DEFAULTS.public_whatsapp_to;
+
+  const start = String(
+    src.asporto_start_time ?? PUBLIC_ASPORTO_DEFAULTS.asporto_start_time,
+  ).trim() || PUBLIC_ASPORTO_DEFAULTS.asporto_start_time;
+
+  const end = String(
+    src.asporto_end_time ?? PUBLIC_ASPORTO_DEFAULTS.asporto_end_time,
+  ).trim() || PUBLIC_ASPORTO_DEFAULTS.asporto_end_time;
+
+  const stepNum = Number(
+    src.asporto_step_minutes ?? PUBLIC_ASPORTO_DEFAULTS.asporto_step_minutes,
+  );
+  const step = Number.isFinite(stepNum) && stepNum > 0
+    ? stepNum
+    : PUBLIC_ASPORTO_DEFAULTS.asporto_step_minutes;
+  const leadNum = Number(
+    src.asporto_lead_minutes ?? PUBLIC_ASPORTO_DEFAULTS.asporto_lead_minutes,
+  );
+  const lead = Number.isFinite(leadNum) && leadNum >= 0
+    ? leadNum
+    : PUBLIC_ASPORTO_DEFAULTS.asporto_lead_minutes;
+
+  return {
+    enable_public_asporto: enable,
+    public_whatsapp_to: publicWhatsapp,
+    asporto_start_time: start,
+    asporto_step_minutes: step,
+    asporto_end_time: end,
+    asporto_lead_minutes: lead,
+    whatsapp_show_prices: showPrices,
+    public_asporto_allow_takeaway: allowTakeaway,
+    public_asporto_allow_delivery: allowDelivery,
+  };
+}
+
+async function getPublicAsportoSettings() {
+  try {
+    const rows = await query(
+      `SELECT
+         enable_public_asporto,
+         public_whatsapp_to,
+         asporto_start_time,
+         asporto_step_minutes,
+         asporto_end_time,
+         asporto_lead_minutes,
+         whatsapp_show_prices,
+         public_asporto_allow_takeaway,
+         public_asporto_allow_delivery
+       FROM public_asporto_settings
+       ORDER BY id ASC
+       LIMIT 1`,
+    );
+    const raw = rows && rows[0] ? rows[0] : null;
+    return normalizePublicAsportoSettings(raw || PUBLIC_ASPORTO_DEFAULTS);
+  } catch (e) {
+    logger.warn('⚠️ public_asporto_settings load KO', { error: String(e) });
+    return normalizePublicAsportoSettings(PUBLIC_ASPORTO_DEFAULTS);
+  }
+}
+
+async function savePublicAsportoSettings(next) {
+  const p = normalizePublicAsportoSettings(next);
+  await query(
+    `INSERT INTO public_asporto_settings (
+       id,
+       enable_public_asporto,
+       public_whatsapp_to,
+       asporto_start_time,
+       asporto_step_minutes,
+       asporto_end_time,
+       asporto_lead_minutes,
+       whatsapp_show_prices,
+       public_asporto_allow_takeaway,
+       public_asporto_allow_delivery
+     ) VALUES (
+       1, ?, ?, ?, ?, ?, ?, ?, ?, ?
+     )
+     ON DUPLICATE KEY UPDATE
+       enable_public_asporto = VALUES(enable_public_asporto),
+       public_whatsapp_to = VALUES(public_whatsapp_to),
+       asporto_start_time = VALUES(asporto_start_time),
+       asporto_step_minutes = VALUES(asporto_step_minutes),
+       asporto_end_time = VALUES(asporto_end_time),
+       asporto_lead_minutes = VALUES(asporto_lead_minutes),
+       whatsapp_show_prices = VALUES(whatsapp_show_prices),
+       public_asporto_allow_takeaway = VALUES(public_asporto_allow_takeaway),
+       public_asporto_allow_delivery = VALUES(public_asporto_allow_delivery)`,
+    [
+      p.enable_public_asporto ? 1 : 0,
+      p.public_whatsapp_to,
+      p.asporto_start_time,
+      p.asporto_step_minutes,
+      p.asporto_end_time,
+      p.asporto_lead_minutes,
+      p.whatsapp_show_prices ? 1 : 0,
+      p.public_asporto_allow_takeaway ? 1 : 0,
+      p.public_asporto_allow_delivery ? 1 : 0,
+    ],
+  );
+  return p;
+}
+
+// ============================================================================
+// 🆕 Visibilità categorie per contesto (DB)
+// ============================================================================
+
+const CATEGORY_CONTEXTS = ['order_new', 'asporto', 'domicilio'];
+
+function normalizeCategoryList(raw) {
+  if (raw == null) return null;
+  if (!Array.isArray(raw)) return null;
+  const cleaned = Array.from(
+    new Set(
+      raw
+        .map((x) => String(x || '').trim())
+        .filter(Boolean),
+    ),
+  );
+  return cleaned;
+}
+
+function normalizeCategoryVisibilityMap(input) {
+  const out = {};
+  for (const ctx of CATEGORY_CONTEXTS) {
+    out[ctx] = null;
+  }
+  if (!input || typeof input !== 'object') return out;
+  for (const ctx of CATEGORY_CONTEXTS) {
+    if (Object.prototype.hasOwnProperty.call(input, ctx)) {
+      out[ctx] = normalizeCategoryList(input[ctx]);
+    }
+  }
+  return out;
+}
+
+async function getCategoryVisibilityMap() {
+  try {
+    const rows = await query(
+      `SELECT context, categories_json
+       FROM order_category_visibility`,
+    );
+    const map = normalizeCategoryVisibilityMap({});
+    for (const r of rows || []) {
+      const ctx = String(r.context || '').trim();
+      if (!CATEGORY_CONTEXTS.includes(ctx)) continue;
+      if (r.categories_json == null) {
+        map[ctx] = null;
+        continue;
+      }
+      try {
+        const parsed = JSON.parse(String(r.categories_json || ''));
+        map[ctx] = normalizeCategoryList(parsed);
+      } catch {
+        map[ctx] = null;
+      }
+    }
+    return map;
+  } catch (e) {
+    logger.warn('⚠️ category_visibility load KO', { error: String(e) });
+    return normalizeCategoryVisibilityMap({});
+  }
+}
+
+async function saveCategoryVisibilityContext(context, categories) {
+  const ctx = String(context || '').trim();
+  if (!CATEGORY_CONTEXTS.includes(ctx)) {
+    throw new Error('invalid_context');
+  }
+  const list = normalizeCategoryList(categories);
+  const payload = list == null ? null : JSON.stringify(list);
+  await query(
+    `INSERT INTO order_category_visibility (context, categories_json)
+     VALUES (?, ?)
+     ON DUPLICATE KEY UPDATE categories_json = VALUES(categories_json)`,
+    [ctx, payload],
+  );
+  return { context: ctx, categories: list };
+}
+
+/**
  * 🔍 Risolve meta "location" per stampa / preview:
  *
  * 1) Se l'ordine ha già table_id → JOIN diretta su tables/rooms.
@@ -2076,7 +3203,12 @@ async function getOrderFullById(id) {
        o.status,
        o.total,
        o.channel,
+       o.fulfillment,
        o.table_id,    -- colonna aggiunta da 007_add_table_id_to_orders.sql
+       o.delivery_name,
+       o.delivery_phone,
+       o.delivery_address,
+       o.delivery_note,
        o.note,
        o.created_at,
        o.updated_at,
@@ -2114,11 +3246,16 @@ async function getOrderFullById(id) {
 
   return {
     ...o,
+    fulfillment : o.fulfillment || (resolvedTableId ? 'table' : 'takeaway'),
     table_id    : resolvedTableId,
     table_number: meta.table ? meta.table.number : null,
     table_name  : meta.table ? meta.table.label  : null,
     room_id     : meta.room ? meta.room.id       : null,
     room_name   : meta.room ? meta.room.name     : null,
+    delivery_name   : o.delivery_name || null,
+    delivery_phone  : o.delivery_phone || null,
+    delivery_address: o.delivery_address || null,
+    delivery_note   : o.delivery_note || null,
     reservation : meta.reservation
       ? {
           id      : meta.reservation.id,
@@ -2507,7 +3644,12 @@ router.get('/', async (req, res) => {
          o.status,
          o.total,
          o.channel,
+         o.fulfillment,
          o.table_id,
+         o.delivery_name,
+         o.delivery_phone,
+         o.delivery_address,
+         o.delivery_note,
          o.note,
          o.created_at,
          o.updated_at,
@@ -2950,6 +4092,59 @@ router.post('/', async (req, res) => {
       }
     }
 
+    // === fulfillment + delivery_* ==========================================
+    const fulfillmentRaw =
+      dto.fulfillment ||
+      dto.order_type ||
+      dto.orderType ||
+      dto.serviceType ||
+      null;
+    let fulfillment = normalizeFulfillment(fulfillmentRaw);
+
+    const deliveryName =
+      dto.delivery_name ||
+      dto.deliveryName ||
+      null;
+    const deliveryPhone =
+      dto.delivery_phone ||
+      dto.deliveryPhone ||
+      null;
+    const deliveryAddress =
+      dto.delivery_address ||
+      dto.deliveryAddress ||
+      null;
+    const deliveryNote =
+      dto.delivery_note ||
+      dto.deliveryNote ||
+      null;
+
+    // fallback compat: se non specificato, inferisco
+    if (!fulfillment) {
+      fulfillment = tableIdFinal ? 'table' : 'takeaway';
+    }
+
+    // Validazioni minime (senza rompere i client legacy)
+    if (fulfillment === 'table' && !tableIdFinal) {
+      return res.status(400).json({
+        ok   : false,
+        error: 'table_id_required_for_fulfillment_table',
+      });
+    }
+    if (fulfillment === 'delivery') {
+      if (!deliveryAddress) {
+        return res.status(400).json({
+          ok   : false,
+          error: 'delivery_address_required',
+        });
+      }
+      if (!deliveryPhone && !phone) {
+        return res.status(400).json({
+          ok   : false,
+          error: 'delivery_phone_or_phone_required',
+        });
+      }
+    }
+
     const r = await query(
       `INSERT INTO orders (
          customer_name,
@@ -2957,21 +4152,31 @@ router.post('/', async (req, res) => {
          email,
          people,
          scheduled_at,
+         fulfillment,
          table_id,
+         delivery_name,
+         delivery_phone,
+         delivery_address,
+         delivery_note,
          note,
          channel,
          status,
          total,
          customer_user_id
        )
-       VALUES (?,?,?,?,?,?,?,?,?,?,?)`,
+       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
       [
         (dto.customer_name || 'Cliente').toString().trim(),
         phone || null,
         email || null,
         dto.people || null,
         scheduled,
+        fulfillment,
         tableIdFinal || null,
+        deliveryName || null,
+        deliveryPhone || phone || null,
+        deliveryAddress || null,
+        deliveryNote || null,
         dto.note || null,
         dto.channel || 'admin',
         'pending',
@@ -3233,6 +4438,63 @@ router.post('/:id(\\d+)/print/comanda', handlePrintComanda);
 router.post('/:id(\\d+)/print-comanda', handlePrintComanda);
 
 // ============================================================================
+// /public-asporto-settings (GET pubblico, PUT protetto)
+// ============================================================================
+
+router.get('/public-asporto-settings', async (_req, res) => {
+  try {
+    const data = await getPublicAsportoSettings();
+    res.set('Cache-Control', 'no-store');
+    return res.json(data);
+  } catch (e) {
+    logger.error('⚠️ public_asporto_settings GET KO', { error: String(e) });
+    return res.status(500).json({ ok: false, error: 'public_asporto_settings_get_error' });
+  }
+});
+
+router.put('/public-asporto-settings', requireAuth, async (req, res) => {
+  try {
+    const next = await savePublicAsportoSettings(req.body || {});
+    res.set('Cache-Control', 'no-store');
+    return res.json(next);
+  } catch (e) {
+    logger.error('⚠️ public_asporto_settings PUT KO', { error: String(e) });
+    return res.status(500).json({ ok: false, error: 'public_asporto_settings_put_error' });
+  }
+});
+
+// ============================================================================
+// /category-visibility (GET pubblico, PUT protetto)
+// ============================================================================
+
+router.get('/category-visibility', async (_req, res) => {
+  try {
+    const map = await getCategoryVisibilityMap();
+    res.set('Cache-Control', 'no-store');
+    return res.json(map);
+  } catch (e) {
+    logger.error('⚠️ category_visibility GET KO', { error: String(e) });
+    return res.status(500).json({ ok: false, error: 'category_visibility_get_error' });
+  }
+});
+
+router.put('/category-visibility', requireAuth, async (req, res) => {
+  try {
+    const body = req.body || {};
+    const context = body.context;
+    const categories = body.categories;
+    const saved = await saveCategoryVisibilityContext(context, categories);
+    res.set('Cache-Control', 'no-store');
+    return res.json(saved);
+  } catch (e) {
+    const code = String(e && e.message ? e.message : e);
+    const status = code === 'invalid_context' ? 400 : 500;
+    logger.error('⚠️ category_visibility PUT KO', { error: String(e) });
+    return res.status(status).json({ ok: false, error: 'category_visibility_put_error' });
+  }
+});
+
+// ============================================================================
 // EXPORT
 // ============================================================================
 
@@ -3432,6 +4694,669 @@ router.delete('/:id(\\d+)', async (req, res) => {
 });
 
 module.exports = router;
+```
+
+### ./src/api/public-voucher.js
+```
+// ============================================================================
+// /api/public/voucher — attivazione buoni regalo (raccolta contatti marketing)
+// - Endpoint: POST /api/public/voucher/activate
+// - Stile: commenti 🇮🇹 + log con emoji
+// ============================================================================
+
+'use strict';
+
+const express = require('express');
+const router = express.Router();
+const logger = require('../logger');
+const {
+  sendActivationEmail,
+  sendActivationSms,
+  sendMarketingConfirmEmail,
+  sendMarketingConfirmSms,
+  sendMarketingConfirmWhatsapp,
+  sendMarketingOptInEmail,
+  sendMarketingOptInSms,
+  sendMarketingOptInWhatsapp,
+} = require('../services/voucher-notify.service');
+
+module.exports = (app) => {
+  const db  = app?.get('db') || require('../db');
+  const log = app?.get('logger') || logger;
+
+  async function q(sql, params = []) {
+    const res = await db.query(sql, params);
+    return (Array.isArray(res) && Array.isArray(res[0])) ? res[0] : res;
+  }
+
+  const toStr = (v) => (v == null ? '' : String(v).trim());
+  const now = () => new Date();
+  const CODE_ALPHABET = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+  function generateCode(len = 8) {
+    let out = '';
+    for (let i = 0; i < len; i += 1) {
+      out += CODE_ALPHABET[Math.floor(Math.random() * CODE_ALPHABET.length)];
+    }
+    return out;
+  }
+
+  // -------------------------------------------------------------------------
+  // Rate limit (best-effort): max 20 richieste / 10 minuti per IP
+  // -------------------------------------------------------------------------
+  const RATE_LIMIT_MAX = 20;
+  const RATE_LIMIT_WINDOW_MS = 10 * 60 * 1000;
+  const rateMap = new Map(); // ip -> timestamps[]
+  const RATE_LIMIT_OPTOUT_MAX = 10;
+  const rateMapOptout = new Map();
+
+  function getIp(req) {
+    const xf = req.headers['x-forwarded-for'];
+    if (xf) return String(xf).split(',')[0].trim();
+    return req.socket?.remoteAddress || 'unknown';
+  }
+
+  function checkRateLimit(req) {
+    const ip = getIp(req);
+    const nowTs = Date.now();
+    const list = rateMap.get(ip) || [];
+    const filtered = list.filter((t) => nowTs - t < RATE_LIMIT_WINDOW_MS);
+    filtered.push(nowTs);
+    rateMap.set(ip, filtered);
+    return filtered.length <= RATE_LIMIT_MAX;
+  }
+
+  function checkRateLimitOptout(req) {
+    const ip = getIp(req);
+    const nowTs = Date.now();
+    const list = rateMapOptout.get(ip) || [];
+    const filtered = list.filter((t) => nowTs - t < RATE_LIMIT_WINDOW_MS);
+    filtered.push(nowTs);
+    rateMapOptout.set(ip, filtered);
+    return filtered.length <= RATE_LIMIT_OPTOUT_MAX;
+  }
+  const toDateOnly = (v) => {
+    if (!v) return null;
+    const raw = String(v).trim();
+    if (!raw) return null;
+    // accetto YYYY-MM-DD oppure ISO completo → prendo solo la data
+    if (raw.includes('T')) return raw.slice(0, 10);
+    return raw.slice(0, 10);
+  };
+
+  // -------------------------------------------------------------------------
+  // POST /api/public/voucher/activate
+  // -------------------------------------------------------------------------
+  router.post('/voucher/activate', async (req, res) => {
+    const dto = req.body || {};
+    try {
+      if (!checkRateLimit(req)) {
+        return res.status(429).json({ ok: false, error: 'rate_limited' });
+      }
+
+      const code = toStr(dto.code).toUpperCase();
+      if (!code) return res.status(400).json({ ok: false, error: 'missing_code' });
+
+      const customer_first = toStr(dto.customer_first);
+      const customer_last  = toStr(dto.customer_last);
+      const phone = toStr(dto.phone);
+      const email = toStr(dto.email);
+      const city  = toStr(dto.city);
+      const notes = toStr(dto.notes);
+      const birthday = toDateOnly(dto.birthday);
+      const consent_marketing = !!dto.consent_marketing;
+      const utm_source = toStr(dto.utm_source);
+      const utm_medium = toStr(dto.utm_medium);
+      const utm_campaign = toStr(dto.utm_campaign);
+      const honeypot = toStr(dto.website || dto.company);
+      if (honeypot) {
+        log.warn('🧯 [VoucherPublic] honeypot hit', { ip: getIp(req) });
+        return res.json({ ok: true, skipped: true });
+      }
+      const allowedSources = new Set([
+        'gift_voucher_manual',
+        'gift_voucher_whatsapp_web',
+        'gift_voucher_whatsapp_api',
+        'gift_voucher_whatsapp_business',
+        'gift_voucher_instagram',
+        'gift_voucher_facebook',
+      ]);
+      const source_tag_raw = toStr(dto.source_tag) || 'gift_voucher_manual';
+      const source_tag = allowedSources.has(source_tag_raw) ? source_tag_raw : 'gift_voucher_manual';
+
+      if (!customer_first || !customer_last) {
+        return res.status(400).json({ ok: false, error: 'name_required' });
+      }
+      if (!city) {
+        return res.status(400).json({ ok: false, error: 'city_required' });
+      }
+      if (!phone && !email) {
+        return res.status(400).json({ ok: false, error: 'contact_required' });
+      }
+
+      // (1) Voucher esiste?
+      const rows = await q(
+        `SELECT id, code, status, valid_until
+         FROM gift_vouchers
+         WHERE code = ?
+         LIMIT 1`,
+        [code],
+      );
+      const v = rows && rows[0] ? rows[0] : null;
+      if (!v) return res.status(404).json({ ok: false, error: 'voucher_not_found' });
+
+      // (2) Stato voucher
+      if (v.status === 'void') return res.status(409).json({ ok: false, error: 'voucher_void' });
+      if (v.status === 'redeemed') return res.status(409).json({ ok: false, error: 'voucher_redeemed' });
+      if (v.status === 'active' && new Date(v.valid_until) < new Date()) {
+        return res.status(409).json({ ok: false, error: 'voucher_expired' });
+      }
+
+      // (3) Contatto già registrato?
+      const existing = await q(
+        'SELECT id FROM gift_voucher_contacts WHERE voucher_id = ? LIMIT 1',
+        [v.id],
+      );
+      if (existing && existing[0]) {
+        return res.status(409).json({ ok: false, error: 'voucher_already_activated' });
+      }
+
+      await q(
+        `INSERT INTO gift_voucher_contacts (
+           voucher_id,
+           voucher_code,
+           customer_first,
+           customer_last,
+           phone,
+           email,
+           city,
+           birthday,
+           notes,
+           consent_marketing,
+           source_tag,
+           utm_source,
+           utm_medium,
+           utm_campaign,
+           created_at
+         ) VALUES (?,?,?,?,?,?,?,?,?,?, ?, ?, ?, ?, UTC_TIMESTAMP())`,
+        [
+          v.id,
+          v.code,
+          customer_first,
+          customer_last,
+          phone || null,
+          email || null,
+          city,
+          birthday,
+          notes || null,
+          0, // double opt-in: consenso attivo solo dopo conferma
+          source_tag,
+          utm_source || null,
+          utm_medium || null,
+          utm_campaign || null,
+        ],
+      );
+
+      // Notifiche best-effort (email + SMS)
+      try {
+        if (email) await sendActivationEmail({ to: email, voucher: v, contact: { customer_first, customer_last } });
+      } catch (e) {
+        log.warn('📧 [VoucherPublic] email KO', { error: String(e?.message || e) });
+      }
+      try {
+        if (phone) await sendActivationSms({ to: phone, voucher: v });
+      } catch (e) {
+        log.warn('📱 [VoucherPublic] sms KO', { error: String(e?.message || e) });
+      }
+
+      // Double opt-in: richiesta conferma (solo se consentito)
+      if (consent_marketing) {
+        let contactId = null;
+        try {
+          const rows = await q(
+            'SELECT id FROM gift_voucher_contacts WHERE voucher_id = ? LIMIT 1',
+            [v.id],
+          );
+          contactId = rows && rows[0] ? rows[0].id : null;
+        } catch {}
+
+        const token = Math.random().toString(36).slice(2) + Date.now().toString(36);
+        await q(
+          `INSERT INTO gift_voucher_optins
+            (contact_id, email, phone, token, status, requested_at, source_tag, utm_source, utm_medium, utm_campaign)
+           VALUES (?,?,?,?, 'pending', UTC_TIMESTAMP(), ?, ?, ?, ?)`,
+          [
+            contactId,
+            email || null,
+            phone || null,
+            token,
+            source_tag,
+            utm_source || null,
+            utm_medium || null,
+            utm_campaign || null,
+          ],
+        );
+
+        try {
+          if (email) await sendMarketingConfirmEmail({ to: email, contact: { customer_first, customer_last }, token });
+        } catch (e) {
+          log.warn('📧 [VoucherPublic] confirm email KO', { error: String(e?.message || e) });
+        }
+        try {
+          if (phone && !email) await sendMarketingConfirmSms({ to: phone, token });
+        } catch (e) {
+          log.warn('📱 [VoucherPublic] confirm sms KO', { error: String(e?.message || e) });
+        }
+        try {
+          if (phone && source_tag.startsWith('gift_voucher_whatsapp')) {
+            await sendMarketingConfirmWhatsapp({ to: phone, token });
+          }
+        } catch (e) {
+          log.warn('📲 [VoucherPublic] confirm wa KO', { error: String(e?.message || e) });
+        }
+      }
+
+      log.info('🎁 [VoucherPublic] activation OK', { code, consent_marketing });
+      res.json({ ok: true });
+    } catch (e) {
+      log.error('🎁 [VoucherPublic] activation ❌', { error: String(e) });
+      res.status(500).json({ ok: false, error: 'voucher_activate_error' });
+    }
+  });
+
+  // -------------------------------------------------------------------------
+  // POST /api/public/promo-voucher
+  // body: contatti + consensi + source_tag + utm
+  // -------------------------------------------------------------------------
+  router.post('/promo-voucher', async (req, res) => {
+    const dto = req.body || {};
+    try {
+      if (!checkRateLimit(req)) {
+        return res.status(429).json({ ok: false, error: 'rate_limited' });
+      }
+      const honeypot = toStr(dto.website || dto.company);
+      if (honeypot) {
+        log.warn('🧯 [PromoVoucher] honeypot hit', { ip: getIp(req) });
+        return res.json({ ok: true, skipped: true });
+      }
+
+      const customer_first = toStr(dto.customer_first);
+      const customer_last  = toStr(dto.customer_last);
+      const phone = toStr(dto.phone);
+      const email = toStr(dto.email);
+      const city  = toStr(dto.city);
+      const notes = toStr(dto.notes);
+      const birthday = toDateOnly(dto.birthday);
+      const consent_marketing = !!dto.consent_marketing;
+      const consent_privacy = !!dto.consent_privacy;
+      const utm_source = toStr(dto.utm_source);
+      const utm_medium = toStr(dto.utm_medium);
+      const utm_campaign = toStr(dto.utm_campaign);
+
+      const allowedSources = new Set([
+        'gift_voucher_manual',
+        'gift_voucher_whatsapp_web',
+        'gift_voucher_whatsapp_api',
+        'gift_voucher_whatsapp_business',
+        'gift_voucher_instagram',
+        'gift_voucher_facebook',
+      ]);
+      const source_tag_raw = toStr(dto.source_tag) || 'gift_voucher_instagram';
+      const source_tag = allowedSources.has(source_tag_raw) ? source_tag_raw : 'gift_voucher_manual';
+
+      if (!customer_first || !customer_last) {
+        return res.status(400).json({ ok: false, error: 'name_required' });
+      }
+      if (!city) {
+        return res.status(400).json({ ok: false, error: 'city_required' });
+      }
+      if (!phone && !email) {
+        return res.status(400).json({ ok: false, error: 'contact_required' });
+      }
+      if (!consent_privacy) {
+        return res.status(400).json({ ok: false, error: 'privacy_required' });
+      }
+
+      // valori promo (configurabili)
+      const PROMO_VALUE_CENTS = Math.max(100, Number(process.env.PROMO_VOUCHER_VALUE_CENTS || 1000));
+      const PROMO_VALID_DAYS = Math.max(7, Number(process.env.PROMO_VOUCHER_VALID_DAYS || 30));
+      const validUntil = new Date(now().getTime() + (PROMO_VALID_DAYS * 24 * 60 * 60 * 1000));
+
+      let voucherId = null;
+      let code = null;
+      for (let i = 0; i < 5; i += 1) {
+        code = generateCode(8);
+        try {
+          const r = await q(
+            `INSERT INTO gift_vouchers (
+               code,
+               value_cents,
+               event_title,
+               description,
+               valid_from,
+               valid_until,
+               status,
+               created_at,
+               updated_at
+             ) VALUES (?,?,?,?,IFNULL(?, UTC_TIMESTAMP()),?,'active',UTC_TIMESTAMP(),UTC_TIMESTAMP())`,
+            [
+              code,
+              PROMO_VALUE_CENTS,
+              'Promo Social',
+              'Voucher promozionale social',
+              null,
+              validUntil,
+            ],
+          );
+          voucherId = r?.insertId;
+          break;
+        } catch (e) {
+          if (String(e?.code || '').toLowerCase() === 'er_dup_entry') continue;
+          throw e;
+        }
+      }
+
+      if (!voucherId) {
+        return res.status(500).json({ ok: false, error: 'voucher_create_failed' });
+      }
+
+      await q(
+        `INSERT INTO gift_voucher_contacts (
+           voucher_id,
+           voucher_code,
+           customer_first,
+           customer_last,
+           phone,
+           email,
+           city,
+           birthday,
+           notes,
+           consent_marketing,
+           source_tag,
+           utm_source,
+           utm_medium,
+           utm_campaign,
+           created_at
+         ) VALUES (?,?,?,?,?,?,?,?,?,?, ?, ?, ?, ?, UTC_TIMESTAMP())`,
+        [
+          voucherId,
+          code,
+          customer_first,
+          customer_last,
+          phone || null,
+          email || null,
+          city,
+          birthday,
+          notes || null,
+          0,
+          source_tag,
+          utm_source || null,
+          utm_medium || null,
+          utm_campaign || null,
+        ],
+      );
+
+      // Notifiche best-effort (email + SMS)
+      try {
+        if (email) await sendActivationEmail({ to: email, voucher: { id: voucherId, value_cents: PROMO_VALUE_CENTS, valid_until: validUntil }, contact: { customer_first, customer_last } });
+      } catch (e) {
+        log.warn('📧 [PromoVoucher] email KO', { error: String(e?.message || e) });
+      }
+      try {
+        if (phone) await sendActivationSms({ to: phone, voucher: { id: voucherId, value_cents: PROMO_VALUE_CENTS, valid_until: validUntil } });
+      } catch (e) {
+        log.warn('📱 [PromoVoucher] sms KO', { error: String(e?.message || e) });
+      }
+
+      // Double opt-in se richiesto
+      if (consent_marketing) {
+        let contactId = null;
+        try {
+          const rows = await q(
+            'SELECT id FROM gift_voucher_contacts WHERE voucher_id = ? LIMIT 1',
+            [voucherId],
+          );
+          contactId = rows && rows[0] ? rows[0].id : null;
+        } catch {}
+
+        const token = Math.random().toString(36).slice(2) + Date.now().toString(36);
+        await q(
+          `INSERT INTO gift_voucher_optins
+            (contact_id, email, phone, token, status, requested_at, source_tag, utm_source, utm_medium, utm_campaign)
+           VALUES (?,?,?,?, 'pending', UTC_TIMESTAMP(), ?, ?, ?, ?)`,
+          [
+            contactId,
+            email || null,
+            phone || null,
+            token,
+            source_tag,
+            utm_source || null,
+            utm_medium || null,
+            utm_campaign || null,
+          ],
+        );
+        try {
+          if (email) await sendMarketingConfirmEmail({ to: email, contact: { customer_first, customer_last }, token });
+        } catch (e) {
+          log.warn('📧 [PromoVoucher] confirm email KO', { error: String(e?.message || e) });
+        }
+        try {
+          if (phone && !email) await sendMarketingConfirmSms({ to: phone, token });
+        } catch (e) {
+          log.warn('📱 [PromoVoucher] confirm sms KO', { error: String(e?.message || e) });
+        }
+        try {
+          if (phone && source_tag.startsWith('gift_voucher_whatsapp')) {
+            await sendMarketingConfirmWhatsapp({ to: phone, token });
+          }
+        } catch (e) {
+          log.warn('📲 [PromoVoucher] confirm wa KO', { error: String(e?.message || e) });
+        }
+      }
+
+      res.json({
+        ok: true,
+        voucher: {
+          code,
+          value_cents: PROMO_VALUE_CENTS,
+          valid_until: validUntil,
+        },
+      });
+    } catch (e) {
+      log.error('🎁 [PromoVoucher] create ❌', { error: String(e) });
+      res.status(500).json({ ok: false, error: 'promo_voucher_error' });
+    }
+  });
+
+  // -------------------------------------------------------------------------
+  // GET /api/public/voucher/:code  → summary (valore/scadenza/stato)
+  // -------------------------------------------------------------------------
+  router.get('/voucher/:code', async (req, res) => {
+    try {
+      const code = toStr(req.params.code).toUpperCase();
+      if (!code) return res.status(400).json({ ok: false, error: 'missing_code' });
+      const rows = await q(
+        `SELECT
+           gv.id,
+           gv.code,
+           gv.value_cents,
+           gv.event_title,
+           gv.valid_until,
+           gv.status,
+           CASE
+             WHEN gv.status = 'active' AND gv.valid_until < UTC_TIMESTAMP() THEN 'expired'
+             ELSE gv.status
+           END AS status_view
+         FROM gift_vouchers gv
+         WHERE gv.code = ?
+         LIMIT 1`,
+        [code],
+      );
+      const v = rows && rows[0] ? rows[0] : null;
+      if (!v) return res.status(404).json({ ok: false, error: 'voucher_not_found' });
+      res.json({
+        ok: true,
+        voucher: {
+          code: v.code,
+          value_cents: Number(v.value_cents || 0),
+          event_title: v.event_title,
+          valid_until: v.valid_until,
+          status: v.status_view || v.status,
+        }
+      });
+    } catch (e) {
+      log.error('🎁 [VoucherPublic] summary ❌', { error: String(e) });
+      res.status(500).json({ ok: false, error: 'voucher_summary_error' });
+    }
+  });
+
+  // -------------------------------------------------------------------------
+  // GET /api/public/marketing/confirm?token=
+  // -------------------------------------------------------------------------
+  router.get('/marketing/confirm', async (req, res) => {
+    try {
+      const token = toStr(req.query.token);
+      if (!token) return res.status(400).json({ ok: false, error: 'missing_token' });
+
+      const rows = await q(
+        `SELECT id, contact_id, email, phone, status
+           , requested_at
+           FROM gift_voucher_optins
+          WHERE token = ?
+          LIMIT 1`,
+        [token],
+      );
+      const opt = rows && rows[0] ? rows[0] : null;
+      if (!opt) return res.status(404).json({ ok: false, error: 'token_not_found' });
+      if (opt.status === 'confirmed') return res.json({ ok: true, already: true });
+
+      // Token scaduto (7 giorni)
+      try {
+        const requestedAt = opt.requested_at ? new Date(opt.requested_at) : null;
+        if (requestedAt && (Date.now() - requestedAt.getTime()) > (7 * 24 * 60 * 60 * 1000)) {
+          await q(
+            `UPDATE gift_voucher_optins
+                SET status = 'expired'
+              WHERE id = ?`,
+            [opt.id],
+          );
+          return res.status(410).json({ ok: false, error: 'token_expired' });
+        }
+      } catch {}
+
+      await q(
+        `UPDATE gift_voucher_optins
+            SET status = 'confirmed',
+                confirmed_at = UTC_TIMESTAMP()
+          WHERE id = ?`,
+        [opt.id],
+      );
+
+      if (opt.contact_id) {
+        await q(
+          `UPDATE gift_voucher_contacts
+              SET consent_marketing = 1
+            WHERE id = ?`,
+          [opt.contact_id],
+        );
+      }
+
+      // Dopo conferma invio messaggio di esito (best-effort)
+      try {
+        if (opt.email) await sendMarketingOptInEmail({ to: opt.email, contact: {} });
+      } catch (e) {
+        log.warn('📧 [VoucherPublic] marketing email KO', { error: String(e?.message || e) });
+      }
+      try {
+        if (opt.phone) await sendMarketingOptInSms({ to: opt.phone });
+      } catch (e) {
+        log.warn('📱 [VoucherPublic] marketing sms KO', { error: String(e?.message || e) });
+      }
+      try {
+        if (opt.phone) await sendMarketingOptInWhatsapp({ to: opt.phone });
+      } catch (e) {
+        log.warn('📲 [VoucherPublic] marketing wa KO', { error: String(e?.message || e) });
+      }
+
+      res.json({ ok: true });
+    } catch (e) {
+      log.error('🎁 [VoucherPublic] confirm ❌', { error: String(e) });
+      res.status(500).json({ ok: false, error: 'marketing_confirm_error' });
+    }
+  });
+
+  // -------------------------------------------------------------------------
+  // POST /api/public/marketing/optout
+  // body: { email?, phone?, channel?, reason? }
+  // -------------------------------------------------------------------------
+  router.post('/marketing/optout', async (req, res) => {
+    try {
+      if (!checkRateLimitOptout(req)) {
+        return res.status(429).json({ ok: false, error: 'rate_limited' });
+      }
+      const email = toStr(req.body?.email);
+      const phone = toStr(req.body?.phone);
+      const channel = toStr(req.body?.channel) || 'unknown';
+      const reason = toStr(req.body?.reason) || null;
+      const honeypot = toStr(req.body?.company || req.body?.website);
+      if (honeypot) {
+        log.warn('🧯 [VoucherPublic] optout honeypot hit', { ip: getIp(req) });
+        return res.json({ ok: true, skipped: true });
+      }
+      if (!email && !phone) {
+        return res.status(400).json({ ok: false, error: 'missing_contact' });
+      }
+
+      const conds = [];
+      const params = [];
+      if (email) { conds.push('email = ?'); params.push(email); }
+      if (phone) { conds.push('phone = ?'); params.push(phone); }
+
+      const where = conds.length ? `WHERE ${conds.join(' OR ')}` : '';
+
+      // (1) aggiorno contatto
+      await q(
+        `UPDATE gift_voucher_contacts
+            SET consent_marketing = 0,
+                opt_out_at = UTC_TIMESTAMP(),
+                opt_out_channel = ?
+          ${where}`,
+        [channel, ...params],
+      );
+
+      // (2) log separato storico revoche
+      let contactId = null;
+      try {
+        const rows = await q(
+          `SELECT id FROM gift_voucher_contacts ${where} LIMIT 1`,
+          params,
+        );
+        contactId = rows && rows[0] ? rows[0].id : null;
+      } catch {}
+
+      await q(
+        `INSERT INTO gift_voucher_optouts
+          (contact_id, email, phone, channel, reason, user_agent, ip_addr)
+         VALUES (?,?,?,?,?,?,?)`,
+        [
+          contactId,
+          email || null,
+          phone || null,
+          channel || null,
+          reason || null,
+          (req.get('user-agent') || null),
+          (req.headers['x-forwarded-for'] || req.socket?.remoteAddress || null),
+        ],
+      );
+
+      res.json({ ok: true });
+    } catch (e) {
+      log.error('🎁 [VoucherPublic] optout ❌', { error: String(e) });
+      res.status(500).json({ ok: false, error: 'marketing_optout_error' });
+    }
+  });
+
+  return router;
+};
 ```
 
 ### ./src/api/reservations.js
@@ -4750,6 +6675,12 @@ const env = {
   },
 
   // ---------------------------------------------------------------------------
+  // CENTRALINO (PBX → /asporto)
+  // ---------------------------------------------------------------------------
+  CENTRALINO_KEY: str(process.env.CENTRALINO_KEY, ''),
+  CENTRALINO_REDIRECT_BASE: str(process.env.CENTRALINO_REDIRECT_BASE, ''),
+
+  // ---------------------------------------------------------------------------
   // MAIL
   // ---------------------------------------------------------------------------
   MAIL: {
@@ -5101,6 +7032,18 @@ if (ensureExists('api/nfc-session', 'API /api/nfc-session')) {
 if (ensureExists('api/customers', 'API /api/customers'))
   app.use('/api/customers', require('./api/customers')(app));
 
+// 🆕 Centralino (PBX → /asporto prefill)
+if (ensureExists('api/centralino', 'API /api/centralino'))
+  app.use('/api/centralino', require('./api/centralino')(app));
+
+// 🆕 Gift Vouchers (Buoni Regalo)
+if (ensureExists('api/gift-vouchers', 'API /api/gift-vouchers'))
+  app.use('/api/gift-vouchers', require('./api/gift-vouchers')(app));
+
+// 🆕 Public voucher activation (no-auth)
+if (ensureExists('api/public-voucher', 'API /api/public/voucher'))
+  app.use('/api/public', require('./api/public-voucher')(app));
+
 // Health
 if (ensureExists('api/health', 'API /api/health'))
   app.use('/api/health', require('./api/health'));
@@ -5143,6 +7086,353 @@ if (ensureExists('db/migrator', 'DB migrator')) {
 server.listen(env.PORT, () =>
   logger.info(`🚀 HTTP listening on :${env.PORT}`),
 );
+```
+
+### ./src/services/gift-voucher-printer.service.js
+```
+// src/services/gift-voucher-printer.service.js
+// ============================================================================
+// Stampa termica "Buono Regalo" (ESC/POS su TCP 9100)
+// - Reuse pattern print (orders/print & thermal-printer)
+// - Header/Footer da ENV, logo PNG opzionale
+// - QR opzionale: usa QR_BASE_URL se presente, altrimenti stampa solo codice
+// - Niente simbolo “€” (compat codepage) → uso "EUR"
+// ============================================================================
+// Stile: commenti lunghi in italiano + log con emoji.
+// ============================================================================
+
+'use strict';
+
+const net    = require('net');
+const fs     = require('fs');
+const path   = require('path');
+const logger = require('../logger');
+const env    = require('../env');
+
+let PNGjs;
+try { ({ PNG: PNGjs } = require('pngjs')); } catch { PNGjs = null; }
+let QRLib;
+try { QRLib = require('qrcode'); } catch { QRLib = null; }
+
+const ESC = 0x1b, GS = 0x1d;
+const WIDTH_MM = Number(process.env.PRINTER_WIDTH_MM || 80);
+const COLS = Number(process.env.PRINTER_COLS || (WIDTH_MM >= 70 ? 48 : 42));
+
+const QR_BASE_URL = (process.env.QR_BASE_URL || '').trim();
+const QR_SIZE_ENV = Number(process.env.PRINTER_QR_SIZE || 5);
+const QR_ECC_ENV  = String(process.env.PRINTER_QR_ECC || 'H').toUpperCase();
+const QR_MODE     = String(process.env.PRINTER_QR_MODE || 'raster').toLowerCase(); // auto|escpos|raster
+const QR_SCALE    = Math.max(1, Math.min(12, Number(process.env.PRINTER_QR_SCALE || 4)));
+
+const PRINT_TIMEOUT_MS = Math.max(1500, Number(process.env.PRINTER_TIMEOUT_MS || 6000));
+
+function cmdInit()     { return Buffer.from([ESC, 0x40]); }
+function cmdAlign(n=0) { return Buffer.from([ESC, 0x61, n]); }
+function cmdMode(n=0)  { return Buffer.from([ESC, 0x21, n]); }
+function cmdLF(n=1)    { return Buffer.from(Array(n).fill(0x0a)); }
+function cmdCut()      { return Buffer.from([GS, 0x56, 0x00]); }
+function cmdSize(w=1, h=1) {
+  const W = Math.max(1, Math.min(8, w));
+  const H = Math.max(1, Math.min(8, h));
+  const v = ((W - 1) << 4) | (H - 1);
+  return Buffer.from([GS, 0x21, v]);
+}
+
+function sanitizeForEscpos(s) {
+  return String(s || '')
+    .replace(/[\u2018\u2019]/g, "'")
+    .replace(/[\u201C\u201D]/g, '"')
+    .replace(/[\u2013\u2014]/g, '-')
+    .replace(/€+/g, 'EUR')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function line(s='') {
+  return Buffer.concat([Buffer.from(sanitizeForEscpos(s), 'latin1'), Buffer.from([0x0a])]);
+}
+
+function wrapText(s, maxCols = COLS) {
+  const text = sanitizeForEscpos(s);
+  if (!text) return [];
+  const words = text.split(' ');
+  const out = [];
+  let cur = '';
+  for (const w of words) {
+    const cand = cur ? `${cur} ${w}` : w;
+    if (cand.length <= maxCols) cur = cand;
+    else { if (cur) out.push(cur); cur = w; }
+  }
+  if (cur) out.push(cur);
+  return out;
+}
+
+function formatDateIt(isoLike) {
+  try {
+    const d = isoLike ? new Date(isoLike) : new Date();
+    if (Number.isNaN(d.getTime())) return String(isoLike || '');
+    return new Intl.DateTimeFormat('it-IT', {
+      weekday: 'long',
+      day: '2-digit',
+      month: '2-digit',
+      year: 'numeric',
+    }).format(d);
+  } catch {
+    return String(isoLike || '');
+  }
+}
+
+function readHeaderLines() {
+  const raw = env.PRINTER?.header ?? process.env.PRINTER_HEADER ?? '';
+  return String(raw).split('|').filter(Boolean);
+}
+function readFooterLines() {
+  const raw = env.PRINTER?.footer ?? process.env.PRINTER_FOOTER ?? '';
+  return String(raw).split('|').filter(Boolean);
+}
+
+// ─────────────────────────── LOGO PNG (opzionale) ───────────────────────────
+const MAX_DOTS = WIDTH_MM >= 70 ? 576 : 384;
+function buildRasterFromPNG(png, maxWidthDots = MAX_DOTS, threshold = 200) {
+  const targetW = Math.min(maxWidthDots, png.width);
+  const ratio   = targetW / png.width;
+  const targetH = Math.max(1, Math.round(png.height * ratio));
+  const bytesPerRow = Math.ceil(targetW / 8);
+  const bmp = Buffer.alloc(bytesPerRow * targetH, 0x00);
+
+  for (let y = 0; y < targetH; y++) {
+    for (let x = 0; x < targetW; x++) {
+      const sx = Math.min(png.width - 1, Math.round(x / ratio));
+      const sy = Math.min(png.height - 1, Math.round(y / ratio));
+      const idx = (sy * png.width + sx) << 2;
+      const r = png.data[idx], g = png.data[idx+1], b = png.data[idx+2], a = png.data[idx+3];
+      const gray = a === 0 ? 255 : Math.round(0.2126*r + 0.7152*g + 0.0722*b);
+      if (gray < threshold) bmp[y * bytesPerRow + (x >> 3)] |= (0x80 >> (x & 7));
+    }
+  }
+  const m  = 0;
+  const xL = bytesPerRow & 0xff, xH = (bytesPerRow >> 8) & 0xff;
+  const yL = targetH & 0xff,      yH = (targetH >> 8) & 0xff;
+  return Buffer.concat([Buffer.from([GS, 0x76, 0x30, m, xL, xH, yL, yH]), bmp, Buffer.from([0x0a])]);
+}
+
+let LOGO_RASTER = null;
+(function preloadLogo() {
+  try {
+    const logoPath = process.env.PRINTER_LOGO_PATH || 'assets/logo.png';
+    const abs = path.resolve(process.cwd(), logoPath);
+    if (PNGjs && fs.existsSync(abs)) {
+      const buf = fs.readFileSync(abs);
+      const png = PNGjs.sync.read(buf);
+      const raster = buildRasterFromPNG(png, Math.floor(MAX_DOTS * 0.85), 190);
+      LOGO_RASTER = Buffer.concat([cmdAlign(1), raster, cmdLF(1)]);
+      logger.info(`🖼️ [GiftVoucher] Logo caricato: ${abs}`);
+    }
+  } catch (e) {
+    logger.warn('🖼️ [GiftVoucher] Logo PNG non caricabile', { msg: String(e?.message || e) });
+  }
+})();
+
+// ────────────────────────────── QR ESC/POS ─────────────────────────────────
+function qrSelectModel2() { return Buffer.from([GS, 0x28, 0x6B, 0x04, 0x00, 0x31, 0x41, 0x32, 0x00]); }
+function qrStoreData(data) {
+  const payload = Buffer.from(String(data || ''), 'ascii');
+  const len = payload.length + 3;
+  const pL = len & 0xff, pH = (len >> 8) & 0xff;
+  return Buffer.from([GS, 0x28, 0x6B, pL, pH, 0x31, 0x50, 0x30, ...payload]);
+}
+function qrSetModuleSize(size = 6) {
+  const s = Math.max(1, Math.min(16, size));
+  return Buffer.from([GS, 0x28, 0x6B, 0x03, 0x00, 0x31, 0x43, s]);
+}
+function qrSetECCFromEnv() {
+  const map = { L: 48, M: 49, Q: 50, H: 51 };
+  const lv = map[QR_ECC_ENV] ?? 51;
+  return Buffer.from([GS, 0x28, 0x6B, 0x03, 0x00, 0x31, 0x45, lv]);
+}
+function qrPrint() { return Buffer.from([GS, 0x28, 0x6B, 0x03, 0x00, 0x31, 0x51, 0x30]); }
+
+async function tryPrintQrAsRaster(sock, url) {
+  if (!QRLib || !PNGjs) return false;
+  try {
+    const eccMap = { L:'L', M:'M', Q:'Q', H:'H' };
+    const ecc = eccMap[QR_ECC_ENV] || 'H';
+    const pngBuf = await QRLib.toBuffer(url, {
+      errorCorrectionLevel: ecc,
+      margin: 0,
+      scale: QR_SCALE,
+      type: 'png',
+    });
+    const png = PNGjs.sync.read(pngBuf);
+    const raster = buildRasterFromPNG(png, Math.floor(MAX_DOTS * 0.7), 160);
+    sock.write(cmdAlign(1));
+    sock.write(raster);
+    sock.write(cmdAlign(0));
+    return true;
+  } catch (e) {
+    logger.warn('🔳 [GiftVoucher] QR raster failed', { msg: String(e?.message || e) });
+    return false;
+  }
+}
+
+function buildQrText(code) {
+  const base = (QR_BASE_URL || '').replace(/\/+$/,'');
+  if (!base) return String(code || '').trim();
+  const q = new URLSearchParams({
+    code: String(code || '').trim(),
+    utm_source: 'gift_voucher_qr',
+    utm_medium: 'qr',
+    utm_campaign: 'gift_voucher',
+  });
+  return `${base}/voucher?${q.toString()}`;
+}
+
+function openSocket() {
+  const ip   = env.PRINTER?.ip || process.env.PRINTER_IP;
+  const port = Number(env.PRINTER?.port || process.env.PRINTER_PORT || 9100);
+  return new Promise((resolve, reject) => {
+    const sock = new net.Socket();
+    const timer = setTimeout(() => {
+      try { sock.destroy(); } catch {}
+      reject(new Error('printer_timeout'));
+    }, PRINT_TIMEOUT_MS);
+    sock.once('error', (err) => {
+      clearTimeout(timer);
+      reject(err);
+    });
+    sock.connect(port, ip, () => {
+      clearTimeout(timer);
+      resolve({ sock, ip, port });
+    });
+  });
+}
+
+async function withPrinter(fn) {
+  if (!env.PRINTER?.enabled && String(process.env.PRINTER_ENABLED).toLowerCase() !== 'true') {
+    logger.warn('🖨️ [GiftVoucher] PRINTER disabled (no-op)');
+    return { jobId: `noop-${Date.now()}`, printedCount: 0, printer: null };
+  }
+  const { sock, ip, port } = await openSocket();
+  try {
+    sock.write(cmdInit());
+
+    const headerLines = readHeaderLines();
+    if (headerLines.length) {
+      sock.write(cmdAlign(1));
+      for (const h of headerLines) sock.write(line(h));
+      sock.write(cmdLF(1));
+      sock.write(cmdAlign(0));
+    }
+
+    const out = await fn(sock);
+
+    const footerLines = readFooterLines();
+    if (footerLines.length) {
+      sock.write(cmdLF(1));
+      sock.write(cmdAlign(1));
+      for (const f of footerLines) sock.write(line(f));
+      sock.write(cmdAlign(0));
+    }
+
+    sock.write(cmdLF(2));
+    sock.write(cmdCut());
+    sock.end();
+    return { ...(out || {}), printer: { ip, port } };
+  } catch (e) {
+    try { sock.end(); } catch {}
+    throw e;
+  }
+}
+
+async function printGiftVoucherSlip({ voucher, qrText }) {
+  const v = voucher || {};
+  const code = String(v.code || '').trim();
+  const valueEUR = (Number(v.value_cents || 0) / 100).toFixed(2);
+  const eventTitle = v.event_title || '—';
+  const desc = v.description || '';
+  const validUntil = v.valid_until ? formatDateIt(v.valid_until) : '';
+
+  return await withPrinter(async (sock) => {
+    // Logo (opzionale) centrato
+    if (LOGO_RASTER) sock.write(LOGO_RASTER);
+
+    // Titolo (leggermente più grande)
+    sock.write(cmdAlign(1));
+    sock.write(cmdMode(0x08));
+    sock.write(cmdSize(2, 3));
+    sock.write(line('BUONO REGALO'));
+    sock.write(cmdSize(1, 1));
+    sock.write(cmdMode(0x00));
+    sock.write(cmdAlign(0));
+
+    sock.write(line('-'.repeat(COLS)));
+    sock.write(line(`Valore: ${valueEUR} EUR`));
+    sock.write(line(`Evento: ${eventTitle}`));
+    sock.write(line(''));
+
+    if (desc) {
+      const wrapped = wrapText(`Descrizione: ${desc}`, COLS);
+      for (const ln of wrapped) sock.write(line(ln));
+    }
+
+    sock.write(line(`Codice: ${code || '-'}`));
+    if (validUntil) sock.write(line(`Valido fino al: ${validUntil}`));
+    sock.write(line('-'.repeat(COLS)));
+
+    // QR (best-effort) → se fallisce, stampo il codice grande
+    if (qrText) {
+      // Un po' di spazio prima del QR per evitare tagli
+      sock.write(cmdLF(1));
+      let printedQr = false;
+      const wantRaster = (QR_MODE === 'raster') || (QR_MODE === 'auto' && QRLib && PNGjs);
+      if (wantRaster) printedQr = await tryPrintQrAsRaster(sock, qrText);
+
+      if (!printedQr && QR_MODE !== 'raster') {
+        try {
+          const seq = [
+            cmdAlign(1),
+            qrSelectModel2(),
+            qrSetModuleSize(QR_SIZE_ENV),
+            qrSetECCFromEnv(),
+            qrStoreData(qrText),
+            qrPrint(),
+            cmdAlign(0),
+            cmdLF(1),
+          ];
+          for (const part of seq) sock.write(part);
+          printedQr = true;
+        } catch {
+          printedQr = false;
+        }
+      }
+
+      if (!printedQr) {
+        sock.write(cmdAlign(1));
+        sock.write(cmdMode(0x08));
+        sock.write(cmdSize(2, 2));
+        sock.write(line(code || '-'));
+        sock.write(cmdSize(1, 1));
+        sock.write(cmdMode(0x00));
+        sock.write(cmdAlign(0));
+      }
+      // Un po' di spazio dopo il QR
+      sock.write(cmdLF(1));
+    }
+
+    // Footer statico brand (come da richiesta)
+    sock.write(cmdAlign(1));
+    sock.write(line('Largo della Liberta 4'));
+    sock.write(line('62022, Castelraimondo (MC)'));
+    sock.write(line('Tel. 0737642142'));
+    sock.write(cmdAlign(0));
+    return { jobId: `gift-${v.id || 'na'}-${Date.now()}`, printedCount: 1 };
+  });
+}
+
+module.exports = {
+  printGiftVoucherSlip,
+  buildQrText,
+};
 ```
 
 ### ./src/services/google.service.js
@@ -5283,7 +7573,7 @@ async function searchContacts(q, limit = 12) {
   const resp = await people.people.searchContacts({
     query: q,
     pageSize: Math.min(50, Math.max(1, limit)),
-    readMask: 'names,emailAddresses,phoneNumbers',
+    readMask: 'names,emailAddresses,phoneNumbers,biographies',
   });
 
   const items = (resp.data.results || []).map((r) => {
@@ -5291,13 +7581,17 @@ async function searchContacts(q, limit = 12) {
     const name  = p.names?.[0];
     const email = p.emailAddresses?.[0];
     const phone = p.phoneNumbers?.[0];
+    const bio   = p.biographies?.[0];
 
     return {
+      resourceName: p.resourceName || r.person?.resourceName || null,
+      etag:         p.etag || r.person?.etag || null,
       displayName: name?.displayName || null,
       givenName:   name?.givenName || null,
       familyName:  name?.familyName || null,
       email:       email?.value || null,
       phone:       phone?.value || null,
+      note:        bio?.value || null,
     };
   });
 
@@ -5305,7 +7599,7 @@ async function searchContacts(q, limit = 12) {
 }
 
 // Crea un contatto (serve scope write: https://www.googleapis.com/auth/contacts)
-async function createContact({ givenName, familyName, displayName, email, phone }) {
+async function createContact({ givenName, familyName, displayName, email, phone, note }) {
   const auth = await ensureAuth();            // può lanciare consent_required
   const people = peopleClient(auth);
 
@@ -5314,6 +7608,7 @@ async function createContact({ givenName, familyName, displayName, email, phone 
       names: [{ givenName: givenName || undefined, familyName: familyName || undefined, displayName: displayName || undefined }],
       emailAddresses: email ? [{ value: email }] : undefined,
       phoneNumbers:   phone ? [{ value: phone }] : undefined,
+      biographies:    note ? [{ value: note, contentType: 'TEXT_PLAIN' }] : undefined,
     };
 
     const resp = await people.people.createContact({ requestBody });
@@ -5333,12 +7628,63 @@ async function createContact({ givenName, familyName, displayName, email, phone 
   }
 }
 
+// Aggiorna un contatto esistente (best-effort)
+async function updateContact({ resourceName, etag, givenName, familyName, displayName, email, phone, note }) {
+  if (!resourceName) {
+    const err = new Error('resourceName_required');
+    err.code = 'resource_name_required';
+    throw err;
+  }
+  const auth = await ensureAuth();
+  const people = peopleClient(auth);
+
+  let contactEtag = etag;
+  if (!contactEtag) {
+    const got = await people.people.get({
+      resourceName,
+      personFields: 'names,emailAddresses,phoneNumbers,biographies',
+    });
+    contactEtag = got?.data?.etag || null;
+  }
+
+  const nameValue = (displayName || `${givenName || ''} ${familyName || ''}`.trim() || null);
+  const requestBody = {
+    resourceName,
+    etag: contactEtag || undefined,
+    names: nameValue ? [{ displayName: nameValue, givenName: givenName || undefined, familyName: familyName || undefined }] : undefined,
+    emailAddresses: email ? [{ value: email }] : undefined,
+    phoneNumbers:   phone ? [{ value: phone }] : undefined,
+    biographies:    note ? [{ value: note, contentType: 'TEXT_PLAIN' }] : undefined,
+  };
+
+  const updateFields = [];
+  if (requestBody.names) updateFields.push('names');
+  if (requestBody.emailAddresses) updateFields.push('emailAddresses');
+  if (requestBody.phoneNumbers) updateFields.push('phoneNumbers');
+  if (requestBody.biographies) updateFields.push('biographies');
+
+  if (!updateFields.length) {
+    return { ok: false, reason: 'no_fields' };
+  }
+
+  const resp = await people.people.updateContact({
+    resourceName,
+    updatePersonFields: updateFields.join(','),
+    requestBody,
+  });
+
+  const updated = resp?.data || {};
+  logger.info('👤 [Google] contact updated', { resourceName, fields: updateFields });
+  return { ok: true, resourceName: updated.resourceName || resourceName };
+}
+
 module.exports = {
   exchangeCode,
   ensureAuth,
   peopleClient,
   searchContacts,
   createContact,
+  updateContact,
   revokeForOwner,
 };
 ```
@@ -6807,6 +9153,7 @@ async function remove(id) {
 const { query } = require('../db');
 const logger = require('../logger');
 const env    = require('../env');
+const google = require('./google.service');
 
 // --- Helpers -----------------------------------------------------------------
 function trimOrNull(s) { const v = (s ?? '').toString().trim(); return v ? v : null; }
@@ -6933,13 +9280,52 @@ function normalizeStatusAction(actionOrStatus) {
 // 📋 LIST / GET
 // ============================================================================
 
-async function list({ status, from, to } = {}) {
+async function list({ status, from, to, q } = {}) {
   const where = [];
   const params = [];
 
   if (status && status !== 'all') {
     where.push('r.status = ?');
     params.push(status);
+  }
+
+  const qNorm = trimOrNull(q);
+  if (qNorm) {
+    const raw = qNorm;
+    const clean = raw.replace(/\s+/g, ' ').trim();
+    const tokens = clean.split(' ').filter(Boolean);
+
+    // Caso rapido: #123 oppure solo numeri → match ID diretto
+    const idCandidate = clean.replace(/^#/, '');
+    if (/^\d+$/.test(idCandidate)) {
+      where.push('r.id = ?');
+      params.push(Number(idCandidate));
+    }
+
+    // Per ogni token costruisco un OR "ampio" e lo metto in AND
+    for (const t of tokens) {
+      const like = `%${t}%`;
+      const tDigits = t.replace(/\D+/g, '');
+      const likeDigits = tDigits ? `%${tDigits}%` : null;
+      where.push(
+        '(' +
+        'r.customer_first COLLATE utf8mb4_unicode_ci LIKE ? OR ' +
+        'r.customer_last COLLATE utf8mb4_unicode_ci LIKE ? OR ' +
+        "CONCAT_WS(' ', r.customer_first, r.customer_last) COLLATE utf8mb4_unicode_ci LIKE ? OR " +
+        'r.phone COLLATE utf8mb4_unicode_ci LIKE ? OR ' +
+        'r.email COLLATE utf8mb4_unicode_ci LIKE ? OR ' +
+        'r.notes COLLATE utf8mb4_unicode_ci LIKE ? OR ' +
+        'r.status_note COLLATE utf8mb4_unicode_ci LIKE ? OR ' +
+        't.table_number LIKE ?' +
+        (likeDigits ? ' OR REPLACE(REPLACE(REPLACE(REPLACE(r.phone, " ", ""), "+", ""), "-", ""), "/", "") LIKE ?' : '') +
+        ')'
+      );
+      if (likeDigits) {
+        params.push(like, like, like, like, like, like, like, like, likeDigits);
+      } else {
+        params.push(like, like, like, like, like, like, like, like);
+      }
+    }
   }
 
   const range = toDayRange(from, to);
@@ -7043,6 +9429,75 @@ async function ensureUser({ first, last, email, phone }) {
   return res.insertId;
 }
 
+async function updateUserById(id, { first, last, email, phone }) {
+  if (!id) return;
+  const fields = [];
+  const params = [];
+
+  if (first !== undefined && first !== null) { fields.push('first_name=?'); params.push(trimOrNull(first)); }
+  if (last  !== undefined && last  !== null) { fields.push('last_name=?');  params.push(trimOrNull(last)); }
+  if (email !== undefined && email !== null) { fields.push('email=?');      params.push(trimOrNull(email)); }
+  if (phone !== undefined && phone !== null) { fields.push('phone=?');      params.push(trimOrNull(phone)); }
+
+  if (!fields.length) return;
+  params.push(id);
+  await query(`UPDATE users SET ${fields.join(', ')} WHERE id=?`, params);
+}
+
+function normPhone(p) { return String(p || '').replace(/\D/g, ''); }
+function isPhoneMatch(a, b) {
+  const na = normPhone(a);
+  const nb = normPhone(b);
+  if (!na || !nb) return false;
+  if (na === nb) return true;
+  if (na.length >= 8 && nb.length >= 8) return na.slice(-8) === nb.slice(-8);
+  return false;
+}
+
+async function syncGoogleContactOnCreate(dto, userId) {
+  const phone = trimOrNull(dto.phone);
+  if (!phone) return;
+
+  let items = [];
+  try {
+    items = await google.searchContacts(phone, 5);
+  } catch (e) {
+    logger.warn('👤⚠️ [Google] search failed', { error: String(e) });
+    return;
+  }
+
+  const match = (items || []).find((it) => isPhoneMatch(phone, it.phone));
+  if (!match?.resourceName) return;
+
+  // Aggiorna DB (utente locale) con dati recenti se abbiamo match Google
+  try {
+    await updateUserById(userId, {
+      first: dto.customer_first,
+      last : dto.customer_last,
+      email: dto.email,
+      phone: dto.phone,
+    });
+  } catch (e) {
+    logger.warn('👤⚠️ [DB] user update failed', { error: String(e), userId });
+  }
+
+  // Aggiorna il contatto Google (best-effort)
+  try {
+    await google.updateContact({
+      resourceName: match.resourceName,
+      etag: match.etag,
+      givenName: trimOrNull(dto.customer_first),
+      familyName: trimOrNull(dto.customer_last),
+      displayName: `${dto.customer_first || ''} ${dto.customer_last || ''}`.trim() || null,
+      email: trimOrNull(dto.email),
+      phone: trimOrNull(dto.phone),
+      note: trimOrNull(dto.google_note) || trimOrNull(dto.notes),
+    });
+  } catch (e) {
+    logger.warn('👤⚠️ [Google] update failed', { error: String(e), resourceName: match.resourceName });
+  }
+}
+
 // ============================================================================
 // ➕ CREATE
 // ============================================================================
@@ -7055,6 +9510,7 @@ async function create(dto, { user } = {}) {
     phone: dto.phone,
   });
 
+  const noteValue = trimOrNull(dto.google_note) || trimOrNull(dto.notes);
   const startIso = dto.start_at;
   const endIso   = dto.end_at || null;
 
@@ -7073,10 +9529,18 @@ async function create(dto, { user } = {}) {
       trimOrNull(dto.phone), trimOrNull(dto.email),
       userId, Number(dto.party_size) || 1, startMysql, endMysql,
       dto.room_id || null, dto.table_id || null,
-      trimOrNull(dto.notes), trimOrNull(user?.email) || null
+      noteValue, trimOrNull(user?.email) || null
     ]);
   const created = await getById(res.insertId);
   logger.info('🆕 reservation created', { id: created.id, by: user?.email || null });
+
+  // Best-effort sync: se il numero matcha un contatto Google, aggiorno DB+Google
+  try {
+    await syncGoogleContactOnCreate(dto, userId);
+  } catch (e) {
+    logger.warn('👤⚠️ [Google] sync failed', { error: String(e) });
+  }
+
   return created;
 }
 
@@ -7114,7 +9578,10 @@ async function update(id, dto, { user } = {}) {
   if (endMysql           !== null)      { fields.push('end_at=?');         pr.push(endMysql);                      }
   if (dto.room_id  !== undefined) { fields.push('room_id=?');  pr.push(dto.room_id || null); }
   if (dto.table_id !== undefined) { fields.push('table_id=?'); pr.push(dto.table_id || null); }
-  if (dto.notes    !== undefined) { fields.push('notes=?');    pr.push(trimOrNull(dto.notes)); }
+  if (dto.notes !== undefined || dto.google_note !== undefined) {
+    fields.push('notes=?');
+    pr.push(trimOrNull(dto.google_note) || trimOrNull(dto.notes));
+  }
   if (dto.checkin_at  !== undefined) {
     fields.push('checkin_at=?');
     pr.push(dto.checkin_at ? isoToMysql(dto.checkin_at) : null);
@@ -8100,6 +10567,300 @@ module.exports = {
   printDailyReservations,
   printPlaceCards,
   printSinglePlaceCard,
+};
+```
+
+### ./src/services/voucher-notify.service.js
+```
+// ============================================================================
+// voucher-notify.service.js
+// - Email + SMS conferma attivazione buono regalo (best-effort)
+// - Stile: commenti 🇮🇹 + log con emoji
+// ============================================================================
+
+'use strict';
+
+const nodemailer = require('nodemailer');
+const logger = require('../logger');
+const env = require('../env');
+const wa = require('./whatsapp.service');
+
+let _transport = null;
+function getTransporter() {
+  if (!env.MAIL?.enabled) return null;
+  if (_transport) return _transport;
+  _transport = nodemailer.createTransport({
+    host  : env.MAIL.host,
+    port  : Number(env.MAIL.port || 587),
+    secure: !!env.MAIL.secure,
+    auth  : { user: env.MAIL.user, pass: env.MAIL.pass },
+  });
+  return _transport;
+}
+
+function fmtDateIt(isoLike) {
+  try {
+    const d = isoLike ? new Date(isoLike) : new Date();
+    if (Number.isNaN(d.getTime())) return String(isoLike || '');
+    return new Intl.DateTimeFormat('it-IT', {
+      weekday: 'long',
+      day: '2-digit',
+      month: '2-digit',
+      year: 'numeric',
+    }).format(d);
+  } catch {
+    return String(isoLike || '');
+  }
+}
+
+function buildOptOutUrl(params = {}) {
+  const base =
+    process.env.PUBLIC_BASE_URL ||
+    env.WA?.webhookBaseUrl ||
+    '';
+  if (!base) return null;
+  const qp = new URLSearchParams();
+  if (params.email) qp.set('email', String(params.email));
+  if (params.phone) qp.set('phone', String(params.phone));
+  if (params.channel) qp.set('channel', String(params.channel));
+  return `${base.replace(/\/+$/, '')}/optout?${qp.toString()}`;
+}
+
+function buildOptInUrl(token) {
+  const base =
+    process.env.PUBLIC_BASE_URL ||
+    env.WA?.webhookBaseUrl ||
+    '';
+  if (!base || !token) return null;
+  const qp = new URLSearchParams({ token: String(token) });
+  return `${base.replace(/\/+$/, '')}/optin?${qp.toString()}`;
+}
+
+async function sendActivationEmail({ to, voucher, contact }) {
+  if (!env.MAIL?.enabled) {
+    logger.warn('📧 [Voucher] email skipped (disabled)');
+    return { ok: false, reason: 'disabled' };
+  }
+  const dest = String(to || '').trim();
+  if (!dest) return { ok: false, reason: 'no_recipient' };
+
+  const t = getTransporter();
+  if (!t) return { ok: false, reason: 'no_transporter' };
+
+  const biz = env.MAIL?.bizName || 'La tua attività';
+  const subject = `${biz} — Attivazione Buono Regalo`;
+  const name = [contact?.customer_first, contact?.customer_last].filter(Boolean).join(' ') || 'Cliente';
+  const valueEUR = (Number(voucher?.value_cents || 0) / 100).toFixed(2);
+  const validUntil = voucher?.valid_until ? fmtDateIt(voucher.valid_until) : '';
+  const optUrl = buildOptOutUrl({ email: dest, channel: 'email' });
+
+  const html = `
+  <div style="font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif">
+    <h2 style="margin:0 0 12px">${biz}</h2>
+    <p>Ciao <b>${name}</b>,</p>
+    <p>Il tuo <b>Buono Regalo</b> è stato attivato correttamente.</p>
+    <p><b>Valore:</b> ${valueEUR} EUR</p>
+    ${validUntil ? `<p><b>Valido fino al:</b> ${validUntil}</p>` : ''}
+    <p>Conserva questo messaggio per qualsiasi necessità.</p>
+    ${optUrl ? `<p style="font-size:12px">Per disiscriverti: <a href="${optUrl}">${optUrl}</a></p>` : ''}
+    <p>— ${biz}</p>
+  </div>`;
+
+  const mail = {
+    from: env.MAIL.from,
+    to: dest,
+    subject,
+    html,
+    replyTo: env.MAIL.replyTo || undefined,
+  };
+
+  const info = await t.sendMail(mail);
+  logger.info('📧 [Voucher] email sent', { to: dest, messageId: info?.messageId });
+  return { ok: true, messageId: info?.messageId };
+}
+
+async function sendActivationSms({ to, voucher }) {
+  const sid = process.env.TWILIO_ACCOUNT_SID || env.WA?.accountSid || '';
+  const token = process.env.TWILIO_AUTH_TOKEN || env.WA?.authToken || '';
+  const from = process.env.SMS_FROM || process.env.TWILIO_SMS_FROM || '';
+  if (!sid || !token || !from) {
+    logger.warn('📱 [Voucher] SMS skipped (missing config)', { hasSid: !!sid, hasToken: !!token, hasFrom: !!from });
+    return { ok: false, reason: 'missing_config' };
+  }
+  const dest = String(to || '').trim();
+  if (!dest) return { ok: false, reason: 'no_recipient' };
+
+  let twilio;
+  try {
+    twilio = require('twilio')(sid, token);
+  } catch (e) {
+    logger.warn('📱 [Voucher] SMS skipped (twilio not available)', { error: String(e?.message || e) });
+    return { ok: false, reason: 'no_twilio' };
+  }
+
+  const valueEUR = (Number(voucher?.value_cents || 0) / 100).toFixed(2);
+  const validUntil = voucher?.valid_until ? fmtDateIt(voucher.valid_until) : '';
+  const optUrl = buildOptOutUrl({ phone: dest, channel: 'sms' });
+  const text = `Buono Regalo attivato. Valore ${valueEUR} EUR${validUntil ? `, valido fino al ${validUntil}` : ''}. Per disiscriverti rispondi STOP.${optUrl ? ` ${optUrl}` : ''}`;
+
+  const msg = await twilio.messages.create({ from, to: dest, body: text });
+  logger.info('📱 [Voucher] SMS sent', { to: dest, sid: msg?.sid });
+  return { ok: true, sid: msg?.sid };
+}
+
+async function sendMarketingConfirmEmail({ to, contact, token }) {
+  if (!env.MAIL?.enabled) {
+    logger.warn('📧 [Voucher] confirm email skipped (disabled)');
+    return { ok: false, reason: 'disabled' };
+  }
+  const dest = String(to || '').trim();
+  if (!dest) return { ok: false, reason: 'no_recipient' };
+
+  const t = getTransporter();
+  if (!t) return { ok: false, reason: 'no_transporter' };
+
+  const biz = env.MAIL?.bizName || 'La tua attività';
+  const subject = `${biz} — Conferma consenso marketing`;
+  const name = [contact?.customer_first, contact?.customer_last].filter(Boolean).join(' ') || 'Cliente';
+  const confirmUrl = buildOptInUrl(token);
+
+  const html = `
+  <div style="font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif">
+    <h2 style="margin:0 0 12px">${biz}</h2>
+    <p>Ciao <b>${name}</b>,</p>
+    <p>Per confermare il consenso marketing, clicca qui:</p>
+    <p><a href="${confirmUrl}">${confirmUrl}</a></p>
+    <p>Se non sei stato tu, ignora questo messaggio.</p>
+    <p>— ${biz}</p>
+  </div>`;
+
+  const mail = {
+    from: env.MAIL.from,
+    to: dest,
+    subject,
+    html,
+    replyTo: env.MAIL.replyTo || undefined,
+  };
+
+  const info = await t.sendMail(mail);
+  logger.info('📧 [Voucher] confirm email sent', { to: dest, messageId: info?.messageId });
+  return { ok: true, messageId: info?.messageId };
+}
+
+async function sendMarketingConfirmSms({ to, token }) {
+  const sid = process.env.TWILIO_ACCOUNT_SID || env.WA?.accountSid || '';
+  const tokenEnv = process.env.TWILIO_AUTH_TOKEN || env.WA?.authToken || '';
+  const from = process.env.SMS_FROM || process.env.TWILIO_SMS_FROM || '';
+  if (!sid || !tokenEnv || !from) {
+    logger.warn('📱 [Voucher] confirm SMS skipped (missing config)', { hasSid: !!sid, hasToken: !!tokenEnv, hasFrom: !!from });
+    return { ok: false, reason: 'missing_config' };
+  }
+  const dest = String(to || '').trim();
+  if (!dest) return { ok: false, reason: 'no_recipient' };
+
+  let twilio;
+  try {
+    twilio = require('twilio')(sid, tokenEnv);
+  } catch (e) {
+    logger.warn('📱 [Voucher] confirm SMS skipped (twilio not available)', { error: String(e?.message || e) });
+    return { ok: false, reason: 'no_twilio' };
+  }
+
+  const confirmUrl = buildOptInUrl(token);
+  const text = `Conferma consenso marketing: ${confirmUrl}`;
+  const msg = await twilio.messages.create({ from, to: dest, body: text });
+  logger.info('📱 [Voucher] confirm SMS sent', { to: dest, sid: msg?.sid });
+  return { ok: true, sid: msg?.sid };
+}
+
+async function sendMarketingConfirmWhatsapp({ to, token }) {
+  const confirmUrl = buildOptInUrl(token);
+  const text = `Conferma consenso marketing: ${confirmUrl}`;
+  const res = await wa.sendText({ to, text });
+  return res;
+}
+
+async function sendMarketingOptInEmail({ to, contact }) {
+  if (!env.MAIL?.enabled) {
+    logger.warn('📧 [Voucher] marketing email skipped (disabled)');
+    return { ok: false, reason: 'disabled' };
+  }
+  const dest = String(to || '').trim();
+  if (!dest) return { ok: false, reason: 'no_recipient' };
+
+  const t = getTransporter();
+  if (!t) return { ok: false, reason: 'no_transporter' };
+
+  const biz = env.MAIL?.bizName || 'La tua attività';
+  const subject = `${biz} — Consenso marketing ricevuto`;
+  const name = [contact?.customer_first, contact?.customer_last].filter(Boolean).join(' ') || 'Cliente';
+  const optUrl = buildOptOutUrl({ email: dest, channel: 'email' });
+
+  const html = `
+  <div style="font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif">
+    <h2 style="margin:0 0 12px">${biz}</h2>
+    <p>Ciao <b>${name}</b>,</p>
+    <p>Abbiamo registrato il tuo <b>consenso marketing</b>.</p>
+    <p>Potrai ricevere comunicazioni promozionali.</p>
+    ${optUrl ? `<p style="font-size:12px">Per disiscriverti: <a href="${optUrl}">${optUrl}</a></p>` : '<p style="font-size:12px">Per disiscriverti rispondi a questa email.</p>'}
+    <p>— ${biz}</p>
+  </div>`;
+
+  const mail = {
+    from: env.MAIL.from,
+    to: dest,
+    subject,
+    html,
+    replyTo: env.MAIL.replyTo || undefined,
+  };
+
+  const info = await t.sendMail(mail);
+  logger.info('📧 [Voucher] marketing email sent', { to: dest, messageId: info?.messageId });
+  return { ok: true, messageId: info?.messageId };
+}
+
+async function sendMarketingOptInSms({ to }) {
+  const sid = process.env.TWILIO_ACCOUNT_SID || env.WA?.accountSid || '';
+  const token = process.env.TWILIO_AUTH_TOKEN || env.WA?.authToken || '';
+  const from = process.env.SMS_FROM || process.env.TWILIO_SMS_FROM || '';
+  if (!sid || !token || !from) {
+    logger.warn('📱 [Voucher] marketing SMS skipped (missing config)', { hasSid: !!sid, hasToken: !!token, hasFrom: !!from });
+    return { ok: false, reason: 'missing_config' };
+  }
+  const dest = String(to || '').trim();
+  if (!dest) return { ok: false, reason: 'no_recipient' };
+
+  let twilio;
+  try {
+    twilio = require('twilio')(sid, token);
+  } catch (e) {
+    logger.warn('📱 [Voucher] marketing SMS skipped (twilio not available)', { error: String(e?.message || e) });
+    return { ok: false, reason: 'no_twilio' };
+  }
+
+  const optUrl = buildOptOutUrl({ phone: dest, channel: 'sms' });
+  const text = `Consenso marketing registrato. Per revocarlo rispondi STOP.${optUrl ? ` ${optUrl}` : ''}`;
+  const msg = await twilio.messages.create({ from, to: dest, body: text });
+  logger.info('📱 [Voucher] marketing SMS sent', { to: dest, sid: msg?.sid });
+  return { ok: true, sid: msg?.sid };
+}
+
+async function sendMarketingOptInWhatsapp({ to }) {
+  const optUrl = buildOptOutUrl({ phone: to, channel: 'whatsapp' });
+  const text = `Consenso marketing registrato. Per revocarlo rispondi STOP.${optUrl ? ` ${optUrl}` : ''}`;
+  const res = await wa.sendText({ to, text });
+  return res;
+}
+
+module.exports = {
+  sendActivationEmail,
+  sendActivationSms,
+  sendMarketingConfirmEmail,
+  sendMarketingConfirmSms,
+  sendMarketingConfirmWhatsapp,
+  sendMarketingOptInEmail,
+  sendMarketingOptInSms,
+  sendMarketingOptInWhatsapp,
 };
 ```
 
@@ -9146,13 +11907,17 @@ function broadcastOrderUpdated(order) {
   try {
     const io = sockets.io();
     io.of('/').emit('order-updated', {
-      id    : order && order.id,
-      status: order && order.status,
+      id         : order && order.id,
+      status     : order && order.status,
+      table_id   : order && order.table_id,
+      fulfillment: order && order.fulfillment,
     });
 
     logger.info('📡 order-updated ▶️ broadcast', {
-      id    : order && order.id,
-      status: order && order.status,
+      id         : order && order.id,
+      status     : order && order.status,
+      table_id   : order && order.table_id,
+      fulfillment: order && order.fulfillment,
     });
   } catch (err) {
     logger.warn('📡 order-updated broadcast KO', { error: String(err) });
@@ -9657,6 +12422,25 @@ function extractRoomLabel(order) {
   return null;
 }
 
+// --- Modalità ordine (fulfillment) -------------------------------------------
+function resolveFulfillment(order) {
+  const v = (order.fulfillment || '').toString().trim().toLowerCase();
+  if (v === 'table' || v === 'takeaway' || v === 'delivery') return v;
+  // Fallback compat: se ho table_id considero "table", altrimenti "takeaway".
+  return order.table_id ? 'table' : 'takeaway';
+}
+
+function extractDeliveryAddressLine(order) {
+  const addr = order.delivery_address || order.deliveryAddress || null;
+  if (addr) return String(addr).trim();
+  // Fallback minimo: provo ad usare note o telefono se mancano i campi dedicati.
+  const note = order.delivery_note || order.note || null;
+  if (note) return String(note).trim();
+  const phone = order.delivery_phone || order.phone || null;
+  if (phone) return `Tel: ${String(phone).trim()}`;
+  return null;
+}
+
 // --- Formattazione orario stile “DOMENICA 10/11/2025  ore 04:42” -------------
 function fmtComandaDate(iso) {
   try{
@@ -9690,6 +12474,20 @@ async function printSlip(title, order) {
   if (order.phone) write(Buffer.from(`${sanitizeForEscpos(order.phone)}\n`,'latin1'));
   if (order.people) write(Buffer.from(`Coperti: ${order.people}\n`,'latin1'));
   if (order.scheduled_at) write(Buffer.from(`Orario: ${fmtComandaDate(order.scheduled_at)}\n`,'latin1'));
+  // Modalità ordine (senza cambiare le logiche esistenti: aggiungo solo righe info)
+  const fulfillment = resolveFulfillment(order);
+  if (fulfillment === 'table') {
+    const room = extractRoomLabel(order);
+    const table = extractTableLabel(order);
+    if (room)  write(Buffer.from(`${sanitizeForEscpos(room)}\n`, 'latin1'));
+    if (table) write(Buffer.from(`${sanitizeForEscpos(table)}\n`, 'latin1'));
+  } else if (fulfillment === 'takeaway') {
+    write(Buffer.from('ASPORTO\n', 'latin1'));
+  } else if (fulfillment === 'delivery') {
+    write(Buffer.from('DOMICILIO\n', 'latin1'));
+    const line = extractDeliveryAddressLine(order);
+    if (line) write(Buffer.from(`${sanitizeForEscpos(line)}\n`, 'latin1'));
+  }
   write(Buffer.from('------------------------------\n','latin1'));
 
   for (const it of order.items) {
@@ -9744,6 +12542,19 @@ async function printComandaSlip(title, order) {
   const table = extractTableLabel(order);
   if (room) { sizeBig(sock); boldOn(sock); writeLine(sock, room); boldOff(sock); }
   if (table){ sizeBig(sock); boldOn(sock); writeLine(sock, table); boldOff(sock); }
+
+  // Modalità ordine: per asporto/domicilio aggiungo una riga grande e leggibile
+  const fulfillment = resolveFulfillment(order);
+  if (fulfillment === 'takeaway') {
+    sizeBig(sock); boldOn(sock); writeLine(sock, 'ASPORTO'); boldOff(sock);
+  } else if (fulfillment === 'delivery') {
+    sizeBig(sock); boldOn(sock); writeLine(sock, 'DOMICILIO'); boldOff(sock);
+    const line = extractDeliveryAddressLine(order);
+    if (line) {
+      const lines = wrapText(line, COMANDA_MAX_COLS);
+      for (const ln of lines) writeLine(sock, ln);
+    }
+  }
 
   // Sub-intestazione compatta
   sizeNormal(sock);
@@ -9844,6 +12655,11 @@ async function printOrderDual(orderFull) {
     scheduled_at: orderFull.scheduled_at,
     total: orderFull.total,
     note: orderFull.note,                 // per eventuale 'Tavolo ...'
+    fulfillment: orderFull.fulfillment,
+    delivery_name: orderFull.delivery_name,
+    delivery_phone: orderFull.delivery_phone,
+    delivery_address: orderFull.delivery_address,
+    delivery_note: orderFull.delivery_note,
     table_name: orderFull.table_name,     // se forniti dal chiamante
     table_number: orderFull.table_number, // idem
     table_id: orderFull.table_id,         // idem
@@ -9876,6 +12692,11 @@ async function printOrderForCenter(orderFull, center = 'PIZZERIA') {
     scheduled_at: orderFull.scheduled_at,
     total: orderFull.total,
     note: orderFull.note,
+    fulfillment: orderFull.fulfillment,
+    delivery_name: orderFull.delivery_name,
+    delivery_phone: orderFull.delivery_phone,
+    delivery_address: orderFull.delivery_address,
+    delivery_note: orderFull.delivery_note,
     table_name: orderFull.table_name,
     table_number: orderFull.table_number,
     table_id: orderFull.table_id,

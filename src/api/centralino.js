@@ -85,6 +85,31 @@ module.exports = (app) => {
       log.warn('⚠️ [Centralino] lookup KO', { error: String(e) });
     }
 
+    // 📡 Realtime: broadcast centralino-call (best-effort, non blocca redirect)
+    try {
+      const sockets = require('../sockets');
+      const io = sockets && typeof sockets.io === 'function' ? sockets.io() : null;
+      if (io) {
+        io.emit('centralino-call', {
+          callerid,
+          calledid,
+          uniqueid,
+          remark,
+          customer: customer || null,
+        });
+        log.info('📡 [Centralino] emit centralino-call OK', {
+          callerid,
+          calledid,
+          uniqueid,
+          remark,
+        });
+      } else {
+        log.warn('⚠️ [Centralino] socket.io non disponibile (io nullo)');
+      }
+    } catch (e) {
+      log.warn('⚠️ [Centralino] emit realtime KO', { error: String(e) });
+    }
+
     const base =
       (env.CENTRALINO_REDIRECT_BASE || '').trim() ||
       `${req.protocol}://${req.get('host')}`;

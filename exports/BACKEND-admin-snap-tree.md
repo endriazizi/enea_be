@@ -1,6 +1,6 @@
 # 📁 Project tree (.)
 
-_Generato: Tue, Jan 27, 2026  2:22:30 PM_
+_Generato: Mon, Feb  2, 2026  1:27:18 PM_
 
 ```text
 .
@@ -19,7 +19,9 @@ readme.md
 src
 src/api
 src/api/auth.js
+src/api/centralino.js
 src/api/customers.js
+src/api/gift-vouchers.js
 src/api/google
 src/api/google/oauth.js
 src/api/google/people.js
@@ -33,6 +35,7 @@ src/api/orders.js
 src/api/printer.js
 src/api/products.js
 src/api/product_ingredients.js
+src/api/public-voucher.js
 src/api/reservations.js
 src/api/rooms.js
 src/api/support
@@ -58,6 +61,7 @@ src/middleware/auth.js
 src/middleware/reqres-logger.js
 src/server.js
 src/services
+src/services/gift-voucher-printer.service.js
 src/services/google.service.js
 src/services/mailer.service.js
 src/services/nfc.service.js
@@ -69,6 +73,7 @@ src/services/product.service.js
 src/services/reservations-status.service.js
 src/services/reservations.service.js
 src/services/thermal-printer.service.js
+src/services/voucher-notify.service.js
 src/services/whatsapp-twilio.service.js
 src/services/whatsapp.service.js
 src/services/whatsapp.twilio.service.jS
