@@ -180,6 +180,7 @@ const PUBLIC_ASPORTO_DEFAULTS = {
   asporto_step_minutes       : 15,
   asporto_end_time           : '23:00',
   asporto_lead_minutes       : 20,
+  whatsapp_show_prices       : true,
   public_asporto_allow_takeaway: true,
   public_asporto_allow_delivery: false,
 };
@@ -195,6 +196,9 @@ function normalizePublicAsportoSettings(raw) {
   const allowDelivery = typeof src.public_asporto_allow_delivery === 'boolean'
     ? src.public_asporto_allow_delivery
     : !!Number(src.public_asporto_allow_delivery ?? PUBLIC_ASPORTO_DEFAULTS.public_asporto_allow_delivery);
+  const showPrices = typeof src.whatsapp_show_prices === 'boolean'
+    ? src.whatsapp_show_prices
+    : !!Number(src.whatsapp_show_prices ?? PUBLIC_ASPORTO_DEFAULTS.whatsapp_show_prices);
 
   const publicWhatsapp = String(
     src.public_whatsapp_to ?? PUBLIC_ASPORTO_DEFAULTS.public_whatsapp_to,
@@ -228,6 +232,7 @@ function normalizePublicAsportoSettings(raw) {
     asporto_step_minutes: step,
     asporto_end_time: end,
     asporto_lead_minutes: lead,
+    whatsapp_show_prices: showPrices,
     public_asporto_allow_takeaway: allowTakeaway,
     public_asporto_allow_delivery: allowDelivery,
   };
@@ -243,6 +248,7 @@ async function getPublicAsportoSettings() {
          asporto_step_minutes,
          asporto_end_time,
          asporto_lead_minutes,
+         whatsapp_show_prices,
          public_asporto_allow_takeaway,
          public_asporto_allow_delivery
        FROM public_asporto_settings
@@ -268,10 +274,11 @@ async function savePublicAsportoSettings(next) {
        asporto_step_minutes,
        asporto_end_time,
        asporto_lead_minutes,
+       whatsapp_show_prices,
        public_asporto_allow_takeaway,
        public_asporto_allow_delivery
      ) VALUES (
-       1, ?, ?, ?, ?, ?, ?, ?, ?
+       1, ?, ?, ?, ?, ?, ?, ?, ?, ?
      )
      ON DUPLICATE KEY UPDATE
        enable_public_asporto = VALUES(enable_public_asporto),
@@ -280,6 +287,7 @@ async function savePublicAsportoSettings(next) {
        asporto_step_minutes = VALUES(asporto_step_minutes),
        asporto_end_time = VALUES(asporto_end_time),
        asporto_lead_minutes = VALUES(asporto_lead_minutes),
+       whatsapp_show_prices = VALUES(whatsapp_show_prices),
        public_asporto_allow_takeaway = VALUES(public_asporto_allow_takeaway),
        public_asporto_allow_delivery = VALUES(public_asporto_allow_delivery)`,
     [
@@ -289,6 +297,7 @@ async function savePublicAsportoSettings(next) {
       p.asporto_step_minutes,
       p.asporto_end_time,
       p.asporto_lead_minutes,
+      p.whatsapp_show_prices ? 1 : 0,
       p.public_asporto_allow_takeaway ? 1 : 0,
       p.public_asporto_allow_delivery ? 1 : 0,
     ],
