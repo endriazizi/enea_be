@@ -90,6 +90,10 @@ if (ensureExists('api/nfc-session', 'API /api/nfc-session')) {
 if (ensureExists('api/customers', 'API /api/customers'))
   app.use('/api/customers', require('./api/customers')(app));
 
+// 🆕 Centralino (PBX → /asporto prefill)
+if (ensureExists('api/centralino', 'API /api/centralino'))
+  app.use('/api/centralino', require('./api/centralino')(app));
+
 // 🆕 Gift Vouchers (Buoni Regalo)
 if (ensureExists('api/gift-vouchers', 'API /api/gift-vouchers'))
   app.use('/api/gift-vouchers', require('./api/gift-vouchers')(app));
