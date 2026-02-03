@@ -1,10 +1,11 @@
 # 📁 Project tree (.)
 
-_Generato: Mon, Feb  2, 2026  1:27:18 PM_
+_Generato: Tue, Feb  3, 2026  2:22:05 AM_
 
 ```text
 .
 .env
+.env.production
 .git
 .gitignore
 assets
@@ -69,6 +70,8 @@ src/services/notify.service.js
 src/services/order-printer.service.js
 src/services/orders.service.js
 src/services/orders.sse.js
+src/services/print-jobs.service.js
+src/services/print-settings.service.js
 src/services/product.service.js
 src/services/reservations-status.service.js
 src/services/reservations.service.js

@@ -10,6 +10,7 @@ const cors = require('cors');
 const env = require('./env');
 const logger = require('./logger');
 const dbmod = require('./db');
+const { processPrintQueueOnce } = require('./services/print-jobs.service');
 
 // === GOOGLE: nuovi router puliti ============================================
 const googleOauth = require('./api/google/oauth');
@@ -144,3 +145,29 @@ if (ensureExists('db/migrator', 'DB migrator')) {
 server.listen(env.PORT, () =>
   logger.info(`🚀 HTTP listening on :${env.PORT}`),
 );
+
+// ============================================================================
+// 🧾 Worker coda stampa (best-effort, no crash)
+// ============================================================================
+
+const PRINT_QUEUE_ENABLED =
+  String(process.env.PRINT_QUEUE_ENABLED || 'true') === 'true';
+const PRINT_QUEUE_INTERVAL_MS = Math.max(
+  5_000,
+  Number(process.env.PRINT_QUEUE_INTERVAL_MS || 30_000),
+);
+
+if (PRINT_QUEUE_ENABLED) {
+  setInterval(async () => {
+    try {
+      await processPrintQueueOnce({ limit: 5 });
+    } catch (e) {
+      logger.warn('🧾🧵 print queue tick KO (best-effort)', {
+        error: String((e && e.message) || e),
+      });
+    }
+  }, PRINT_QUEUE_INTERVAL_MS);
+  logger.info('🧾🧵 print queue ON', { every_ms: PRINT_QUEUE_INTERVAL_MS });
+} else {
+  logger.info('🧾🧵 print queue OFF (PRINT_QUEUE_ENABLED=false)');
+}

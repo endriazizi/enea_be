@@ -1,6 +1,6 @@
 # 🧩 Project code (file ammessi in .)
 
-_Generato: Mon, Feb  2, 2026  1:27:24 PM_
+_Generato: Tue, Feb  3, 2026  2:22:07 AM_
 
 ### ./docs/canvas-backend.md
 ```
@@ -531,6 +531,31 @@ module.exports = (app) => {
       customer = await lookupCustomerByPhone(callerid);
     } catch (e) {
       log.warn('⚠️ [Centralino] lookup KO', { error: String(e) });
+    }
+
+    // 📡 Realtime: broadcast centralino-call (best-effort, non blocca redirect)
+    try {
+      const sockets = require('../sockets');
+      const io = sockets && typeof sockets.io === 'function' ? sockets.io() : null;
+      if (io) {
+        io.emit('centralino-call', {
+          callerid,
+          calledid,
+          uniqueid,
+          remark,
+          customer: customer || null,
+        });
+        log.info('📡 [Centralino] emit centralino-call OK', {
+          callerid,
+          calledid,
+          uniqueid,
+          remark,
+        });
+      } else {
+        log.warn('⚠️ [Centralino] socket.io non disponibile (io nullo)');
+      }
+    } catch (e) {
+      log.warn('⚠️ [Centralino] emit realtime KO', { error: String(e) });
     }
 
     const base =
@@ -2723,6 +2748,16 @@ const router  = express.Router();
 
 const logger = require('../logger');
 const { query } = require('../db');
+const {
+  getPrintSettings,
+  savePrintSettings,
+} = require('../services/print-settings.service');
+const {
+  enqueuePrintJob,
+  listPrintJobs,
+  retryPrintJob,
+  cancelPrintJob,
+} = require('../services/print-jobs.service');
 
 // === requireAuth con fallback DEV ============================================
 let requireAuth;
@@ -2860,6 +2895,72 @@ function normalizeFulfillment(raw) {
   if (v === 'takeaway' || v === 'asporto' || v === 'take-away') return 'takeaway';
   if (v === 'delivery' || v === 'domicilio') return 'delivery';
   return null;
+}
+
+// ============================================================================
+// 🆕 Print Settings helpers (DB)
+// ============================================================================
+
+function toBool(raw, fallback = false) {
+  if (typeof raw === 'boolean') return raw;
+  if (raw == null) return fallback;
+  const s = String(raw).trim().toLowerCase();
+  if (s === 'true' || s === '1' || s === 'yes') return true;
+  if (s === 'false' || s === '0' || s === 'no') return false;
+  return fallback;
+}
+
+function buildPrinterConfigFromSettings(st) {
+  return {
+    PRINTER_ENABLED: st?.printer_enabled ? 'true' : 'false',
+    PRINTER_IP: st?.printer_ip || undefined,
+    PRINTER_PORT: st?.printer_port || undefined,
+  };
+}
+
+function resolveComandaCenter(raw, settings, order = null) {
+  // Se arriva un valore esplicito dal client, lo rispettiamo (ALL incluso)
+  if (raw != null && raw !== '') {
+    const c = String(raw).trim().toUpperCase();
+    if (c === 'PIZZERIA' || c === 'CUCINA' || c === 'ALL') return c;
+    return 'PIZZERIA';
+  }
+
+  // Default intelligente:
+  // - per ordine da tavolo → stampiamo entrambi i centri
+  // - per takeaway/delivery → usiamo il setting
+  const fulfillment = String(order?.fulfillment || '').toLowerCase();
+  if (fulfillment === 'table') return 'ALL';
+
+  const stCenter = String(settings?.takeaway_center || '').trim().toUpperCase();
+  if (stCenter === 'PIZZERIA' || stCenter === 'CUCINA') return stCenter;
+
+  // Fallback legacy (vecchio campo)
+  const legacy = String(settings?.takeaway_comanda_center || 'ALL').toUpperCase();
+  if (legacy === 'PIZZERIA' || legacy === 'CUCINA' || legacy === 'ALL') return legacy;
+
+  return 'PIZZERIA';
+}
+
+function resolveComandaLayout(raw, settings) {
+  if (raw != null && raw !== '') {
+    const v = String(raw).trim().toLowerCase();
+    return v === 'mcd' ? 'mcd' : 'classic';
+  }
+  const st = String(settings?.comanda_layout || 'classic').trim().toLowerCase();
+  return st === 'mcd' ? 'mcd' : 'classic';
+}
+
+function resolveComandaCopies(raw, settings, order = null) {
+  const fulfillment = String(order?.fulfillment || '').toLowerCase();
+  // Copie: default 1 se tavolo, altrimenti usa setting
+  const base =
+    fulfillment === 'table'
+      ? 1
+      : Number(settings?.takeaway_copies || 1);
+  const n = Number(raw ?? base);
+  if (!Number.isFinite(n)) return Math.min(3, Math.max(1, base));
+  return Math.min(3, Math.max(1, Math.trunc(n)));
 }
 
 // ============================================================================
@@ -4352,8 +4453,19 @@ router.post('/:id(\\d+)/print', async (req, res) => {
       note: 'CONTO',
     });
 
+    const st = await getPrintSettings();
+    const printerConfig = buildPrinterConfigFromSettings(st);
+
+    if (!st.printer_enabled) {
+      return res.status(502).json({
+        ok    : false,
+        error : 'printer_disabled',
+        reason: 'printer_disabled',
+      });
+    }
+
     try {
-      await printOrderDual(full);
+      await printOrderDual(full, { printerSettings: printerConfig });
       logger.info('🖨️ orders print OK', { id });
       return res.json({ ok: true });
     } catch (e) {
@@ -4382,22 +4494,33 @@ async function handlePrintComanda(req, res) {
       return res.status(404).json({ ok: false, error: 'not_found' });
     }
 
-    const centerRaw = (
-      (req.body && req.body.center) ||
-      (req.query && req.query.center) ||
-      'pizzeria'
-    )
-      .toString()
-      .toUpperCase();
+    const bestEffort = toBool(
+      (req.body && req.body.best_effort) ||
+        (req.query && req.query.best_effort),
+      false,
+    );
 
-    const center = centerRaw === 'CUCINA' ? 'CUCINA' : 'PIZZERIA';
-    const copies = Math.max(
-      1,
-      toNum(
-        (req.body && req.body.copies) ||
-          (req.query && req.query.copies),
-        1,
-      ),
+    const st = await getPrintSettings();
+    const printerConfig = buildPrinterConfigFromSettings(st);
+
+    const center = resolveComandaCenter(
+      (req.body && req.body.center) ||
+        (req.query && req.query.center) ||
+        null,
+      st,
+      full,
+    );
+    const copies = resolveComandaCopies(
+      (req.body && req.body.copies) ||
+        (req.query && req.query.copies),
+      st,
+      full,
+    );
+    const layoutKey = resolveComandaLayout(
+      (req.body && (req.body.layoutKey || req.body.layout_key)) ||
+        (req.query && (req.query.layoutKey || req.query.layout_key)) ||
+        null,
+      st,
     );
 
     // Tn: ogni volta che invio COMANDA registro un batch
@@ -4409,18 +4532,84 @@ async function handlePrintComanda(req, res) {
       note: `COMANDA:${center}`,
     });
 
+    if (!st.printer_enabled) {
+      if (bestEffort) {
+        let jobId = null;
+        try {
+          const job = await enqueuePrintJob({
+            kind: 'order_comanda',
+            orderId: id,
+            payload: { center, copies, layoutKey },
+            reason: 'printer_disabled',
+          });
+          jobId = job?.id || null;
+        } catch (qe) {
+          logger.warn('🧾🧵 enqueue job KO (printer disabled)', { error: String(qe) });
+        }
+        return res.json({
+          ok: true,
+          printed: false,
+          queued: !!jobId,
+          job_id: jobId,
+          warned: true,
+          reason: 'printer_unavailable',
+        });
+      }
+      return res.status(502).json({
+        ok    : false,
+        error : 'printer_disabled',
+        reason: 'printer_disabled',
+      });
+    }
+
     try {
       for (let i = 0; i < copies; i += 1) {
-        await printOrderForCenter(full, center);
+        if (center === 'ALL') {
+          await printOrderForCenter(full, 'PIZZERIA', {
+            printerSettings: printerConfig,
+            layoutKey,
+          });
+          await printOrderForCenter(full, 'CUCINA', {
+            printerSettings: printerConfig,
+            layoutKey,
+          });
+        } else {
+          await printOrderForCenter(full, center, {
+            printerSettings: printerConfig,
+            layoutKey,
+          });
+        }
       }
-      logger.info('🧾 comanda OK', { id, center, copies });
-      return res.json({ ok: true, center, copies });
+      logger.info('🧾 comanda OK', { id, center, copies, layoutKey });
+      return res.json({ ok: true, center, copies, layoutKey, printed: true });
     } catch (e) {
       logger.warn('🧾 comanda ⚠️', {
         id,
         center,
         error: String(e),
       });
+      if (bestEffort) {
+        let jobId = null;
+        try {
+          const job = await enqueuePrintJob({
+            kind: 'order_comanda',
+            orderId: id,
+            payload: { center, copies, layoutKey },
+            reason: String(e),
+          });
+          jobId = job?.id || null;
+        } catch (qe) {
+          logger.warn('🧾🧵 enqueue job KO', { error: String(qe) });
+        }
+        return res.json({
+          ok: true,
+          printed: false,
+          queued: !!jobId,
+          job_id: jobId,
+          warned: true,
+          reason: 'printer_unavailable',
+        });
+      }
       return res.status(502).json({
         ok    : false,
         error : 'printer_error',
@@ -4436,6 +4625,86 @@ async function handlePrintComanda(req, res) {
 // Alias: /print/comanda (nuovo) e /print-comanda (compat)
 router.post('/:id(\\d+)/print/comanda', handlePrintComanda);
 router.post('/:id(\\d+)/print-comanda', handlePrintComanda);
+
+// ============================================================================
+// /print-settings (GET/POST protetti)
+// ============================================================================
+
+router.get('/print-settings', requireAuth, async (_req, res) => {
+  try {
+    const data = await getPrintSettings();
+    res.set('Cache-Control', 'no-store');
+    return res.json({ ok: true, settings: data });
+  } catch (e) {
+    logger.error('⚠️ print_settings GET KO', { error: String(e) });
+    return res.status(500).json({ ok: false, error: 'print_settings_get_error' });
+  }
+});
+
+router.put('/print-settings', requireAuth, async (req, res) => {
+  try {
+    const next = await savePrintSettings(req.body || {});
+    res.set('Cache-Control', 'no-store');
+    return res.json({ ok: true, settings: next });
+  } catch (e) {
+    logger.error('⚠️ print_settings PUT KO', { error: String(e) });
+    return res.status(500).json({ ok: false, error: 'print_settings_put_error' });
+  }
+});
+
+// 🔙 Compat: POST legacy (manteniamo risposta coerente)
+router.post('/print-settings', requireAuth, async (req, res) => {
+  try {
+    const next = await savePrintSettings(req.body || {});
+    res.set('Cache-Control', 'no-store');
+    return res.json({ ok: true, settings: next });
+  } catch (e) {
+    logger.error('⚠️ print_settings POST KO', { error: String(e) });
+    return res.status(500).json({ ok: false, error: 'print_settings_post_error' });
+  }
+});
+
+// ============================================================================
+// /print-jobs (monitor + retry)
+// ============================================================================
+
+router.get('/print-jobs', requireAuth, async (req, res) => {
+  try {
+    const status = req.query?.status || null;
+    const limit = req.query?.limit || 50;
+    const rows = await listPrintJobs({ status, limit });
+    return res.json(rows);
+  } catch (e) {
+    logger.error('⚠️ print_jobs GET KO', { error: String(e) });
+    return res.status(500).json({ ok: false, error: 'print_jobs_get_error' });
+  }
+});
+
+router.post('/print-jobs/:id/retry', requireAuth, async (req, res) => {
+  try {
+    const id = toNum(req.params.id);
+    const out = await retryPrintJob(id);
+    return res.json(out);
+  } catch (e) {
+    const msg = String((e && e.message) || e);
+    const status = msg === 'invalid_id' ? 400 : 500;
+    logger.error('⚠️ print_jobs retry KO', { error: msg });
+    return res.status(status).json({ ok: false, error: 'print_jobs_retry_error' });
+  }
+});
+
+router.post('/print-jobs/:id/cancel', requireAuth, async (req, res) => {
+  try {
+    const id = toNum(req.params.id);
+    const out = await cancelPrintJob(id);
+    return res.json(out);
+  } catch (e) {
+    const msg = String((e && e.message) || e);
+    const status = msg === 'invalid_id' ? 400 : 500;
+    logger.error('⚠️ print_jobs cancel KO', { error: msg });
+    return res.status(status).json({ ok: false, error: 'print_jobs_cancel_error' });
+  }
+});
 
 // ============================================================================
 // /public-asporto-settings (GET pubblico, PUT protetto)
@@ -6952,6 +7221,7 @@ const cors = require('cors');
 const env = require('./env');
 const logger = require('./logger');
 const dbmod = require('./db');
+const { processPrintQueueOnce } = require('./services/print-jobs.service');
 
 // === GOOGLE: nuovi router puliti ============================================
 const googleOauth = require('./api/google/oauth');
@@ -7086,6 +7356,32 @@ if (ensureExists('db/migrator', 'DB migrator')) {
 server.listen(env.PORT, () =>
   logger.info(`🚀 HTTP listening on :${env.PORT}`),
 );
+
+// ============================================================================
+// 🧾 Worker coda stampa (best-effort, no crash)
+// ============================================================================
+
+const PRINT_QUEUE_ENABLED =
+  String(process.env.PRINT_QUEUE_ENABLED || 'true') === 'true';
+const PRINT_QUEUE_INTERVAL_MS = Math.max(
+  5_000,
+  Number(process.env.PRINT_QUEUE_INTERVAL_MS || 30_000),
+);
+
+if (PRINT_QUEUE_ENABLED) {
+  setInterval(async () => {
+    try {
+      await processPrintQueueOnce({ limit: 5 });
+    } catch (e) {
+      logger.warn('🧾🧵 print queue tick KO (best-effort)', {
+        error: String((e && e.message) || e),
+      });
+    }
+  }, PRINT_QUEUE_INTERVAL_MS);
+  logger.info('🧾🧵 print queue ON', { every_ms: PRINT_QUEUE_INTERVAL_MS });
+} else {
+  logger.info('🧾🧵 print queue OFF (PRINT_QUEUE_ENABLED=false)');
+}
 ```
 
 ### ./src/services/gift-voucher-printer.service.js
@@ -9005,6 +9301,526 @@ function emitStatus(payload) {
 }
 
 module.exports = { mount, emitCreated, emitStatus };
+```
+
+### ./src/services/print-jobs.service.js
+```
+// src/services/print-jobs.service.js
+// ============================================================================
+// Print Jobs — coda best-effort per stampe (log emoji + commenti lunghi)
+// ============================================================================
+
+'use strict';
+
+const logger = require('../logger');
+const { query } = require('../db');
+const { getPrintSettings } = require('./print-settings.service');
+const { printOrderForCenter } = require('../utils/print-order');
+
+const DEFAULT_MAX_ATTEMPTS = 10;
+const DEFAULT_LIMIT = 5;
+
+// =============================================================================
+// Helper: normalizza payload + status
+// =============================================================================
+
+function normalizeStatus(raw) {
+  const v = String(raw || '').trim().toLowerCase();
+  if (v === 'queued' || v === 'printing' || v === 'done' || v === 'failed' || v === 'cancelled') {
+    return v;
+  }
+  return null;
+}
+
+function computeBackoffSeconds(attempts) {
+  const n = Math.max(1, Number(attempts || 1));
+  const sec = 30 * Math.pow(2, n - 1);
+  return Math.min(sec, 1800); // cap 30 minuti
+}
+
+// =============================================================================
+// Caricamento ordine "minimo" per stampa comanda
+// =============================================================================
+
+async function loadOrderForPrint(orderId) {
+  const rows = await query(
+    `SELECT
+       o.id,
+       o.customer_name,
+       o.phone,
+       o.people,
+       o.scheduled_at,
+       o.created_at,
+       o.total,
+       o.note,
+       o.fulfillment,
+       o.table_id,
+       o.delivery_name,
+       o.delivery_phone,
+       o.delivery_address,
+       o.delivery_note,
+       t.table_number,
+       COALESCE(NULLIF(t.table_number, ''), CONCAT('T', t.id)) AS table_name,
+       rm.id   AS room_id,
+       rm.name AS room_name
+     FROM orders o
+     LEFT JOIN tables t ON t.id = o.table_id
+     LEFT JOIN rooms  rm ON rm.id = t.room_id
+     WHERE o.id = ?
+     LIMIT 1`,
+    [orderId],
+  );
+  const h = rows && rows[0];
+  if (!h) return null;
+
+  const items = await query(
+    `SELECT i.id,
+            i.order_id,
+            i.product_id,
+            i.name,
+            i.qty,
+            i.price,
+            i.notes,
+            COALESCE(c.name, 'Altro') AS category
+     FROM order_items i
+     LEFT JOIN products   p ON p.id = i.product_id
+     LEFT JOIN categories c ON c.id = p.category_id
+     WHERE i.order_id = ?
+     ORDER BY i.id ASC`,
+    [orderId],
+  );
+
+  return {
+    ...h,
+    items: (items || []).map((r) => ({
+      ...r,
+      qty: Number(r.qty || 0),
+      price: Number(r.price || 0),
+    })),
+  };
+}
+
+// =============================================================================
+// API principale
+// =============================================================================
+
+async function enqueuePrintJob({ kind, orderId, payload, reason } = {}) {
+  const payloadJson = JSON.stringify(payload || {});
+  const maxAttempts = DEFAULT_MAX_ATTEMPTS;
+  const result = await query(
+    `INSERT INTO print_jobs (
+       kind,
+       order_id,
+       payload_json,
+       status,
+       attempts,
+       max_attempts,
+       next_run_at,
+       last_error,
+       created_at,
+       updated_at
+     )
+     VALUES (?, ?, ?, 'queued', 0, ?, UTC_TIMESTAMP(), ?, UTC_TIMESTAMP(), UTC_TIMESTAMP())`,
+    [
+      String(kind || ''),
+      orderId != null ? Number(orderId) : null,
+      payloadJson,
+      maxAttempts,
+      reason ? String(reason) : null,
+    ],
+  );
+  const jobId = result?.insertId || null;
+  logger.info('🧾🧵 [print_jobs] enqueue', {
+    id: jobId,
+    kind,
+    order_id: orderId || null,
+  });
+  return { id: jobId };
+}
+
+async function listPrintJobs({ status, limit } = {}) {
+  const st = normalizeStatus(status);
+  const lim = Math.min(Math.max(Number(limit || 50), 1), 200);
+  const cond = st ? 'WHERE status = ?' : '';
+  const params = st ? [st, lim] : [lim];
+  const rows = await query(
+    `SELECT
+       id,
+       kind,
+       order_id,
+       status,
+       attempts,
+       max_attempts,
+       next_run_at,
+       last_error,
+       created_at,
+       updated_at,
+       printed_at
+     FROM print_jobs
+     ${cond}
+     ORDER BY id DESC
+     LIMIT ?`,
+    params,
+  );
+  return rows || [];
+}
+
+async function retryPrintJob(id) {
+  const jobId = Number(id || 0);
+  if (!jobId) throw new Error('invalid_id');
+  await query(
+    `UPDATE print_jobs
+       SET status = 'queued',
+           next_run_at = UTC_TIMESTAMP(),
+           last_error = NULL,
+           updated_at = UTC_TIMESTAMP()
+     WHERE id = ?`,
+    [jobId],
+  );
+  logger.info('🔁🧾 [print_jobs] retry', { id: jobId });
+  return { ok: true };
+}
+
+async function cancelPrintJob(id) {
+  const jobId = Number(id || 0);
+  if (!jobId) throw new Error('invalid_id');
+  await query(
+    `UPDATE print_jobs
+       SET status = 'cancelled',
+           updated_at = UTC_TIMESTAMP()
+     WHERE id = ?`,
+    [jobId],
+  );
+  logger.info('⛔🧾 [print_jobs] cancel', { id: jobId });
+  return { ok: true };
+}
+
+async function markDone(id) {
+  await query(
+    `UPDATE print_jobs
+       SET status = 'done',
+           printed_at = UTC_TIMESTAMP(),
+           updated_at = UTC_TIMESTAMP()
+     WHERE id = ?`,
+    [id],
+  );
+}
+
+async function markFailed(id, err, nextRunAt, attempts, maxAttempts) {
+  const errMsg = err ? String(err) : 'print_error';
+  if (attempts >= maxAttempts) {
+    await query(
+      `UPDATE print_jobs
+         SET status = 'failed',
+             last_error = ?,
+             updated_at = UTC_TIMESTAMP()
+       WHERE id = ?`,
+      [errMsg, id],
+    );
+    return;
+  }
+  await query(
+    `UPDATE print_jobs
+       SET status = 'queued',
+           last_error = ?,
+           next_run_at = ?,
+           updated_at = UTC_TIMESTAMP()
+     WHERE id = ?`,
+    [errMsg, nextRunAt, id],
+  );
+}
+
+async function processPrintQueueOnce({ limit } = {}) {
+  const lim = Math.min(Math.max(Number(limit || DEFAULT_LIMIT), 1), 20);
+  const jobs = await query(
+    `SELECT
+       id,
+       kind,
+       order_id,
+       payload_json,
+       attempts,
+       max_attempts
+     FROM print_jobs
+     WHERE status = 'queued'
+       AND next_run_at <= UTC_TIMESTAMP()
+     ORDER BY next_run_at ASC, id ASC
+     LIMIT ?`,
+    [lim],
+  );
+  if (!jobs || !jobs.length) return { ok: true, processed: 0 };
+
+  const settings = await getPrintSettings();
+  const printerSettings = {
+    PRINTER_ENABLED: settings.printer_enabled ? 'true' : 'false',
+    PRINTER_IP: settings.printer_ip || undefined,
+    PRINTER_PORT: settings.printer_port || undefined,
+  };
+
+  let processed = 0;
+
+  for (const job of jobs) {
+    const claim = await query(
+      `UPDATE print_jobs
+         SET status = 'printing',
+             attempts = attempts + 1,
+             updated_at = UTC_TIMESTAMP()
+       WHERE id = ? AND status = 'queued'`,
+      [job.id],
+    );
+    if (!claim || claim.affectedRows === 0) continue;
+
+    const attempts = Number(job.attempts || 0) + 1;
+    const maxAttempts = Number(job.max_attempts || DEFAULT_MAX_ATTEMPTS);
+
+    try {
+      if (!settings.printer_enabled) {
+        throw new Error('printer_disabled');
+      }
+      if (String(job.kind) === 'order_comanda') {
+        const payload = job.payload_json
+          ? JSON.parse(String(job.payload_json))
+          : {};
+        const centerRaw = String(payload?.center || 'ALL').toUpperCase();
+        const copies = Math.max(1, Number(payload?.copies || 1));
+        const layoutKey = String(payload?.layoutKey || 'classic')
+          .trim()
+          .toLowerCase();
+
+        const orderId = Number(job.order_id || 0);
+        const full = await loadOrderForPrint(orderId);
+        if (!full) {
+          throw new Error('order_not_found');
+        }
+
+        for (let i = 0; i < copies; i += 1) {
+          if (centerRaw === 'ALL') {
+            await printOrderForCenter(full, 'PIZZERIA', {
+              printerSettings,
+              layoutKey,
+            });
+            await printOrderForCenter(full, 'CUCINA', {
+              printerSettings,
+              layoutKey,
+            });
+          } else {
+            await printOrderForCenter(full, centerRaw, {
+              printerSettings,
+              layoutKey,
+            });
+          }
+        }
+      } else {
+        throw new Error('unsupported_kind');
+      }
+
+      await markDone(job.id);
+      processed += 1;
+      logger.info('🧾🟢 [print_jobs] done', { id: job.id });
+    } catch (e) {
+      const backoffSec = computeBackoffSeconds(attempts);
+      const nextRun = new Date(Date.now() + backoffSec * 1000);
+      await markFailed(job.id, e, nextRun, attempts, maxAttempts);
+      logger.warn('🧾🔁 [print_jobs] fail', {
+        id: job.id,
+        attempts,
+        maxAttempts,
+        error: String((e && e.message) || e),
+      });
+    }
+  }
+
+  return { ok: true, processed };
+}
+
+module.exports = {
+  enqueuePrintJob,
+  listPrintJobs,
+  retryPrintJob,
+  cancelPrintJob,
+  processPrintQueueOnce,
+};
+```
+
+### ./src/services/print-settings.service.js
+```
+// src/services/print-settings.service.js
+// ============================================================================
+// Print Settings — persistenza DB + normalizzazione (stile Endri, log emoji)
+// ============================================================================
+
+'use strict';
+
+const logger = require('../logger');
+const { query } = require('../db');
+
+const PRINT_SETTINGS_DEFAULTS = {
+  printer_enabled: true,
+  printer_ip: '',
+  printer_port: 9100,
+  // === Comanda (takeaway) ===================================================
+  comanda_layout: 'classic',            // classic | mcd
+  takeaway_center: 'pizzeria',          // pizzeria | cucina
+  takeaway_copies: 1,                   // 1..3
+  takeaway_auto_print: true,
+  // 🔙 compat: campo legacy (se presente in DB)
+  takeaway_comanda_center: 'ALL',
+};
+
+function normalizePrintSettings(raw) {
+  const src = raw || {};
+  const enabled = typeof src.printer_enabled === 'boolean'
+    ? src.printer_enabled
+    : !!Number(src.printer_enabled ?? PRINT_SETTINGS_DEFAULTS.printer_enabled);
+
+  const ip = String(
+    src.printer_ip ?? PRINT_SETTINGS_DEFAULTS.printer_ip,
+  ).trim();
+
+  const portNum = Number(
+    src.printer_port ?? PRINT_SETTINGS_DEFAULTS.printer_port,
+  );
+  const port =
+    Number.isFinite(portNum) && portNum > 0 ? portNum : PRINT_SETTINGS_DEFAULTS.printer_port;
+
+  const autoPrint = typeof src.takeaway_auto_print === 'boolean'
+    ? src.takeaway_auto_print
+    : !!Number(
+      src.takeaway_auto_print ?? PRINT_SETTINGS_DEFAULTS.takeaway_auto_print,
+    );
+
+  // Layout comanda (classic | mcd)
+  const layoutRaw = String(
+    src.comanda_layout ?? PRINT_SETTINGS_DEFAULTS.comanda_layout,
+  ).trim().toLowerCase();
+  const comanda_layout =
+    layoutRaw === 'mcd' ? 'mcd' : 'classic';
+
+  // Centro comanda (nuovo)
+  const centerRaw = String(
+    src.takeaway_center ??
+      src.takeaway_comanda_center ??
+      PRINT_SETTINGS_DEFAULTS.takeaway_center,
+  ).trim().toLowerCase();
+  const takeaway_center =
+    centerRaw === 'cucina' ? 'cucina' : 'pizzeria';
+
+  // Copie comanda (1..3)
+  const copiesNum = Number(
+    src.takeaway_copies ?? PRINT_SETTINGS_DEFAULTS.takeaway_copies,
+  );
+  const takeaway_copies =
+    Number.isFinite(copiesNum)
+      ? Math.min(3, Math.max(1, Math.trunc(copiesNum)))
+      : PRINT_SETTINGS_DEFAULTS.takeaway_copies;
+
+  // 🔙 compat legacy (ALL/PIZZERIA/CUCINA)
+  const legacyCenterRaw =
+    src.takeaway_comanda_center != null
+      ? String(src.takeaway_comanda_center).trim().toUpperCase()
+      : '';
+  const takeaway_comanda_center =
+    legacyCenterRaw === 'PIZZERIA' || legacyCenterRaw === 'CUCINA' || legacyCenterRaw === 'ALL'
+      ? legacyCenterRaw
+      : String(takeaway_center || 'PIZZERIA').toUpperCase();
+
+  return {
+    printer_enabled: enabled,
+    printer_ip: ip,
+    printer_port: port,
+    comanda_layout,
+    takeaway_center,
+    takeaway_copies,
+    takeaway_auto_print: autoPrint,
+    takeaway_comanda_center,
+  };
+}
+
+async function getPrintSettings() {
+  try {
+    const rows = await query(
+      `SELECT
+         printer_enabled,
+         printer_ip,
+         printer_port,
+         comanda_layout,
+         takeaway_center,
+         takeaway_copies,
+         takeaway_auto_print,
+         takeaway_comanda_center
+       FROM print_settings
+       ORDER BY id ASC
+       LIMIT 1`,
+    );
+    const raw = rows && rows[0] ? rows[0] : null;
+    return {
+      ...normalizePrintSettings(raw || PRINT_SETTINGS_DEFAULTS),
+      _source: 'db',
+    };
+  } catch (e) {
+    logger.warn('⚠️ print_settings load KO', { error: String(e) });
+    return {
+      ...normalizePrintSettings(PRINT_SETTINGS_DEFAULTS),
+      _source: 'env',
+    };
+  }
+}
+
+async function savePrintSettings(next) {
+  const p = normalizePrintSettings(next);
+  await query(
+    `INSERT INTO print_settings (
+       id,
+       printer_enabled,
+       printer_ip,
+       printer_port,
+       comanda_layout,
+       takeaway_center,
+       takeaway_copies,
+       takeaway_auto_print,
+       takeaway_comanda_center,
+       updated_at
+     ) VALUES (
+       1, ?, ?, ?, ?, ?, ?, ?, ?, UTC_TIMESTAMP()
+     )
+     ON DUPLICATE KEY UPDATE
+       printer_enabled = VALUES(printer_enabled),
+       printer_ip = VALUES(printer_ip),
+       printer_port = VALUES(printer_port),
+       comanda_layout = VALUES(comanda_layout),
+       takeaway_center = VALUES(takeaway_center),
+       takeaway_copies = VALUES(takeaway_copies),
+       takeaway_auto_print = VALUES(takeaway_auto_print),
+       takeaway_comanda_center = VALUES(takeaway_comanda_center),
+       updated_at = UTC_TIMESTAMP()`,
+    [
+      p.printer_enabled ? 1 : 0,
+      p.printer_ip,
+      p.printer_port,
+      p.comanda_layout,
+      p.takeaway_center,
+      p.takeaway_copies,
+      p.takeaway_auto_print ? 1 : 0,
+      p.takeaway_comanda_center,
+    ],
+  );
+  logger.info('🧾⚙️ [PrintSettings] saved', {
+    comanda_layout: p.comanda_layout,
+    takeaway_center: p.takeaway_center,
+    takeaway_copies: p.takeaway_copies,
+    takeaway_auto_print: p.takeaway_auto_print,
+    printer_enabled: p.printer_enabled,
+    printer_ip: p.printer_ip || null,
+    printer_port: p.printer_port,
+  });
+  return { ...p, _source: 'db' };
+}
+
+module.exports = {
+  PRINT_SETTINGS_DEFAULTS,
+  normalizePrintSettings,
+  getPrintSettings,
+  savePrintSettings,
+};
 ```
 
 ### ./src/services/product.service.js
@@ -12296,18 +13112,42 @@ module.exports = resolveCustomerUserId;
 const net = require('net');
 const logger = require('../logger');
 
-const {
-  PRINTER_ENABLED = 'true',
-  PRINTER_IP = '127.0.0.1',
-  PRINTER_PORT = '9100',
-  PRINTER_CUT = 'true',
-  PRINTER_HEADER = '',
-  PRINTER_FOOTER = '',
-  PRINTER_WIDTH_MM = '80',
+// ⚙️ Config stampante (env + override runtime)
+const DEFAULT_CONFIG = {
+  PRINTER_ENABLED: process.env.PRINTER_ENABLED ?? 'true',
+  PRINTER_IP: process.env.PRINTER_IP ?? '127.0.0.1',
+  PRINTER_PORT: process.env.PRINTER_PORT ?? '9100',
+  PRINTER_CUT: process.env.PRINTER_CUT ?? 'true',
+  PRINTER_HEADER: process.env.PRINTER_HEADER ?? '',
+  PRINTER_FOOTER: process.env.PRINTER_FOOTER ?? '',
+  PRINTER_WIDTH_MM: process.env.PRINTER_WIDTH_MM ?? '80',
   // mapping reparti
-  PIZZERIA_CATEGORIES = 'PIZZE,PIZZE ROSSE,PIZZE BIANCHE',
-  KITCHEN_CATEGORIES = 'ANTIPASTI,FRITTI,BEVANDE',
-} = process.env;
+  PIZZERIA_CATEGORIES:
+    process.env.PIZZERIA_CATEGORIES ?? 'PIZZE,PIZZE ROSSE,PIZZE BIANCHE',
+  KITCHEN_CATEGORIES:
+    process.env.KITCHEN_CATEGORIES ?? 'ANTIPASTI,FRITTI,BEVANDE',
+};
+
+function resolvePrintConfig(override = {}) {
+  const src = { ...DEFAULT_CONFIG, ...(override || {}) };
+  return {
+    PRINTER_ENABLED: String(src.PRINTER_ENABLED ?? 'true'),
+    PRINTER_IP: String(src.PRINTER_IP ?? '127.0.0.1'),
+    PRINTER_PORT: Number(src.PRINTER_PORT || 9100),
+    PRINTER_CUT: String(src.PRINTER_CUT ?? 'true'),
+    PRINTER_HEADER: String(src.PRINTER_HEADER ?? ''),
+    PRINTER_FOOTER: String(src.PRINTER_FOOTER ?? ''),
+    PRINTER_WIDTH_MM: String(src.PRINTER_WIDTH_MM ?? '80'),
+    PIZZERIA_CATEGORIES: String(
+      src.PIZZERIA_CATEGORIES ??
+        DEFAULT_CONFIG.PIZZERIA_CATEGORIES,
+    ),
+    KITCHEN_CATEGORIES: String(
+      src.KITCHEN_CATEGORIES ??
+        DEFAULT_CONFIG.KITCHEN_CATEGORIES,
+    ),
+  };
+}
 
 function esc(...codes) { return Buffer.from(codes); }
 
@@ -12325,7 +13165,9 @@ function charSpacing(sock, n){ sock.write(esc(0x1B,0x20, Math.max(0,Math.min(255
 function setLineSpacing(sock, n){ sock.write(esc(0x1B,0x33, Math.max(0,Math.min(255,n)))); } // ESC 3 n
 function resetLineSpacing(sock){ sock.write(esc(0x1B,0x32)); }         // ESC 2 (default)
 function feedLines(sock, n){ sock.write(esc(0x1B,0x64, Math.max(0,Math.min(255,n)))); }     // ESC d n
-function cutIfEnabled(sock){ if (PRINTER_CUT === 'true') sock.write(esc(0x1D,0x56,0x42,0x00)); } // GS V B n
+function cutIfEnabled(sock, cfg){
+  if (cfg.PRINTER_CUT === 'true') sock.write(esc(0x1D,0x56,0x42,0x00));
+} // GS V B n
 function codepageCP1252(sock){ try{ sock.write(esc(0x1B,0x74,0x10)); }catch{} } // ESC t 16 → CP1252 (tipico Epson)
 
 // --- Scrittura linea con sanificazione (accenti/apici/dash) -----------------
@@ -12370,19 +13212,19 @@ function qtyStr(q) { return String(Math.max(1, Number(q) || 1)).padStart(2,' ');
 function money(n){ return Number(n || 0).toFixed(2); }
 
 // ----------------------------------------------------------------------------
-function openSocket() {
+function openSocket(cfg) {
   return new Promise((resolve, reject) => {
     const socket = net.createConnection(
-      { host: PRINTER_IP, port: Number(PRINTER_PORT || 9100) },
+      { host: cfg.PRINTER_IP, port: Number(cfg.PRINTER_PORT || 9100) },
       () => resolve(socket)
     );
     socket.on('error', reject);
   });
 }
 
-function splitByDept(items) {
-  const piz = new Set(PIZZERIA_CATEGORIES.split(',').map(s => s.trim().toUpperCase()).filter(Boolean));
-  const kit = new Set(KITCHEN_CATEGORIES.split(',').map(s => s.trim().toUpperCase()).filter(Boolean));
+function splitByDept(items, cfg) {
+  const piz = new Set(cfg.PIZZERIA_CATEGORIES.split(',').map(s => s.trim().toUpperCase()).filter(Boolean));
+  const kit = new Set(cfg.KITCHEN_CATEGORIES.split(',').map(s => s.trim().toUpperCase()).filter(Boolean));
 
   const pizzeria = [];
   const kitchen  = [];
@@ -12456,8 +13298,8 @@ function fmtComandaDate(iso) {
 }
 
 // --- Stampa standard (CONTO) -------------------------------------------------
-async function printSlip(title, order) {
-  const sock = await openSocket();
+async function printSlip(title, order, cfg) {
+  const sock = await openSocket(cfg);
   const write = (buf) => sock.write(buf);
 
   init(sock);
@@ -12466,7 +13308,7 @@ async function printSlip(title, order) {
   write(Buffer.from(String(title)+'\n','latin1'));
   write(esc(0x1B,0x21,0x00));       // normal
 
-  const headerLines = (PRINTER_HEADER || '').split('|').filter(Boolean);
+  const headerLines = (cfg.PRINTER_HEADER || '').split('|').filter(Boolean);
   for (const h of headerLines) write(Buffer.from(sanitizeForEscpos(h)+'\n','latin1'));
 
   write(Buffer.from('------------------------------\n','latin1'));
@@ -12497,12 +13339,12 @@ async function printSlip(title, order) {
 
   write(Buffer.from('------------------------------\n','latin1'));
   write(Buffer.from(`Totale: ${money(order.total || 0)}\n`,'latin1'));
-  if (PRINTER_FOOTER) {
+  if (cfg.PRINTER_FOOTER) {
     write(Buffer.from('\n','latin1'));
-    for (const f of (PRINTER_FOOTER || '').split('|')) write(Buffer.from(sanitizeForEscpos(f)+'\n','latin1'));
+    for (const f of (cfg.PRINTER_FOOTER || '').split('|')) write(Buffer.from(sanitizeForEscpos(f)+'\n','latin1'));
   }
   write(Buffer.from('\n','latin1'));
-  cutIfEnabled(sock);
+  cutIfEnabled(sock, cfg);
   sock.end();
 }
 
@@ -12520,9 +13362,9 @@ function normalizeNotesForKitchen(raw) {
   return s;
 }
 
-// --- Stampa COMANDA (centro produzione) — font grande/bold + spacing ---------
-async function printComandaSlip(title, order) {
-  const sock = await openSocket();
+// --- Stampa COMANDA (centro produzione) — layout "classic" -------------------
+async function printComandaSlipClassic(title, order, cfg) {
+  const sock = await openSocket(cfg);
 
   // init + set leggibilità (Font A, spaziatura righe, leggera spaziatura caratteri, codepage)
   init(sock);
@@ -12637,16 +13479,106 @@ async function printComandaSlip(title, order) {
 
   resetLineSpacing(sock);
   charSpacing(sock, 0);
-  cutIfEnabled(sock);
+  cutIfEnabled(sock, cfg);
   sock.end();
 }
 
-async function printOrderDual(orderFull) {
-  if (PRINTER_ENABLED !== 'true') {
+// --- Stampa COMANDA (centro produzione) — layout "mcd" -----------------------
+async function printComandaSlipMcd(title, order, cfg) {
+  const sock = await openSocket(cfg);
+
+  init(sock);
+  codepageCP1252(sock);
+  fontA(sock);
+  setLineSpacing(sock, 32);
+  charSpacing(sock, 0);
+
+  // Header grande e pulito
+  alignCenter(sock);
+  sizeBig(sock); boldOn(sock); writeLine(sock, `ORD. #${order.id}`); boldOff(sock);
+
+  const fulfillment = resolveFulfillment(order);
+  if (fulfillment === 'table') {
+    const room = extractRoomLabel(order);
+    const table = extractTableLabel(order);
+    const label = table || room || 'TAVOLO';
+    sizeBig(sock); boldOn(sock); writeLine(sock, label.toUpperCase()); boldOff(sock);
+  } else if (fulfillment === 'delivery') {
+    sizeBig(sock); boldOn(sock); writeLine(sock, 'DOMICILIO'); boldOff(sock);
+  } else {
+    sizeBig(sock); boldOn(sock); writeLine(sock, 'ASPORTO'); boldOff(sock);
+  }
+
+  sizeNormal(sock);
+  alignCenter(sock);
+  writeLine(sock, '------------------------------');
+
+  // Orario ritiro/consegna
+  if (order.scheduled_at) {
+    const label = fulfillment === 'delivery' ? 'Consegna' : 'Ritiro';
+    writeLine(sock, `${label}: ${fmtComandaDate(order.scheduled_at)}`);
+  } else {
+    writeLine(sock, fmtComandaDate(order.created_at || new Date().toISOString()));
+  }
+
+  alignLeft(sock);
+  writeLine(sock, '------------------------------');
+
+  // Corpo: QTY + NOME (senza prezzi) + note sotto riga
+  for (const it of order.items || []) {
+    const qty = Math.max(1, Number(it.qty) || 1);
+    const qtyTxt = qtyStr(qty);
+    const name = (it.name || '').toString().trim();
+    const nameLines = wrapText(name, COMANDA_MAX_COLS - 4);
+
+    if (nameLines.length) {
+      writeLine(sock, `${qtyTxt} ${nameLines[0]}`);
+      for (const ln of nameLines.slice(1)) {
+        writeLine(sock, `   ${ln}`);
+      }
+    } else {
+      writeLine(sock, `${qtyTxt} (senza nome)`);
+    }
+
+    if (it.notes) {
+      const norm = normalizeNotesForKitchen(it.notes);
+      const noteLines = wrapText(`NOTE: ${norm}`, COMANDA_MAX_COLS - 4);
+      for (const ln of noteLines) {
+        writeLine(sock, `   ${ln}`);
+      }
+    }
+    writeLine(sock, '');
+  }
+
+  // Footer semplice
+  alignCenter(sock);
+  writeLine(sock, '------------------------------');
+  writeLine(sock, title.toUpperCase());
+  writeLine(sock, 'COMANDA');
+  writeLine(sock, '');
+
+  resetLineSpacing(sock);
+  charSpacing(sock, 0);
+  cutIfEnabled(sock, cfg);
+  sock.end();
+}
+
+// --- Facade: layout selezionabile (classic | mcd) ----------------------------
+async function printComandaSlip({ title, order, cfg, layoutKey = 'classic' }) {
+  const key = String(layoutKey || 'classic').trim().toLowerCase();
+  if (key === 'mcd') {
+    return printComandaSlipMcd(title, order, cfg);
+  }
+  return printComandaSlipClassic(title, order, cfg);
+}
+
+async function printOrderDual(orderFull, options = {}) {
+  const cfg = resolvePrintConfig(options.printerSettings);
+  if (cfg.PRINTER_ENABLED !== 'true') {
     logger.warn('🖨️  PRINT disabled (PRINTER_ENABLED=false)');
     return;
   }
-  const { pizzeria, kitchen } = splitByDept(orderFull.items || []);
+  const { pizzeria, kitchen } = splitByDept(orderFull.items || [], cfg);
   const head = {
     id: orderFull.id,
     customer_name: orderFull.customer_name,
@@ -12668,28 +13600,30 @@ async function printOrderDual(orderFull) {
   };
 
   if (pizzeria.length) {
-    await printSlip('PIZZERIA', { ...head, items: pizzeria });
+    await printSlip('PIZZERIA', { ...head, items: pizzeria }, cfg);
     logger.info('🖨️  PIZZERIA printed', { id: orderFull.id, items: pizzeria.length });
   }
   if (kitchen.length) {
-    await printSlip('CUCINA', { ...head, items: kitchen });
+    await printSlip('CUCINA', { ...head, items: kitchen }, cfg);
     logger.info('🖨️  CUCINA printed', { id: orderFull.id, items: kitchen.length });
   }
 }
 
 // 🆕 Stampa SOLO un centro (PIZZERIA | CUCINA) — usa la formattazione COMANDA
-async function printOrderForCenter(orderFull, center = 'PIZZERIA') {
-  if (PRINTER_ENABLED !== 'true') {
+async function printOrderForCenter(orderFull, center = 'PIZZERIA', options = {}) {
+  const cfg = resolvePrintConfig(options.printerSettings);
+  if (cfg.PRINTER_ENABLED !== 'true') {
     logger.warn('🧾 PRINT(comanda) disabled (PRINTER_ENABLED=false)');
     return;
   }
-  const { pizzeria, kitchen } = splitByDept(orderFull.items || []);
+  const { pizzeria, kitchen } = splitByDept(orderFull.items || [], cfg);
   const head = {
     id: orderFull.id,
     customer_name: orderFull.customer_name,
     phone: orderFull.phone,
     people: orderFull.people,
     scheduled_at: orderFull.scheduled_at,
+    created_at: orderFull.created_at,
     total: orderFull.total,
     note: orderFull.note,
     fulfillment: orderFull.fulfillment,
@@ -12712,8 +13646,18 @@ async function printOrderForCenter(orderFull, center = 'PIZZERIA') {
     logger.info('🧾 comanda skip (no items per centro)', { id: orderFull.id, center: which });
     return;
   }
-  await printComandaSlip(title, { ...head, items: payload }); // 👈 stile COMANDA
-  logger.info('🧾 comanda printed', { id: orderFull.id, center: which, items: payload.length });
+  await printComandaSlip({
+    title,
+    order: { ...head, items: payload },
+    cfg,
+    layoutKey: options?.layoutKey || 'classic',
+  }); // 👈 stile COMANDA
+  logger.info('🧾 comanda printed', {
+    id: orderFull.id,
+    center: which,
+    items: payload.length,
+    layoutKey: options?.layoutKey || 'classic',
+  });
 }
 
 module.exports = { printOrderDual, printOrderForCenter };

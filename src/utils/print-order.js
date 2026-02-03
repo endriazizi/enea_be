@@ -17,18 +17,42 @@
 const net = require('net');
 const logger = require('../logger');
 
-const {
-  PRINTER_ENABLED = 'true',
-  PRINTER_IP = '127.0.0.1',
-  PRINTER_PORT = '9100',
-  PRINTER_CUT = 'true',
-  PRINTER_HEADER = '',
-  PRINTER_FOOTER = '',
-  PRINTER_WIDTH_MM = '80',
+// ⚙️ Config stampante (env + override runtime)
+const DEFAULT_CONFIG = {
+  PRINTER_ENABLED: process.env.PRINTER_ENABLED ?? 'true',
+  PRINTER_IP: process.env.PRINTER_IP ?? '127.0.0.1',
+  PRINTER_PORT: process.env.PRINTER_PORT ?? '9100',
+  PRINTER_CUT: process.env.PRINTER_CUT ?? 'true',
+  PRINTER_HEADER: process.env.PRINTER_HEADER ?? '',
+  PRINTER_FOOTER: process.env.PRINTER_FOOTER ?? '',
+  PRINTER_WIDTH_MM: process.env.PRINTER_WIDTH_MM ?? '80',
   // mapping reparti
-  PIZZERIA_CATEGORIES = 'PIZZE,PIZZE ROSSE,PIZZE BIANCHE',
-  KITCHEN_CATEGORIES = 'ANTIPASTI,FRITTI,BEVANDE',
-} = process.env;
+  PIZZERIA_CATEGORIES:
+    process.env.PIZZERIA_CATEGORIES ?? 'PIZZE,PIZZE ROSSE,PIZZE BIANCHE',
+  KITCHEN_CATEGORIES:
+    process.env.KITCHEN_CATEGORIES ?? 'ANTIPASTI,FRITTI,BEVANDE',
+};
+
+function resolvePrintConfig(override = {}) {
+  const src = { ...DEFAULT_CONFIG, ...(override || {}) };
+  return {
+    PRINTER_ENABLED: String(src.PRINTER_ENABLED ?? 'true'),
+    PRINTER_IP: String(src.PRINTER_IP ?? '127.0.0.1'),
+    PRINTER_PORT: Number(src.PRINTER_PORT || 9100),
+    PRINTER_CUT: String(src.PRINTER_CUT ?? 'true'),
+    PRINTER_HEADER: String(src.PRINTER_HEADER ?? ''),
+    PRINTER_FOOTER: String(src.PRINTER_FOOTER ?? ''),
+    PRINTER_WIDTH_MM: String(src.PRINTER_WIDTH_MM ?? '80'),
+    PIZZERIA_CATEGORIES: String(
+      src.PIZZERIA_CATEGORIES ??
+        DEFAULT_CONFIG.PIZZERIA_CATEGORIES,
+    ),
+    KITCHEN_CATEGORIES: String(
+      src.KITCHEN_CATEGORIES ??
+        DEFAULT_CONFIG.KITCHEN_CATEGORIES,
+    ),
+  };
+}
 
 function esc(...codes) { return Buffer.from(codes); }
 
@@ -46,7 +70,9 @@ function charSpacing(sock, n){ sock.write(esc(0x1B,0x20, Math.max(0,Math.min(255
 function setLineSpacing(sock, n){ sock.write(esc(0x1B,0x33, Math.max(0,Math.min(255,n)))); } // ESC 3 n
 function resetLineSpacing(sock){ sock.write(esc(0x1B,0x32)); }         // ESC 2 (default)
 function feedLines(sock, n){ sock.write(esc(0x1B,0x64, Math.max(0,Math.min(255,n)))); }     // ESC d n
-function cutIfEnabled(sock){ if (PRINTER_CUT === 'true') sock.write(esc(0x1D,0x56,0x42,0x00)); } // GS V B n
+function cutIfEnabled(sock, cfg){
+  if (cfg.PRINTER_CUT === 'true') sock.write(esc(0x1D,0x56,0x42,0x00));
+} // GS V B n
 function codepageCP1252(sock){ try{ sock.write(esc(0x1B,0x74,0x10)); }catch{} } // ESC t 16 → CP1252 (tipico Epson)
 
 // --- Scrittura linea con sanificazione (accenti/apici/dash) -----------------
@@ -91,19 +117,19 @@ function qtyStr(q) { return String(Math.max(1, Number(q) || 1)).padStart(2,' ');
 function money(n){ return Number(n || 0).toFixed(2); }
 
 // ----------------------------------------------------------------------------
-function openSocket() {
+function openSocket(cfg) {
   return new Promise((resolve, reject) => {
     const socket = net.createConnection(
-      { host: PRINTER_IP, port: Number(PRINTER_PORT || 9100) },
+      { host: cfg.PRINTER_IP, port: Number(cfg.PRINTER_PORT || 9100) },
       () => resolve(socket)
     );
     socket.on('error', reject);
   });
 }
 
-function splitByDept(items) {
-  const piz = new Set(PIZZERIA_CATEGORIES.split(',').map(s => s.trim().toUpperCase()).filter(Boolean));
-  const kit = new Set(KITCHEN_CATEGORIES.split(',').map(s => s.trim().toUpperCase()).filter(Boolean));
+function splitByDept(items, cfg) {
+  const piz = new Set(cfg.PIZZERIA_CATEGORIES.split(',').map(s => s.trim().toUpperCase()).filter(Boolean));
+  const kit = new Set(cfg.KITCHEN_CATEGORIES.split(',').map(s => s.trim().toUpperCase()).filter(Boolean));
 
   const pizzeria = [];
   const kitchen  = [];
@@ -177,8 +203,8 @@ function fmtComandaDate(iso) {
 }
 
 // --- Stampa standard (CONTO) -------------------------------------------------
-async function printSlip(title, order) {
-  const sock = await openSocket();
+async function printSlip(title, order, cfg) {
+  const sock = await openSocket(cfg);
   const write = (buf) => sock.write(buf);
 
   init(sock);
@@ -187,7 +213,7 @@ async function printSlip(title, order) {
   write(Buffer.from(String(title)+'\n','latin1'));
   write(esc(0x1B,0x21,0x00));       // normal
 
-  const headerLines = (PRINTER_HEADER || '').split('|').filter(Boolean);
+  const headerLines = (cfg.PRINTER_HEADER || '').split('|').filter(Boolean);
   for (const h of headerLines) write(Buffer.from(sanitizeForEscpos(h)+'\n','latin1'));
 
   write(Buffer.from('------------------------------\n','latin1'));
@@ -218,12 +244,12 @@ async function printSlip(title, order) {
 
   write(Buffer.from('------------------------------\n','latin1'));
   write(Buffer.from(`Totale: ${money(order.total || 0)}\n`,'latin1'));
-  if (PRINTER_FOOTER) {
+  if (cfg.PRINTER_FOOTER) {
     write(Buffer.from('\n','latin1'));
-    for (const f of (PRINTER_FOOTER || '').split('|')) write(Buffer.from(sanitizeForEscpos(f)+'\n','latin1'));
+    for (const f of (cfg.PRINTER_FOOTER || '').split('|')) write(Buffer.from(sanitizeForEscpos(f)+'\n','latin1'));
   }
   write(Buffer.from('\n','latin1'));
-  cutIfEnabled(sock);
+  cutIfEnabled(sock, cfg);
   sock.end();
 }
 
@@ -241,9 +267,9 @@ function normalizeNotesForKitchen(raw) {
   return s;
 }
 
-// --- Stampa COMANDA (centro produzione) — font grande/bold + spacing ---------
-async function printComandaSlip(title, order) {
-  const sock = await openSocket();
+// --- Stampa COMANDA (centro produzione) — layout "classic" -------------------
+async function printComandaSlipClassic(title, order, cfg) {
+  const sock = await openSocket(cfg);
 
   // init + set leggibilità (Font A, spaziatura righe, leggera spaziatura caratteri, codepage)
   init(sock);
@@ -358,16 +384,106 @@ async function printComandaSlip(title, order) {
 
   resetLineSpacing(sock);
   charSpacing(sock, 0);
-  cutIfEnabled(sock);
+  cutIfEnabled(sock, cfg);
   sock.end();
 }
 
-async function printOrderDual(orderFull) {
-  if (PRINTER_ENABLED !== 'true') {
+// --- Stampa COMANDA (centro produzione) — layout "mcd" -----------------------
+async function printComandaSlipMcd(title, order, cfg) {
+  const sock = await openSocket(cfg);
+
+  init(sock);
+  codepageCP1252(sock);
+  fontA(sock);
+  setLineSpacing(sock, 32);
+  charSpacing(sock, 0);
+
+  // Header grande e pulito
+  alignCenter(sock);
+  sizeBig(sock); boldOn(sock); writeLine(sock, `ORD. #${order.id}`); boldOff(sock);
+
+  const fulfillment = resolveFulfillment(order);
+  if (fulfillment === 'table') {
+    const room = extractRoomLabel(order);
+    const table = extractTableLabel(order);
+    const label = table || room || 'TAVOLO';
+    sizeBig(sock); boldOn(sock); writeLine(sock, label.toUpperCase()); boldOff(sock);
+  } else if (fulfillment === 'delivery') {
+    sizeBig(sock); boldOn(sock); writeLine(sock, 'DOMICILIO'); boldOff(sock);
+  } else {
+    sizeBig(sock); boldOn(sock); writeLine(sock, 'ASPORTO'); boldOff(sock);
+  }
+
+  sizeNormal(sock);
+  alignCenter(sock);
+  writeLine(sock, '------------------------------');
+
+  // Orario ritiro/consegna
+  if (order.scheduled_at) {
+    const label = fulfillment === 'delivery' ? 'Consegna' : 'Ritiro';
+    writeLine(sock, `${label}: ${fmtComandaDate(order.scheduled_at)}`);
+  } else {
+    writeLine(sock, fmtComandaDate(order.created_at || new Date().toISOString()));
+  }
+
+  alignLeft(sock);
+  writeLine(sock, '------------------------------');
+
+  // Corpo: QTY + NOME (senza prezzi) + note sotto riga
+  for (const it of order.items || []) {
+    const qty = Math.max(1, Number(it.qty) || 1);
+    const qtyTxt = qtyStr(qty);
+    const name = (it.name || '').toString().trim();
+    const nameLines = wrapText(name, COMANDA_MAX_COLS - 4);
+
+    if (nameLines.length) {
+      writeLine(sock, `${qtyTxt} ${nameLines[0]}`);
+      for (const ln of nameLines.slice(1)) {
+        writeLine(sock, `   ${ln}`);
+      }
+    } else {
+      writeLine(sock, `${qtyTxt} (senza nome)`);
+    }
+
+    if (it.notes) {
+      const norm = normalizeNotesForKitchen(it.notes);
+      const noteLines = wrapText(`NOTE: ${norm}`, COMANDA_MAX_COLS - 4);
+      for (const ln of noteLines) {
+        writeLine(sock, `   ${ln}`);
+      }
+    }
+    writeLine(sock, '');
+  }
+
+  // Footer semplice
+  alignCenter(sock);
+  writeLine(sock, '------------------------------');
+  writeLine(sock, title.toUpperCase());
+  writeLine(sock, 'COMANDA');
+  writeLine(sock, '');
+
+  resetLineSpacing(sock);
+  charSpacing(sock, 0);
+  cutIfEnabled(sock, cfg);
+  sock.end();
+}
+
+// --- Facade: layout selezionabile (classic | mcd) ----------------------------
+async function printComandaSlip({ title, order, cfg, layoutKey = 'classic' }) {
+  const key = String(layoutKey || 'classic').trim().toLowerCase();
+  if (key === 'mcd') {
+    return printComandaSlipMcd(title, order, cfg);
+  }
+  return printComandaSlipClassic(title, order, cfg);
+}
+
+async function printOrderDual(orderFull, options = {}) {
+  const cfg = resolvePrintConfig(options.printerSettings);
+  if (cfg.PRINTER_ENABLED !== 'true') {
     logger.warn('🖨️  PRINT disabled (PRINTER_ENABLED=false)');
     return;
   }
-  const { pizzeria, kitchen } = splitByDept(orderFull.items || []);
+  const { pizzeria, kitchen } = splitByDept(orderFull.items || [], cfg);
   const head = {
     id: orderFull.id,
     customer_name: orderFull.customer_name,
@@ -389,28 +505,30 @@ async function printOrderDual(orderFull) {
   };
 
   if (pizzeria.length) {
-    await printSlip('PIZZERIA', { ...head, items: pizzeria });
+    await printSlip('PIZZERIA', { ...head, items: pizzeria }, cfg);
     logger.info('🖨️  PIZZERIA printed', { id: orderFull.id, items: pizzeria.length });
   }
   if (kitchen.length) {
-    await printSlip('CUCINA', { ...head, items: kitchen });
+    await printSlip('CUCINA', { ...head, items: kitchen }, cfg);
     logger.info('🖨️  CUCINA printed', { id: orderFull.id, items: kitchen.length });
   }
 }
 
 // 🆕 Stampa SOLO un centro (PIZZERIA | CUCINA) — usa la formattazione COMANDA
-async function printOrderForCenter(orderFull, center = 'PIZZERIA') {
-  if (PRINTER_ENABLED !== 'true') {
+async function printOrderForCenter(orderFull, center = 'PIZZERIA', options = {}) {
+  const cfg = resolvePrintConfig(options.printerSettings);
+  if (cfg.PRINTER_ENABLED !== 'true') {
     logger.warn('🧾 PRINT(comanda) disabled (PRINTER_ENABLED=false)');
     return;
   }
-  const { pizzeria, kitchen } = splitByDept(orderFull.items || []);
+  const { pizzeria, kitchen } = splitByDept(orderFull.items || [], cfg);
   const head = {
     id: orderFull.id,
     customer_name: orderFull.customer_name,
     phone: orderFull.phone,
     people: orderFull.people,
     scheduled_at: orderFull.scheduled_at,
+    created_at: orderFull.created_at,
     total: orderFull.total,
     note: orderFull.note,
     fulfillment: orderFull.fulfillment,
@@ -433,8 +551,18 @@ async function printOrderForCenter(orderFull, center = 'PIZZERIA') {
     logger.info('🧾 comanda skip (no items per centro)', { id: orderFull.id, center: which });
     return;
   }
-  await printComandaSlip(title, { ...head, items: payload }); // 👈 stile COMANDA
-  logger.info('🧾 comanda printed', { id: orderFull.id, center: which, items: payload.length });
+  await printComandaSlip({
+    title,
+    order: { ...head, items: payload },
+    cfg,
+    layoutKey: options?.layoutKey || 'classic',
+  }); // 👈 stile COMANDA
+  logger.info('🧾 comanda printed', {
+    id: orderFull.id,
+    center: which,
+    items: payload.length,
+    layoutKey: options?.layoutKey || 'classic',
+  });
 }
 
 module.exports = { printOrderDual, printOrderForCenter };

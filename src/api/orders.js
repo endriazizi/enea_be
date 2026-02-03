@@ -30,6 +30,16 @@ const router  = express.Router();
 
 const logger = require('../logger');
 const { query } = require('../db');
+const {
+  getPrintSettings,
+  savePrintSettings,
+} = require('../services/print-settings.service');
+const {
+  enqueuePrintJob,
+  listPrintJobs,
+  retryPrintJob,
+  cancelPrintJob,
+} = require('../services/print-jobs.service');
 
 // === requireAuth con fallback DEV ============================================
 let requireAuth;
@@ -167,6 +177,72 @@ function normalizeFulfillment(raw) {
   if (v === 'takeaway' || v === 'asporto' || v === 'take-away') return 'takeaway';
   if (v === 'delivery' || v === 'domicilio') return 'delivery';
   return null;
+}
+
+// ============================================================================
+// 🆕 Print Settings helpers (DB)
+// ============================================================================
+
+function toBool(raw, fallback = false) {
+  if (typeof raw === 'boolean') return raw;
+  if (raw == null) return fallback;
+  const s = String(raw).trim().toLowerCase();
+  if (s === 'true' || s === '1' || s === 'yes') return true;
+  if (s === 'false' || s === '0' || s === 'no') return false;
+  return fallback;
+}
+
+function buildPrinterConfigFromSettings(st) {
+  return {
+    PRINTER_ENABLED: st?.printer_enabled ? 'true' : 'false',
+    PRINTER_IP: st?.printer_ip || undefined,
+    PRINTER_PORT: st?.printer_port || undefined,
+  };
+}
+
+function resolveComandaCenter(raw, settings, order = null) {
+  // Se arriva un valore esplicito dal client, lo rispettiamo (ALL incluso)
+  if (raw != null && raw !== '') {
+    const c = String(raw).trim().toUpperCase();
+    if (c === 'PIZZERIA' || c === 'CUCINA' || c === 'ALL') return c;
+    return 'PIZZERIA';
+  }
+
+  // Default intelligente:
+  // - per ordine da tavolo → stampiamo entrambi i centri
+  // - per takeaway/delivery → usiamo il setting
+  const fulfillment = String(order?.fulfillment || '').toLowerCase();
+  if (fulfillment === 'table') return 'ALL';
+
+  const stCenter = String(settings?.takeaway_center || '').trim().toUpperCase();
+  if (stCenter === 'PIZZERIA' || stCenter === 'CUCINA') return stCenter;
+
+  // Fallback legacy (vecchio campo)
+  const legacy = String(settings?.takeaway_comanda_center || 'ALL').toUpperCase();
+  if (legacy === 'PIZZERIA' || legacy === 'CUCINA' || legacy === 'ALL') return legacy;
+
+  return 'PIZZERIA';
+}
+
+function resolveComandaLayout(raw, settings) {
+  if (raw != null && raw !== '') {
+    const v = String(raw).trim().toLowerCase();
+    return v === 'mcd' ? 'mcd' : 'classic';
+  }
+  const st = String(settings?.comanda_layout || 'classic').trim().toLowerCase();
+  return st === 'mcd' ? 'mcd' : 'classic';
+}
+
+function resolveComandaCopies(raw, settings, order = null) {
+  const fulfillment = String(order?.fulfillment || '').toLowerCase();
+  // Copie: default 1 se tavolo, altrimenti usa setting
+  const base =
+    fulfillment === 'table'
+      ? 1
+      : Number(settings?.takeaway_copies || 1);
+  const n = Number(raw ?? base);
+  if (!Number.isFinite(n)) return Math.min(3, Math.max(1, base));
+  return Math.min(3, Math.max(1, Math.trunc(n)));
 }
 
 // ============================================================================
@@ -1659,8 +1735,19 @@ router.post('/:id(\\d+)/print', async (req, res) => {
       note: 'CONTO',
     });
 
+    const st = await getPrintSettings();
+    const printerConfig = buildPrinterConfigFromSettings(st);
+
+    if (!st.printer_enabled) {
+      return res.status(502).json({
+        ok    : false,
+        error : 'printer_disabled',
+        reason: 'printer_disabled',
+      });
+    }
+
     try {
-      await printOrderDual(full);
+      await printOrderDual(full, { printerSettings: printerConfig });
       logger.info('🖨️ orders print OK', { id });
       return res.json({ ok: true });
     } catch (e) {
@@ -1689,22 +1776,33 @@ async function handlePrintComanda(req, res) {
       return res.status(404).json({ ok: false, error: 'not_found' });
     }
 
-    const centerRaw = (
-      (req.body && req.body.center) ||
-      (req.query && req.query.center) ||
-      'pizzeria'
-    )
-      .toString()
-      .toUpperCase();
+    const bestEffort = toBool(
+      (req.body && req.body.best_effort) ||
+        (req.query && req.query.best_effort),
+      false,
+    );
 
-    const center = centerRaw === 'CUCINA' ? 'CUCINA' : 'PIZZERIA';
-    const copies = Math.max(
-      1,
-      toNum(
-        (req.body && req.body.copies) ||
-          (req.query && req.query.copies),
-        1,
-      ),
+    const st = await getPrintSettings();
+    const printerConfig = buildPrinterConfigFromSettings(st);
+
+    const center = resolveComandaCenter(
+      (req.body && req.body.center) ||
+        (req.query && req.query.center) ||
+        null,
+      st,
+      full,
+    );
+    const copies = resolveComandaCopies(
+      (req.body && req.body.copies) ||
+        (req.query && req.query.copies),
+      st,
+      full,
+    );
+    const layoutKey = resolveComandaLayout(
+      (req.body && (req.body.layoutKey || req.body.layout_key)) ||
+        (req.query && (req.query.layoutKey || req.query.layout_key)) ||
+        null,
+      st,
     );
 
     // Tn: ogni volta che invio COMANDA registro un batch
@@ -1716,18 +1814,84 @@ async function handlePrintComanda(req, res) {
       note: `COMANDA:${center}`,
     });
 
+    if (!st.printer_enabled) {
+      if (bestEffort) {
+        let jobId = null;
+        try {
+          const job = await enqueuePrintJob({
+            kind: 'order_comanda',
+            orderId: id,
+            payload: { center, copies, layoutKey },
+            reason: 'printer_disabled',
+          });
+          jobId = job?.id || null;
+        } catch (qe) {
+          logger.warn('🧾🧵 enqueue job KO (printer disabled)', { error: String(qe) });
+        }
+        return res.json({
+          ok: true,
+          printed: false,
+          queued: !!jobId,
+          job_id: jobId,
+          warned: true,
+          reason: 'printer_unavailable',
+        });
+      }
+      return res.status(502).json({
+        ok    : false,
+        error : 'printer_disabled',
+        reason: 'printer_disabled',
+      });
+    }
+
     try {
       for (let i = 0; i < copies; i += 1) {
-        await printOrderForCenter(full, center);
+        if (center === 'ALL') {
+          await printOrderForCenter(full, 'PIZZERIA', {
+            printerSettings: printerConfig,
+            layoutKey,
+          });
+          await printOrderForCenter(full, 'CUCINA', {
+            printerSettings: printerConfig,
+            layoutKey,
+          });
+        } else {
+          await printOrderForCenter(full, center, {
+            printerSettings: printerConfig,
+            layoutKey,
+          });
+        }
       }
-      logger.info('🧾 comanda OK', { id, center, copies });
-      return res.json({ ok: true, center, copies });
+      logger.info('🧾 comanda OK', { id, center, copies, layoutKey });
+      return res.json({ ok: true, center, copies, layoutKey, printed: true });
     } catch (e) {
       logger.warn('🧾 comanda ⚠️', {
         id,
         center,
         error: String(e),
       });
+      if (bestEffort) {
+        let jobId = null;
+        try {
+          const job = await enqueuePrintJob({
+            kind: 'order_comanda',
+            orderId: id,
+            payload: { center, copies, layoutKey },
+            reason: String(e),
+          });
+          jobId = job?.id || null;
+        } catch (qe) {
+          logger.warn('🧾🧵 enqueue job KO', { error: String(qe) });
+        }
+        return res.json({
+          ok: true,
+          printed: false,
+          queued: !!jobId,
+          job_id: jobId,
+          warned: true,
+          reason: 'printer_unavailable',
+        });
+      }
       return res.status(502).json({
         ok    : false,
         error : 'printer_error',
@@ -1743,6 +1907,86 @@ async function handlePrintComanda(req, res) {
 // Alias: /print/comanda (nuovo) e /print-comanda (compat)
 router.post('/:id(\\d+)/print/comanda', handlePrintComanda);
 router.post('/:id(\\d+)/print-comanda', handlePrintComanda);
+
+// ============================================================================
+// /print-settings (GET/POST protetti)
+// ============================================================================
+
+router.get('/print-settings', requireAuth, async (_req, res) => {
+  try {
+    const data = await getPrintSettings();
+    res.set('Cache-Control', 'no-store');
+    return res.json({ ok: true, settings: data });
+  } catch (e) {
+    logger.error('⚠️ print_settings GET KO', { error: String(e) });
+    return res.status(500).json({ ok: false, error: 'print_settings_get_error' });
+  }
+});
+
+router.put('/print-settings', requireAuth, async (req, res) => {
+  try {
+    const next = await savePrintSettings(req.body || {});
+    res.set('Cache-Control', 'no-store');
+    return res.json({ ok: true, settings: next });
+  } catch (e) {
+    logger.error('⚠️ print_settings PUT KO', { error: String(e) });
+    return res.status(500).json({ ok: false, error: 'print_settings_put_error' });
+  }
+});
+
+// 🔙 Compat: POST legacy (manteniamo risposta coerente)
+router.post('/print-settings', requireAuth, async (req, res) => {
+  try {
+    const next = await savePrintSettings(req.body || {});
+    res.set('Cache-Control', 'no-store');
+    return res.json({ ok: true, settings: next });
+  } catch (e) {
+    logger.error('⚠️ print_settings POST KO', { error: String(e) });
+    return res.status(500).json({ ok: false, error: 'print_settings_post_error' });
+  }
+});
+
+// ============================================================================
+// /print-jobs (monitor + retry)
+// ============================================================================
+
+router.get('/print-jobs', requireAuth, async (req, res) => {
+  try {
+    const status = req.query?.status || null;
+    const limit = req.query?.limit || 50;
+    const rows = await listPrintJobs({ status, limit });
+    return res.json(rows);
+  } catch (e) {
+    logger.error('⚠️ print_jobs GET KO', { error: String(e) });
+    return res.status(500).json({ ok: false, error: 'print_jobs_get_error' });
+  }
+});
+
+router.post('/print-jobs/:id/retry', requireAuth, async (req, res) => {
+  try {
+    const id = toNum(req.params.id);
+    const out = await retryPrintJob(id);
+    return res.json(out);
+  } catch (e) {
+    const msg = String((e && e.message) || e);
+    const status = msg === 'invalid_id' ? 400 : 500;
+    logger.error('⚠️ print_jobs retry KO', { error: msg });
+    return res.status(status).json({ ok: false, error: 'print_jobs_retry_error' });
+  }
+});
+
+router.post('/print-jobs/:id/cancel', requireAuth, async (req, res) => {
+  try {
+    const id = toNum(req.params.id);
+    const out = await cancelPrintJob(id);
+    return res.json(out);
+  } catch (e) {
+    const msg = String((e && e.message) || e);
+    const status = msg === 'invalid_id' ? 400 : 500;
+    logger.error('⚠️ print_jobs cancel KO', { error: msg });
+    return res.status(status).json({ ok: false, error: 'print_jobs_cancel_error' });
+  }
+});
 
 // ============================================================================
 // /public-asporto-settings (GET pubblico, PUT protetto)
