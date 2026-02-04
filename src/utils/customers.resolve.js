@@ -114,6 +114,7 @@ async function resolveCustomerUserId(db, payload = {}) {
   try {
     let first = null;
     let last  = null;
+    let full  = null;
 
     if (displayName) {
       const parts = displayName.split(/\s+/);
@@ -121,6 +122,7 @@ async function resolveCustomerUserId(db, payload = {}) {
       if (parts.length > 1) {
         last = parts.slice(1).join(' ') || null;
       }
+      full = displayName;
     }
 
     const now = new Date();
@@ -145,6 +147,22 @@ async function resolveCustomerUserId(db, payload = {}) {
     );
 
     const id = result && result.insertId ? result.insertId : null;
+
+    // Best-effort: set full_name + name se disponibili (compat)
+    if (id && full) {
+      try {
+        await runQuery(
+          db,
+          'UPDATE users SET full_name = COALESCE(full_name, ?), name = COALESCE(name, ?) WHERE id = ?',
+          [full, full, id],
+        );
+      } catch (e) {
+        logger.warn('👥 resolveCustomerUserId: update full_name/name KO (continuo)', {
+          id,
+          error: String(e),
+        });
+      }
+    }
 
     logger.info('👥 resolveCustomerUserId: created new customer user', {
       id,

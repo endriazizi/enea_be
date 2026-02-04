@@ -15,6 +15,7 @@ const logger = require('../../logger');
 const {
   searchContacts,
   createContact,
+  updateContact,
   ensureAuth
 } = require('../../services/google.service');
 
@@ -58,6 +59,40 @@ router.post('/create', express.json(), async (req, res) => {
     }
     logger.error('👤❌ [Google] people.create failed', { error: String(e) });
     return res.status(500).json({ ok: false, message: 'create_failed' });
+  }
+});
+
+// PATCH /api/google/people/update — aggiorna contatto esistente (match da ricerca)
+// body: { resourceName, etag?, displayName?, givenName?, familyName?, email?, phone?, note? }
+router.patch('/update', express.json(), async (req, res) => {
+  const { resourceName, etag, displayName, givenName, familyName, email, phone, note } = req.body || {};
+
+  if (!resourceName || typeof resourceName !== 'string') {
+    return res.status(400).json({ ok: false, reason: 'resourceName_required' });
+  }
+
+  try {
+    const out = await updateContact({
+      resourceName,
+      etag,
+      displayName,
+      givenName,
+      familyName,
+      email,
+      phone,
+      note,
+    });
+    return res.json(out);
+  } catch (e) {
+    const code = e?.code || '';
+    if (code === 'consent_required') {
+      return res.status(401).json({ ok: false, reason: 'google_consent_required' });
+    }
+    if (code === 'write_scope_required') {
+      return res.status(403).json({ ok: false, reason: 'google_scope_write_required' });
+    }
+    logger.error('👤❌ [Google] people.update failed', { error: String(e) });
+    return res.status(500).json({ ok: false, message: 'update_failed' });
   }
 });
 

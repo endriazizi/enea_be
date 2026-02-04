@@ -304,57 +304,45 @@ async function updateUserById(id, { first, last, email, phone }) {
   await query(`UPDATE users SET ${fields.join(', ')} WHERE id=?`, params);
 }
 
-function normPhone(p) { return String(p || '').replace(/\D/g, ''); }
-function isPhoneMatch(a, b) {
-  const na = normPhone(a);
-  const nb = normPhone(b);
-  if (!na || !nb) return false;
-  if (na === nb) return true;
-  if (na.length >= 8 && nb.length >= 8) return na.slice(-8) === nb.slice(-8);
-  return false;
+async function loadUserForGoogle(userId, dto) {
+  if (!userId) return null;
+  const rows = await query(
+    `SELECT
+       id,
+       first_name,
+       last_name,
+       full_name,
+       name,
+       email,
+       phone,
+       note,
+       google_resource_name,
+       google_etag
+     FROM users
+     WHERE id = ? LIMIT 1`,
+    [userId],
+  );
+  const user = rows && rows[0] ? rows[0] : null;
+  if (!user) return null;
+
+  return {
+    ...user,
+    first_name: trimOrNull(dto.customer_first) || user.first_name,
+    last_name: trimOrNull(dto.customer_last) || user.last_name,
+    email: trimOrNull(dto.email) || user.email,
+    phone: trimOrNull(dto.phone) || user.phone,
+    note: trimOrNull(dto.google_note) || trimOrNull(dto.notes) || user.note,
+  };
 }
 
-async function syncGoogleContactOnCreate(dto, userId) {
-  const phone = trimOrNull(dto.phone);
-  if (!phone) return;
-
-  let items = [];
+async function upsertGoogleContactForUser(userId, dto) {
+  if (!userId) return;
   try {
-    items = await google.searchContacts(phone, 5);
+    const user = await loadUserForGoogle(userId, dto);
+    if (!user) return;
+    await google.upsertContactFromUser(user);
   } catch (e) {
-    logger.warn('👤⚠️ [Google] search failed', { error: String(e) });
-    return;
-  }
-
-  const match = (items || []).find((it) => isPhoneMatch(phone, it.phone));
-  if (!match?.resourceName) return;
-
-  // Aggiorna DB (utente locale) con dati recenti se abbiamo match Google
-  try {
-    await updateUserById(userId, {
-      first: dto.customer_first,
-      last : dto.customer_last,
-      email: dto.email,
-      phone: dto.phone,
-    });
-  } catch (e) {
-    logger.warn('👤⚠️ [DB] user update failed', { error: String(e), userId });
-  }
-
-  // Aggiorna il contatto Google (best-effort)
-  try {
-    await google.updateContact({
-      resourceName: match.resourceName,
-      etag: match.etag,
-      givenName: trimOrNull(dto.customer_first),
-      familyName: trimOrNull(dto.customer_last),
-      displayName: `${dto.customer_first || ''} ${dto.customer_last || ''}`.trim() || null,
-      email: trimOrNull(dto.email),
-      phone: trimOrNull(dto.phone),
-      note: trimOrNull(dto.google_note) || trimOrNull(dto.notes),
-    });
-  } catch (e) {
-    logger.warn('👤⚠️ [Google] update failed', { error: String(e), resourceName: match.resourceName });
+    logger.warn('👤⚠️ [Google] upsert failed', { error: String(e), userId });
   }
 }
 
@@ -394,12 +382,8 @@ async function create(dto, { user } = {}) {
   const created = await getById(res.insertId);
   logger.info('🆕 reservation created', { id: created.id, by: user?.email || null });
 
-  // Best-effort sync: se il numero matcha un contatto Google, aggiorno DB+Google
-  try {
-    await syncGoogleContactOnCreate(dto, userId);
-  } catch (e) {
-    logger.warn('👤⚠️ [Google] sync failed', { error: String(e) });
-  }
+  // Best-effort sync: upsert contatto Google
+  await upsertGoogleContactForUser(userId, dto);
 
   return created;
 }
@@ -464,6 +448,7 @@ async function update(id, dto, { user } = {}) {
   await query(`UPDATE reservations SET ${fields.join(', ')} WHERE id=?`, pr);
   const updated = await getById(id);
   logger.info('✏️ reservation updated', { id, by: user?.email || null });
+  await upsertGoogleContactForUser(updated?.user_id || userId, dto);
   return updated;
 }
 

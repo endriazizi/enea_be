@@ -5,10 +5,11 @@
     "main": "src/server.js",
     "scripts": {
         "start": "node src/server.js",
-        "dev": "cross-env NODE_ENV=development nodemon server.js"
+        "dev": "cross-env NODE_ENV=development NODE_OPTIONS=--max-old-space-size=512 nodemon server.js"
     },
     "dependencies": {
         "@ngrok/ngrok": "1.7.0",
+        "@whiskeysockets/baileys": "6.7.21",
         "bcryptjs": "3.0.2",
         "cors": "^2.8.5",
         "dotenv": "^16.4.5",

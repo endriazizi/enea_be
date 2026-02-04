@@ -17,6 +17,9 @@ const PRINT_SETTINGS_DEFAULTS = {
   takeaway_center: 'pizzeria',          // pizzeria | cucina
   takeaway_copies: 1,                   // 1..3
   takeaway_auto_print: true,
+  // === Nuovi default ========================================================
+  order_include_extras_in_total_default: true,
+  takeaway_force_invia_comanda: true,
   // 🔙 compat: campo legacy (se presente in DB)
   takeaway_comanda_center: 'ALL',
 };
@@ -41,6 +44,20 @@ function normalizePrintSettings(raw) {
     ? src.takeaway_auto_print
     : !!Number(
       src.takeaway_auto_print ?? PRINT_SETTINGS_DEFAULTS.takeaway_auto_print,
+    );
+
+  const includeExtrasDefault = typeof src.order_include_extras_in_total_default === 'boolean'
+    ? src.order_include_extras_in_total_default
+    : !!Number(
+      src.order_include_extras_in_total_default ??
+        PRINT_SETTINGS_DEFAULTS.order_include_extras_in_total_default,
+    );
+
+  const forceInviaComanda = typeof src.takeaway_force_invia_comanda === 'boolean'
+    ? src.takeaway_force_invia_comanda
+    : !!Number(
+      src.takeaway_force_invia_comanda ??
+        PRINT_SETTINGS_DEFAULTS.takeaway_force_invia_comanda,
     );
 
   // Layout comanda (classic | mcd)
@@ -86,31 +103,58 @@ function normalizePrintSettings(raw) {
     takeaway_center,
     takeaway_copies,
     takeaway_auto_print: autoPrint,
+    order_include_extras_in_total_default: includeExtrasDefault,
+    takeaway_force_invia_comanda: forceInviaComanda,
     takeaway_comanda_center,
   };
 }
 
 async function getPrintSettings() {
   try {
-    const rows = await query(
-      `SELECT
-         printer_enabled,
-         printer_ip,
-         printer_port,
-         comanda_layout,
-         takeaway_center,
-         takeaway_copies,
-         takeaway_auto_print,
-         takeaway_comanda_center
-       FROM print_settings
-       ORDER BY id ASC
-       LIMIT 1`,
-    );
-    const raw = rows && rows[0] ? rows[0] : null;
-    return {
-      ...normalizePrintSettings(raw || PRINT_SETTINGS_DEFAULTS),
-      _source: 'db',
-    };
+    try {
+      const rows = await query(
+        `SELECT
+           printer_enabled,
+           printer_ip,
+           printer_port,
+           comanda_layout,
+           takeaway_center,
+           takeaway_copies,
+           takeaway_auto_print,
+           order_include_extras_in_total_default,
+           takeaway_force_invia_comanda,
+           takeaway_comanda_center
+         FROM print_settings
+         ORDER BY id ASC
+         LIMIT 1`,
+      );
+      const raw = rows && rows[0] ? rows[0] : null;
+      return {
+        ...normalizePrintSettings(raw || PRINT_SETTINGS_DEFAULTS),
+        _source: 'db',
+      };
+    } catch (e) {
+      logger.warn('⚠️ print_settings load (legacy cols) KO', { error: String(e) });
+      const rowsLegacy = await query(
+        `SELECT
+           printer_enabled,
+           printer_ip,
+           printer_port,
+           comanda_layout,
+           takeaway_center,
+           takeaway_copies,
+           takeaway_auto_print,
+           takeaway_comanda_center
+         FROM print_settings
+         ORDER BY id ASC
+         LIMIT 1`,
+      );
+      const rawLegacy = rowsLegacy && rowsLegacy[0] ? rowsLegacy[0] : null;
+      return {
+        ...normalizePrintSettings(rawLegacy || PRINT_SETTINGS_DEFAULTS),
+        _source: 'db',
+      };
+    }
   } catch (e) {
     logger.warn('⚠️ print_settings load KO', { error: String(e) });
     return {
@@ -122,47 +166,95 @@ async function getPrintSettings() {
 
 async function savePrintSettings(next) {
   const p = normalizePrintSettings(next);
-  await query(
-    `INSERT INTO print_settings (
-       id,
-       printer_enabled,
-       printer_ip,
-       printer_port,
-       comanda_layout,
-       takeaway_center,
-       takeaway_copies,
-       takeaway_auto_print,
-       takeaway_comanda_center,
-       updated_at
-     ) VALUES (
-       1, ?, ?, ?, ?, ?, ?, ?, ?, UTC_TIMESTAMP()
-     )
-     ON DUPLICATE KEY UPDATE
-       printer_enabled = VALUES(printer_enabled),
-       printer_ip = VALUES(printer_ip),
-       printer_port = VALUES(printer_port),
-       comanda_layout = VALUES(comanda_layout),
-       takeaway_center = VALUES(takeaway_center),
-       takeaway_copies = VALUES(takeaway_copies),
-       takeaway_auto_print = VALUES(takeaway_auto_print),
-       takeaway_comanda_center = VALUES(takeaway_comanda_center),
-       updated_at = UTC_TIMESTAMP()`,
-    [
-      p.printer_enabled ? 1 : 0,
-      p.printer_ip,
-      p.printer_port,
-      p.comanda_layout,
-      p.takeaway_center,
-      p.takeaway_copies,
-      p.takeaway_auto_print ? 1 : 0,
-      p.takeaway_comanda_center,
-    ],
-  );
+  try {
+    await query(
+      `INSERT INTO print_settings (
+         id,
+         printer_enabled,
+         printer_ip,
+         printer_port,
+         comanda_layout,
+         takeaway_center,
+         takeaway_copies,
+         takeaway_auto_print,
+         order_include_extras_in_total_default,
+         takeaway_force_invia_comanda,
+         takeaway_comanda_center,
+         updated_at
+       ) VALUES (
+         1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, UTC_TIMESTAMP()
+       )
+       ON DUPLICATE KEY UPDATE
+         printer_enabled = VALUES(printer_enabled),
+         printer_ip = VALUES(printer_ip),
+         printer_port = VALUES(printer_port),
+         comanda_layout = VALUES(comanda_layout),
+         takeaway_center = VALUES(takeaway_center),
+         takeaway_copies = VALUES(takeaway_copies),
+         takeaway_auto_print = VALUES(takeaway_auto_print),
+         order_include_extras_in_total_default = VALUES(order_include_extras_in_total_default),
+         takeaway_force_invia_comanda = VALUES(takeaway_force_invia_comanda),
+         takeaway_comanda_center = VALUES(takeaway_comanda_center),
+         updated_at = UTC_TIMESTAMP()`,
+      [
+        p.printer_enabled ? 1 : 0,
+        p.printer_ip,
+        p.printer_port,
+        p.comanda_layout,
+        p.takeaway_center,
+        p.takeaway_copies,
+        p.takeaway_auto_print ? 1 : 0,
+        p.order_include_extras_in_total_default ? 1 : 0,
+        p.takeaway_force_invia_comanda ? 1 : 0,
+        p.takeaway_comanda_center,
+      ],
+    );
+  } catch (e) {
+    logger.warn('⚠️ print_settings save (legacy cols) KO', { error: String(e) });
+    await query(
+      `INSERT INTO print_settings (
+         id,
+         printer_enabled,
+         printer_ip,
+         printer_port,
+         comanda_layout,
+         takeaway_center,
+         takeaway_copies,
+         takeaway_auto_print,
+         takeaway_comanda_center,
+         updated_at
+       ) VALUES (
+         1, ?, ?, ?, ?, ?, ?, ?, ?, UTC_TIMESTAMP()
+       )
+       ON DUPLICATE KEY UPDATE
+         printer_enabled = VALUES(printer_enabled),
+         printer_ip = VALUES(printer_ip),
+         printer_port = VALUES(printer_port),
+         comanda_layout = VALUES(comanda_layout),
+         takeaway_center = VALUES(takeaway_center),
+         takeaway_copies = VALUES(takeaway_copies),
+         takeaway_auto_print = VALUES(takeaway_auto_print),
+         takeaway_comanda_center = VALUES(takeaway_comanda_center),
+         updated_at = UTC_TIMESTAMP()`,
+      [
+        p.printer_enabled ? 1 : 0,
+        p.printer_ip,
+        p.printer_port,
+        p.comanda_layout,
+        p.takeaway_center,
+        p.takeaway_copies,
+        p.takeaway_auto_print ? 1 : 0,
+        p.takeaway_comanda_center,
+      ],
+    );
+  }
   logger.info('🧾⚙️ [PrintSettings] saved', {
     comanda_layout: p.comanda_layout,
     takeaway_center: p.takeaway_center,
     takeaway_copies: p.takeaway_copies,
     takeaway_auto_print: p.takeaway_auto_print,
+    order_include_extras_in_total_default: p.order_include_extras_in_total_default,
+    takeaway_force_invia_comanda: p.takeaway_force_invia_comanda,
     printer_enabled: p.printer_enabled,
     printer_ip: p.printer_ip || null,
     printer_port: p.printer_port,

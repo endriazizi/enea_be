@@ -36,20 +36,40 @@ function tryLoadDotEnv() {
   }
 
   const cwd = process.cwd();
+  // Cartella backend (be/): env.js è in be/src, quindi __dirname/.. = be/
+  const backendRoot = path.resolve(__dirname, '..');
 
-  // ordine: più specifico → più generico
-  const candidates = [
-    `.env.${NODE_ENV}.local`,
-    `.env.${NODE_ENV}`,
-    `.env.local`,
-    `.env`,
-    // fallback “umani” (succede quando ci si salva .env con nome diverso)
-    `.env copy`,
-    `.env copy 2`,
-    `env/.env`,
-    `env/.env.${NODE_ENV}`,
-  ];
+  let loadedAny = false;
+  // 1) Base da be/: carica .env poi overlay .env.${NODE_ENV} così WHATSAPP_WEBQR_ENABLED non si perde
+  const baseEnv = path.join(backendRoot, '.env');
+  if (fs.existsSync(baseEnv)) {
+    try {
+      dotenv.config({ path: baseEnv });
+      loadedAny = true;
+    } catch (_) {}
+  }
+  const overlayEnv = path.join(backendRoot, `.env.${NODE_ENV}`);
+  if (fs.existsSync(overlayEnv)) {
+    try {
+      dotenv.config({ path: overlayEnv });
+      loadedAny = true;
+    } catch (_) {}
+  }
+  if (loadedAny) return { loaded: true, file: baseEnv };
 
+  // 2) Fallback: ordine storico da backendRoot
+  const candidates = [`.env.${NODE_ENV}.local`, `.env.${NODE_ENV}`, `.env.local`, `.env`, `.env copy`, `.env copy 2`, `env/.env`, `env/.env.${NODE_ENV}`];
+  for (const name of candidates) {
+    const full = path.join(backendRoot, name);
+    try {
+      if (fs.existsSync(full)) {
+        dotenv.config({ path: full });
+        return { loaded: true, file: full };
+      }
+    } catch (_) {}
+  }
+
+  // 3) Fallback: cwd
   for (const name of candidates) {
     const full = path.join(cwd, name);
     try {

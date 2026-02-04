@@ -95,6 +95,10 @@ if (ensureExists('api/customers', 'API /api/customers'))
 if (ensureExists('api/centralino', 'API /api/centralino'))
   app.use('/api/centralino', require('./api/centralino')(app));
 
+// 🆕 WhatsApp WebQR (BLOCCO 3 — stub: GET /status, /qr, POST /send)
+if (ensureExists('api/whatsapp-webqr', 'API /api/whatsapp-webqr'))
+  app.use('/api/whatsapp-webqr', require('./api/whatsapp-webqr'));
+
 // 🆕 Gift Vouchers (Buoni Regalo)
 if (ensureExists('api/gift-vouchers', 'API /api/gift-vouchers'))
   app.use('/api/gift-vouchers', require('./api/gift-vouchers')(app));
@@ -106,6 +110,10 @@ if (ensureExists('api/public-voucher', 'API /api/public/voucher'))
 // Health
 if (ensureExists('api/health', 'API /api/health'))
   app.use('/api/health', require('./api/health'));
+
+// [DEV] Support dev: POST /api/support/dev/restart (solo NODE_ENV!==production + DEV_ALLOW_RESTART=1)
+if (ensureExists('api/support.dev', 'API /api/support/dev'))
+  app.use('/api/support/dev', require('./api/support.dev'));
 
 // (Eventuali) Socket.IO
 const { Server } = require('socket.io');
@@ -141,6 +149,16 @@ if (ensureExists('db/migrator', 'DB migrator')) {
       }),
     );
 }
+
+// TASK E: error handler finale per loggare 500 e rispondere JSON
+app.use((err, _req, res, _next) => {
+  const path = _req?.path ?? _req?.url ?? '';
+  const method = _req?.method ?? '';
+  logger.error('[API] 💥 500', { path, method, err: String(err?.message || err) });
+  if (!res.headersSent) {
+    res.status(500).json({ ok: false, error: 'internal_error' });
+  }
+});
 
 server.listen(env.PORT, () =>
   logger.info(`🚀 HTTP listening on :${env.PORT}`),

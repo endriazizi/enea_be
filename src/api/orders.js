@@ -141,6 +141,19 @@ try {
   });
 }
 
+// Google Contacts upsert (best-effort)
+let upsertContactFromUser = async (_user) => null;
+try {
+  const g = require('../services/google.service');
+  if (typeof g?.upsertContactFromUser === 'function') {
+    upsertContactFromUser = g.upsertContactFromUser;
+  }
+} catch (e) {
+  logger.warn('ℹ️ [orders] google.service upsert non disponibile', {
+    error: String((e && e.message) || e),
+  });
+}
+
 // ============================================================================
 // Helpers
 // ============================================================================
@@ -177,6 +190,45 @@ function normalizeFulfillment(raw) {
   if (v === 'takeaway' || v === 'asporto' || v === 'take-away') return 'takeaway';
   if (v === 'delivery' || v === 'domicilio') return 'delivery';
   return null;
+}
+
+async function tryUpsertGoogleContactForOrder(customerUserId, dto) {
+  if (!customerUserId) return;
+  try {
+    const rows = await query(
+      `SELECT
+         id,
+         first_name,
+         last_name,
+         full_name,
+         name,
+         email,
+         phone,
+         note,
+         google_resource_name,
+         google_etag
+       FROM users
+       WHERE id = ? LIMIT 1`,
+      [customerUserId],
+    );
+    const user = rows && rows[0] ? rows[0] : null;
+    if (!user) return;
+
+    const customerName = (dto?.customer_name || '').toString().trim();
+    const merged = {
+      ...user,
+      full_name: customerName || user.full_name,
+      name: customerName || user.name,
+      email: dto?.email || user.email,
+      phone: dto?.phone || user.phone,
+    };
+    await upsertContactFromUser(merged);
+  } catch (e) {
+    logger.warn('👤⚠️ [orders] google upsert KO', {
+      error: String((e && e.message) || e),
+      customerUserId,
+    });
+  }
 }
 
 // ============================================================================
@@ -1436,6 +1488,12 @@ router.post('/', async (req, res) => {
           phone,
           displayName,
           customer_user_id,
+        });
+        // Best-effort: upsert contatto Google dopo resolve
+        await tryUpsertGoogleContactForOrder(customer_user_id, {
+          customer_name: dto.customer_name || displayName || null,
+          email,
+          phone,
         });
       }
     } catch (e) {

@@ -10,6 +10,7 @@
 'use strict';
 
 const { google } = require('googleapis');
+const crypto = require('crypto');
 // ✅ FIX path relativi dal folder /services → vai su ../logger e ../db:
 const logger = require('../logger');
 const { query } = require('../db');
@@ -174,8 +175,9 @@ async function createContact({ givenName, familyName, displayName, email, phone,
 
     const resp = await people.people.createContact({ requestBody });
     const resourceName = resp.data?.resourceName || null;
+    const etag = resp.data?.etag || null;
     logger.info('👤 [Google] contact created', { resourceName });
-    return { ok: true, resourceName };
+    return { ok: true, resourceName, etag };
   } catch (e) {
     const msg = String(e?.message || e);
     // se i token non includono scope write → 403 insufficient permissions
@@ -236,7 +238,304 @@ async function updateContact({ resourceName, etag, givenName, familyName, displa
 
   const updated = resp?.data || {};
   logger.info('👤 [Google] contact updated', { resourceName, fields: updateFields });
-  return { ok: true, resourceName: updated.resourceName || resourceName };
+  return { ok: true, resourceName: updated.resourceName || resourceName, etag: updated.etag || contactEtag };
+}
+
+// ----------------------------------------------------------------------------
+// Upsert "pro"
+// ----------------------------------------------------------------------------
+function normalizePhone(v) {
+  return String(v || '').replace(/\D+/g, '');
+}
+
+function isPhoneMatch(a, b) {
+  const na = normalizePhone(a);
+  const nb = normalizePhone(b);
+  if (!na || !nb) return false;
+  if (na === nb) return true;
+  if (na.length >= 8 && nb.length >= 8) return na.slice(-8) === nb.slice(-8);
+  return false;
+}
+
+function isEmailMatch(a, b) {
+  const ea = String(a || '').trim().toLowerCase();
+  const eb = String(b || '').trim().toLowerCase();
+  if (!ea || !eb) return false;
+  return ea === eb;
+}
+
+function buildContactPayloadFromUser(user) {
+  const first = String(user?.first_name || '').trim();
+  const last = String(user?.last_name || '').trim();
+  const full =
+    String(user?.full_name || '').trim() ||
+    String(user?.name || '').trim() ||
+    `${first} ${last}`.trim();
+
+  return {
+    givenName: first || undefined,
+    familyName: last || undefined,
+    displayName: full || undefined,
+    email: String(user?.email || '').trim() || undefined,
+    phone: String(user?.phone || '').trim() || undefined,
+    note: String(user?.note || '').trim() || undefined,
+  };
+}
+
+function buildLocalSnapshot(payload) {
+  return {
+    displayName: payload.displayName || null,
+    givenName: payload.givenName || null,
+    familyName: payload.familyName || null,
+    email: payload.email || null,
+    phone: payload.phone || null,
+    note: payload.note || null,
+  };
+}
+
+function buildHash(snapshot) {
+  const json = JSON.stringify(snapshot || {});
+  return crypto.createHash('sha256').update(json).digest('hex');
+}
+
+function toContactSnapshot(raw) {
+  return {
+    resourceName: raw?.resourceName || null,
+    etag: raw?.etag || null,
+    displayName: raw?.displayName || null,
+    givenName: raw?.givenName || null,
+    familyName: raw?.familyName || null,
+    email: raw?.email || null,
+    phone: raw?.phone || null,
+    note: raw?.note || null,
+  };
+}
+
+async function getContact(resourceName) {
+  if (!resourceName) return null;
+  const auth = await ensureAuth();
+  const people = peopleClient(auth);
+  const resp = await people.people.get({
+    resourceName,
+    personFields: 'names,emailAddresses,phoneNumbers,biographies',
+  });
+  const p = resp?.data || {};
+  const name = p.names?.[0] || {};
+  const email = p.emailAddresses?.[0] || {};
+  const phone = p.phoneNumbers?.[0] || {};
+  const bio = p.biographies?.[0] || {};
+  return toContactSnapshot({
+    resourceName: p.resourceName || resourceName,
+    etag: p.etag || null,
+    displayName: name.displayName || null,
+    givenName: name.givenName || null,
+    familyName: name.familyName || null,
+    email: email.value || null,
+    phone: phone.value || null,
+    note: bio.value || null,
+  });
+}
+
+function isEtagMismatchError(e) {
+  const code = e?.code || e?.response?.status || null;
+  if (code === 412 || code === 409) return true;
+  const msg = String(e?.message || e || '').toLowerCase();
+  return msg.includes('etag') || msg.includes('precondition');
+}
+
+function detectConflict(localSnap, googleSnap) {
+  if (!googleSnap) return false;
+  const localPhone = normalizePhone(localSnap?.phone);
+  const googlePhone = normalizePhone(googleSnap?.phone);
+  const phoneConflict =
+    localPhone && googlePhone && localPhone !== googlePhone;
+
+  const localEmail = String(localSnap?.email || '').trim().toLowerCase();
+  const googleEmail = String(googleSnap?.email || '').trim().toLowerCase();
+  const emailConflict =
+    localEmail && googleEmail && localEmail !== googleEmail;
+
+  const localName = String(localSnap?.displayName || '').trim().toLowerCase();
+  const googleName = String(googleSnap?.displayName || '').trim().toLowerCase();
+  const nameConflict =
+    localName && googleName && localName !== googleName;
+
+  return phoneConflict || emailConflict || nameConflict;
+}
+
+async function insertConflict(userId, localSnap, googleSnap) {
+  const localJson = JSON.stringify(localSnap || {});
+  const googleJson = JSON.stringify(googleSnap || {});
+  try {
+    const res = await query(
+      `INSERT INTO google_contact_conflicts
+        (user_id, local_snapshot_json, google_snapshot_json, status, created_at)
+       VALUES (?, ?, ?, 'pending', UTC_TIMESTAMP())`,
+      [userId, localJson, googleJson],
+    );
+    return res?.insertId || null;
+  } catch (e) {
+    logger.warn('👤⚠️ [Google] conflict insert KO', { error: String(e), userId });
+    return null;
+  }
+}
+
+async function updateUserGoogleMeta(userId, { resourceName, etag, hash }) {
+  if (!userId) return;
+  await query(
+    `UPDATE users
+     SET
+       google_resource_name = COALESCE(?, google_resource_name),
+       google_etag = COALESCE(?, google_etag),
+       google_sync_hash = COALESCE(?, google_sync_hash),
+       google_sync_at = UTC_TIMESTAMP()
+     WHERE id = ?`,
+    [resourceName || null, etag || null, hash || null, userId],
+  );
+}
+
+async function findBestMatchByPhoneEmail({ phone, email }) {
+  const items = [];
+  if (phone) {
+    const list = await searchContacts(phone, 10);
+    items.push(...(list || []));
+  }
+  if (email) {
+    const list = await searchContacts(email, 10);
+    items.push(...(list || []));
+  }
+  const byPhone = items.find((it) => isPhoneMatch(phone, it.phone));
+  if (byPhone) return toContactSnapshot(byPhone);
+  const byEmail = items.find((it) => isEmailMatch(email, it.email));
+  if (byEmail) return toContactSnapshot(byEmail);
+  return null;
+}
+
+async function upsertContactFromUser(user = {}) {
+  const userId = user?.id || null;
+  if (!userId) return { ok: false, reason: 'missing_user_id' };
+
+  const payload = buildContactPayloadFromUser(user);
+  const localSnap = buildLocalSnapshot(payload);
+  const hash = buildHash(localSnap);
+
+  if (!payload.phone && !payload.email && !payload.displayName) {
+    return { ok: false, reason: 'empty_payload' };
+  }
+
+  const resourceName = user.google_resource_name || null;
+  const etag = user.google_etag || null;
+
+  // 1) Se ho già resourceName → update con etag
+  if (resourceName) {
+    try {
+      const res = await updateContact({
+        resourceName,
+        etag,
+        ...payload,
+      });
+      await updateUserGoogleMeta(userId, {
+        resourceName: res.resourceName || resourceName,
+        etag: res.etag || etag,
+        hash,
+      });
+      return { ok: true, resourceName: res.resourceName || resourceName };
+    } catch (e) {
+      if (isEtagMismatchError(e)) {
+        const remote = await getContact(resourceName);
+        if (detectConflict(localSnap, remote)) {
+          const conflictId = await insertConflict(userId, localSnap, remote);
+          logger.warn('👤⚠️ [Google] conflict detected (etag mismatch)', {
+            userId,
+            resourceName,
+            conflictId,
+          });
+          return { ok: false, reason: 'conflict', conflictId };
+        }
+        try {
+          const res = await updateContact({
+            resourceName,
+            etag: remote?.etag || null,
+            ...payload,
+          });
+          await updateUserGoogleMeta(userId, {
+            resourceName: res.resourceName || resourceName,
+            etag: res.etag || remote?.etag || null,
+            hash,
+          });
+          return { ok: true, resourceName: res.resourceName || resourceName };
+        } catch (e2) {
+          logger.warn('👤⚠️ [Google] update retry failed', {
+            error: String(e2),
+            resourceName,
+          });
+          const conflictId = await insertConflict(userId, localSnap, remote);
+          return { ok: false, reason: 'update_failed', conflictId };
+        }
+      }
+      logger.warn('👤⚠️ [Google] update failed', { error: String(e), resourceName });
+      return { ok: false, reason: 'update_failed' };
+    }
+  }
+
+  // 2) Se non ho resourceName → search by phone/email
+  try {
+    const match = await findBestMatchByPhoneEmail({
+      phone: payload.phone,
+      email: payload.email,
+    });
+    if (match?.resourceName) {
+      await updateUserGoogleMeta(userId, {
+        resourceName: match.resourceName,
+        etag: match.etag || null,
+        hash,
+      });
+      if (detectConflict(localSnap, match)) {
+        const conflictId = await insertConflict(userId, localSnap, match);
+        logger.warn('👤⚠️ [Google] conflict detected (search match)', {
+          userId,
+          resourceName: match.resourceName,
+          conflictId,
+        });
+        return { ok: false, reason: 'conflict', conflictId };
+      }
+      try {
+        const res = await updateContact({
+          resourceName: match.resourceName,
+          etag: match.etag || null,
+          ...payload,
+        });
+        await updateUserGoogleMeta(userId, {
+          resourceName: res.resourceName || match.resourceName,
+          etag: res.etag || match.etag || null,
+          hash,
+        });
+        return { ok: true, resourceName: res.resourceName || match.resourceName };
+      } catch (e) {
+        logger.warn('👤⚠️ [Google] update after search failed', {
+          error: String(e),
+          resourceName: match.resourceName,
+        });
+        return { ok: false, reason: 'update_failed' };
+      }
+    }
+  } catch (e) {
+    logger.warn('👤⚠️ [Google] search failed', { error: String(e) });
+  }
+
+  // 3) create
+  try {
+    const res = await createContact(payload);
+    await updateUserGoogleMeta(userId, {
+      resourceName: res.resourceName || null,
+      etag: res.etag || null,
+      hash,
+    });
+    return { ok: true, resourceName: res.resourceName || null };
+  } catch (e) {
+    logger.warn('👤⚠️ [Google] create failed', { error: String(e) });
+    return { ok: false, reason: 'create_failed' };
+  }
 }
 
 module.exports = {
@@ -246,5 +545,7 @@ module.exports = {
   searchContacts,
   createContact,
   updateContact,
+  getContact,
+  upsertContactFromUser,
   revokeForOwner,
 };

@@ -26,6 +26,11 @@ module.exports = (app) => {
     return s === 'tasto1' || s === 'tasto 1' || s === 'tasto_1';
   }
 
+  function isTasto2(raw) {
+    const s = String(raw || '').trim().toLowerCase();
+    return s === 'tasto2' || s === 'tasto 2' || s === 'tasto_2';
+  }
+
   async function lookupCustomerByPhone(phoneRaw) {
     const digits = normDigits(phoneRaw);
     if (!digits) return null;
@@ -74,7 +79,10 @@ module.exports = (app) => {
       remark3,
     });
 
-    if (!isTasto1(remark)) {
+    const is1 = isTasto1(remark);
+    const is2 = isTasto2(remark);
+
+    if (!is1 && !is2) {
       return res.json({ ok: true, action: 'ignore' });
     }
 
@@ -120,7 +128,8 @@ module.exports = (app) => {
     if (customer?.first_name) params.set('customer_first', customer.first_name);
     if (customer?.last_name) params.set('customer_last', customer.last_name);
 
-    const url = `${base}/asporto?${params.toString()}`;
+    const path = is2 ? '/prenota' : '/asporto';
+    const url = `${base}${path}?${params.toString()}`;
     return res.redirect(302, url);
   });
 

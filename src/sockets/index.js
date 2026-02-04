@@ -32,6 +32,9 @@ function init(ioInstance) {
   ioInstance.on('connection', (socket) => {
     logger.info('🔌 SOCKET connected', { id: socket.id });
 
+    /** Registrazione room admins (usata da whatsapp-webqr e altre pagine admin). */
+    socket.on('register-admin', () => socket.join('admins'));
+
     socket.on('ping', () => {
       logger.info('🏓 ping from', { id: socket.id });
       socket.emit('pong');
@@ -80,6 +83,19 @@ function init(ioInstance) {
     }
   } catch (err) {
     logger.warn('📡 SOCKET channel nfc.session non disponibile', {
+      error: String(err),
+    });
+  }
+
+  // [WEBQR] WhatsApp WebQR: emit whatsapp-webqr:status, :qr, :error
+  try {
+    const webqrMod = require('./whatsapp-webqr');
+    if (webqrMod && typeof webqrMod.mount === 'function') {
+      webqrMod.mount(ioInstance);
+      logger.info('📡 SOCKET channel mounted: whatsapp-webqr');
+    }
+  } catch (err) {
+    logger.warn('📡 SOCKET channel whatsapp-webqr non disponibile', {
       error: String(err),
     });
   }

@@ -132,6 +132,12 @@ module.exports = (app) => {
   router.put('/:id(\\d+)', async (req, res) => {
     const id = Number(req.params.id);
     const { full_name, first_name, last_name, phone, email, note, tags, is_active } = req.body || {};
+
+    const first = (first_name ?? '').toString().trim();
+    const last = (last_name ?? '').toString().trim();
+    const full = (full_name ?? '').toString().trim();
+    const fullNameEffective = !full && (first || last) ? `${first} ${last}`.trim() : (full || null);
+
     try {
       await q(`
         UPDATE users SET
@@ -144,8 +150,17 @@ module.exports = (app) => {
           tags      = COALESCE(?, tags),
           is_active = COALESCE(?, is_active)
         WHERE id=?`,
-        [full_name, first_name, last_name, phone, email, note, tags,
-         ([0,1].includes(is_active)? is_active : null), id]);
+        [
+          fullNameEffective,
+          first_name,
+          last_name,
+          phone,
+          email,
+          note,
+          tags,
+          ([0,1].includes(is_active) ? is_active : null),
+          id,
+        ]);
       const out = (await q(`SELECT * FROM users WHERE id=?`, [id]))?.[0] || null;
       log.info('✏️  [Customers] update id=', id);
       res.json(out);
