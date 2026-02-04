@@ -194,6 +194,18 @@ const env = {
   },
 
   // ---------------------------------------------------------------------------
+  // TWILIO GATE (globale: WhatsApp + SMS — disattivabile via env senza toccare codice)
+  // Regola: Twilio è attivo solo se TWILIO_ENABLED=1 E credenziali minime presenti.
+  // Se mancano credenziali → forzare disabled + log warn (gestito in twilio.service).
+  // ---------------------------------------------------------------------------
+  TWILIO: {
+    // '0' | '1' — default non impostato: in twilio.service si deriva da presenza credenziali
+    enabledRaw: str(process.env.TWILIO_ENABLED, ''),
+    dryRun: bool(process.env.TWILIO_DRY_RUN, false),
+    blockReason: str(process.env.TWILIO_BLOCK_REASON, '').trim(),
+  },
+
+  // ---------------------------------------------------------------------------
   // WHATSAPP (TWILIO)
   // ---------------------------------------------------------------------------
   WA: {

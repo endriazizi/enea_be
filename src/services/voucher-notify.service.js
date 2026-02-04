@@ -10,6 +10,7 @@ const nodemailer = require('nodemailer');
 const logger = require('../logger');
 const env = require('../env');
 const wa = require('./whatsapp.service');
+const twilioService = require('./twilio.service');
 
 let _transport = null;
 function getTransporter() {
@@ -106,32 +107,20 @@ async function sendActivationEmail({ to, voucher, contact }) {
 }
 
 async function sendActivationSms({ to, voucher }) {
-  const sid = process.env.TWILIO_ACCOUNT_SID || env.WA?.accountSid || '';
-  const token = process.env.TWILIO_AUTH_TOKEN || env.WA?.authToken || '';
-  const from = process.env.SMS_FROM || process.env.TWILIO_SMS_FROM || '';
-  if (!sid || !token || !from) {
-    logger.warn('📱 [Voucher] SMS skipped (missing config)', { hasSid: !!sid, hasToken: !!token, hasFrom: !!from });
-    return { ok: false, reason: 'missing_config' };
-  }
   const dest = String(to || '').trim();
   if (!dest) return { ok: false, reason: 'no_recipient' };
-
-  let twilio;
-  try {
-    twilio = require('twilio')(sid, token);
-  } catch (e) {
-    logger.warn('📱 [Voucher] SMS skipped (twilio not available)', { error: String(e?.message || e) });
-    return { ok: false, reason: 'no_twilio' };
-  }
 
   const valueEUR = (Number(voucher?.value_cents || 0) / 100).toFixed(2);
   const validUntil = voucher?.valid_until ? fmtDateIt(voucher.valid_until) : '';
   const optUrl = buildOptOutUrl({ phone: dest, channel: 'sms' });
   const text = `Buono Regalo attivato. Valore ${valueEUR} EUR${validUntil ? `, valido fino al ${validUntil}` : ''}. Per disiscriverti rispondi STOP.${optUrl ? ` ${optUrl}` : ''}`;
 
-  const msg = await twilio.messages.create({ from, to: dest, body: text });
-  logger.info('📱 [Voucher] SMS sent', { to: dest, sid: msg?.sid });
-  return { ok: true, sid: msg?.sid };
+  const res = await twilioService.sendSms({ to: dest, body: text, meta: { kind: 'voucher_activation' } });
+  if (res.disabled) return { ok: true, disabled: true };
+  if (res.simulated) return { ok: true, simulated: true, sid: null };
+  if (!res.ok) return { ok: false, reason: res.reason || res.lastError || 'twilio_error' };
+  logger.info('📱 [Voucher] SMS sent', { to: dest, sid: res.sid ? res.sid.slice(0, 10) + '…' : '' });
+  return { ok: true, sid: res.sid };
 }
 
 async function sendMarketingConfirmEmail({ to, contact, token }) {
@@ -174,29 +163,17 @@ async function sendMarketingConfirmEmail({ to, contact, token }) {
 }
 
 async function sendMarketingConfirmSms({ to, token }) {
-  const sid = process.env.TWILIO_ACCOUNT_SID || env.WA?.accountSid || '';
-  const tokenEnv = process.env.TWILIO_AUTH_TOKEN || env.WA?.authToken || '';
-  const from = process.env.SMS_FROM || process.env.TWILIO_SMS_FROM || '';
-  if (!sid || !tokenEnv || !from) {
-    logger.warn('📱 [Voucher] confirm SMS skipped (missing config)', { hasSid: !!sid, hasToken: !!tokenEnv, hasFrom: !!from });
-    return { ok: false, reason: 'missing_config' };
-  }
   const dest = String(to || '').trim();
   if (!dest) return { ok: false, reason: 'no_recipient' };
 
-  let twilio;
-  try {
-    twilio = require('twilio')(sid, tokenEnv);
-  } catch (e) {
-    logger.warn('📱 [Voucher] confirm SMS skipped (twilio not available)', { error: String(e?.message || e) });
-    return { ok: false, reason: 'no_twilio' };
-  }
-
   const confirmUrl = buildOptInUrl(token);
   const text = `Conferma consenso marketing: ${confirmUrl}`;
-  const msg = await twilio.messages.create({ from, to: dest, body: text });
-  logger.info('📱 [Voucher] confirm SMS sent', { to: dest, sid: msg?.sid });
-  return { ok: true, sid: msg?.sid };
+  const res = await twilioService.sendSms({ to: dest, body: text, meta: { kind: 'voucher_confirm_sms' } });
+  if (res.disabled) return { ok: true, disabled: true };
+  if (res.simulated) return { ok: true, simulated: true, sid: null };
+  if (!res.ok) return { ok: false, reason: res.reason || res.lastError || 'twilio_error' };
+  logger.info('📱 [Voucher] confirm SMS sent', { to: dest, sid: res.sid ? res.sid.slice(0, 10) + '…' : '' });
+  return { ok: true, sid: res.sid };
 }
 
 async function sendMarketingConfirmWhatsapp({ to, token }) {
@@ -246,29 +223,17 @@ async function sendMarketingOptInEmail({ to, contact }) {
 }
 
 async function sendMarketingOptInSms({ to }) {
-  const sid = process.env.TWILIO_ACCOUNT_SID || env.WA?.accountSid || '';
-  const token = process.env.TWILIO_AUTH_TOKEN || env.WA?.authToken || '';
-  const from = process.env.SMS_FROM || process.env.TWILIO_SMS_FROM || '';
-  if (!sid || !token || !from) {
-    logger.warn('📱 [Voucher] marketing SMS skipped (missing config)', { hasSid: !!sid, hasToken: !!token, hasFrom: !!from });
-    return { ok: false, reason: 'missing_config' };
-  }
   const dest = String(to || '').trim();
   if (!dest) return { ok: false, reason: 'no_recipient' };
 
-  let twilio;
-  try {
-    twilio = require('twilio')(sid, token);
-  } catch (e) {
-    logger.warn('📱 [Voucher] marketing SMS skipped (twilio not available)', { error: String(e?.message || e) });
-    return { ok: false, reason: 'no_twilio' };
-  }
-
   const optUrl = buildOptOutUrl({ phone: dest, channel: 'sms' });
   const text = `Consenso marketing registrato. Per revocarlo rispondi STOP.${optUrl ? ` ${optUrl}` : ''}`;
-  const msg = await twilio.messages.create({ from, to: dest, body: text });
-  logger.info('📱 [Voucher] marketing SMS sent', { to: dest, sid: msg?.sid });
-  return { ok: true, sid: msg?.sid };
+  const res = await twilioService.sendSms({ to: dest, body: text, meta: { kind: 'voucher_marketing_optin' } });
+  if (res.disabled) return { ok: true, disabled: true };
+  if (res.simulated) return { ok: true, simulated: true, sid: null };
+  if (!res.ok) return { ok: false, reason: res.reason || res.lastError || 'twilio_error' };
+  logger.info('📱 [Voucher] marketing SMS sent', { to: dest, sid: res.sid ? res.sid.slice(0, 10) + '…' : '' });
+  return { ok: true, sid: res.sid };
 }
 
 async function sendMarketingOptInWhatsapp({ to }) {

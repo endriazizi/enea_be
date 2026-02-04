@@ -95,6 +95,43 @@ router.post('/mail/test', requireAuth, safeRoute('mail.test', async (req, res) =
 }));
 
 // ----------------------------------------------------------------------------
+// POST /whatsapp/twilio — FE invia { kind: 'reservation-pending', reservation } o { kind: 'order-created', order }
+// Se Twilio disabilitato: 200 { ok: true, disabled: true } (no regressione FE)
+// ----------------------------------------------------------------------------
+router.post('/whatsapp/twilio', requireAuth, safeRoute('whatsapp.twilio', async (req, res) => {
+  const kind = req.body?.kind || null;
+  const reservation = req.body?.reservation || null;
+  const order = req.body?.order || null;
+
+  if (kind === 'reservation-pending' && reservation) {
+    const phone = reservation.contact_phone || reservation.phone || null;
+    const name = [reservation.customer_first, reservation.customer_last].filter(Boolean).join(' ') || reservation.display_name || 'Cliente';
+    const start = reservation.start_at ? new Date(reservation.start_at) : null;
+    const dateStr = start ? new Intl.DateTimeFormat('it-IT', { weekday: 'long', day: '2-digit', month: '2-digit', year: 'numeric' }).format(start) : '';
+    const timeStr = start ? `${String(start.getHours()).padStart(2, '0')}:${String(start.getMinutes()).padStart(2, '0')}` : '';
+    const peopleStr = reservation.party_size != null ? String(reservation.party_size) : '';
+    const out = await wa.sendReservationConfirmTemplate({
+      to: phone,
+      name,
+      dateStr,
+      timeStr,
+      peopleStr,
+      reservationId: reservation.id || null,
+    });
+    return res.json(out);
+  }
+
+  if (kind === 'order-created' && order) {
+    const to = order.customer_phone || order.phone || order.contact_phone || null;
+    const text = (req.body?.text || 'Ordine ricevuto. Grazie.').toString().trim();
+    const out = await wa.sendText({ to, text });
+    return res.json(out);
+  }
+
+  return res.status(400).json({ ok: false, error: 'missing_kind_or_payload' });
+}));
+
+// ----------------------------------------------------------------------------
 // WA FREE TEXT (protetta) - dentro finestra 24h (se blocco attivo)
 // ----------------------------------------------------------------------------
 router.post('/wa/send', requireAuth, safeRoute('wa.send', async (req, res) => {

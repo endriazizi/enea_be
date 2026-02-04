@@ -31,6 +31,7 @@
 
 const logger = require('../logger');
 const env    = require('../env');
+const twilioService = require('./twilio.service');
 
 // ----------------------------------------------------------------------------
 // DB best-effort (se non c’è, fallback in-memory)
@@ -366,10 +367,10 @@ async function sendText(arg1, arg2, arg3) {
     return { ok: false, skipped: true, reason: 'disabled' };
   }
 
-  const client = getClient();
-  if (!client) {
-    logger.warn('📲 WA SKIPPED (client_unavailable)', { to: String(to || '') });
-    return { ok: false, skipped: true, reason: 'client_unavailable' };
+  // Gate Twilio globale: se disattivato via env, rispondiamo ok + disabled (no regressione FE)
+  if (!twilioService.isTwilioEnabled()) {
+    logger.warn('🛑 [TWILIO] disabled — skip sendWhatsApp to=+' + String(to || '').slice(0, 6) + '…');
+    return { ok: true, disabled: true };
   }
 
   const phone = normalizeToE164(to);
@@ -425,22 +426,26 @@ async function sendText(arg1, arg2, arg3) {
     body: CFG.logContent ? body : '[hidden]'
   });
 
-  const msg = await client.messages.create(payload);
+  const res = await twilioService.sendWhatsApp(payload, { toMask: phone, kind: 'free_text' });
+  if (res.disabled) return { ok: true, disabled: true };
+  if (res.simulated) return { ok: true, simulated: true };
+  if (!res.ok) return { ok: false, skipped: true, reason: res.reason || res.lastError || 'twilio_error' };
 
-  logger.info('📲 WA sendText OK ✅', { service: 'server', sid: msg.sid, to: phone });
+  const msgSid = res.sid;
+  logger.info('📲 WA sendText OK ✅', { service: 'server', sid: msgSid, to: phone });
 
   await insertWaMessage({
-    sid: msg.sid,
+    sid: msgSid,
     direction: 'out',
     kind: 'free_text',
     to_phone: phone,
     from_phone: fromWhatsAppAddress(waFrom),
     reservation_id: null,
-    status: msg.status || null,
+    status: null,
     payload_json: safeJson({ payload }),
   });
 
-  return { ok: true, sid: msg.sid, skipped: false, reason: null };
+  return { ok: true, sid: msgSid, skipped: false, reason: null };
 }
 
 // Alias compat
@@ -458,8 +463,10 @@ async function sendTemplate({ to, contentSid, variables = {}, kind = 'template',
 
   if (!CFG.enabled) return { ok: false, skipped: true, reason: 'disabled' };
 
-  const client = getClient();
-  if (!client) return { ok: false, skipped: true, reason: 'client_unavailable' };
+  if (!twilioService.isTwilioEnabled()) {
+    logger.warn('🛑 [TWILIO] disabled — skip sendTemplate kind=' + kind);
+    return { ok: true, disabled: true };
+  }
 
   const waFrom = _normalizeFrom(CFG.from);
   if (!waFrom) return { ok: false, skipped: true, reason: 'missing_from' };
@@ -482,29 +489,35 @@ async function sendTemplate({ to, contentSid, variables = {}, kind = 'template',
     contentSid
   });
 
-  const msg = await client.messages.create(payload);
+  const res = await twilioService.sendWhatsApp(payload, { toMask: phone, kind });
+  if (res.disabled) return { ok: true, disabled: true };
+  if (res.simulated) return { ok: true, simulated: true };
+  if (!res.ok) return { ok: false, skipped: true, reason: res.reason || res.lastError || 'twilio_error' };
 
+  const msgSid = res.sid;
   logger.info('📲 WA template OK ✅', {
     service: 'server',
-    sid: msg.sid,
+    sid: msgSid,
     to: phone,
     kind,
     reservationId: reservationId || null
   });
 
-  // IMPORTANTISSIMO: link SID template -> reservationId
-  await insertWaMessage({
-    sid: msg.sid,
-    direction: 'out',
-    kind,
-    to_phone: phone,
-    from_phone: fromWhatsAppAddress(waFrom),
-    reservation_id: reservationId,
-    status: msg.status || null,
-    payload_json: safeJson({ payload }),
-  });
+  // IMPORTANTISSIMO: link SID template -> reservationId (solo se invio reale)
+  if (msgSid) {
+    await insertWaMessage({
+      sid: msgSid,
+      direction: 'out',
+      kind,
+      to_phone: phone,
+      from_phone: fromWhatsAppAddress(waFrom),
+      reservation_id: reservationId,
+      status: null,
+      payload_json: safeJson({ payload }),
+    });
+  }
 
-  return { ok: true, sid: msg.sid, skipped: false, reason: null };
+  return { ok: true, sid: msgSid, skipped: false, reason: null };
 }
 
 // ----------------------------------------------------------------------------
@@ -554,6 +567,11 @@ async function sendStatusChange({ to, reservation, status, reason }) {
   if (!CFG.enabled) {
     logger.warn('📲 WA SKIPPED (disabled)', { id: reservation?.id });
     return { ok: false, skipped: true, reason: 'disabled' };
+  }
+
+  if (!twilioService.isTwilioEnabled()) {
+    logger.warn('🛑 [TWILIO] disabled — skip sendStatusChange id=' + (reservation?.id || ''));
+    return { ok: true, disabled: true };
   }
 
   const phone = normalizeToE164(to || reservation?.contact_phone || reservation?.phone);

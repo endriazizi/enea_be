@@ -1,8 +1,19 @@
 // src/api/health.js
 // Endpoints di diagnostica. /api/health/time mostra orari server+DB.
+// GET /api/health/twilio = stato gate Twilio (enabled, dryRun, reason, hasCreds).
 
 const router = require('express').Router();
 const { query } = require('../db');
+const twilioService = require('../services/twilio.service');
+
+router.get('/twilio', (_req, res) => {
+  try {
+    const state = twilioService.getHealthState();
+    res.json(state);
+  } catch (err) {
+    res.status(500).json({ ok: false, error: String(err) });
+  }
+});
 
 router.get('/time', async (_req, res) => {
   try {
