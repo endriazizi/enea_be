@@ -241,6 +241,23 @@ const env = {
   },
 
   // ---------------------------------------------------------------------------
+  // WHATSAPP TEMPLATE — Brand, Maps, Footer (prenotazione ricevuta)
+  // ---------------------------------------------------------------------------
+  WHATSAPP_TEMPLATE: {
+    brandName: str(process.env.BRAND_NAME, str(process.env.BIZ_NAME, 'Pizzeria La Lanterna')),
+    brandCity: str(process.env.BRAND_CITY, 'Castelraimondo'),
+    brandPhone: str(process.env.BRAND_PHONE, '0737642142'),
+    brandAddressLine: str(process.env.BRAND_ADDRESS_LINE, 'Largo della Libertà, 4'),
+    brandMapsQuery: str(process.env.BRAND_MAPS_QUERY, ''),
+    brandMapsUrl: str(process.env.BRAND_MAPS_URL, ''),
+    footerMode: str(process.env.WHATSAPP_FOOTER_MODE, 'no-reply'),
+    notificationsOnlyText: str(
+      process.env.WHATSAPP_NOTIFICATIONS_ONLY_TEXT,
+      'Questo numero WhatsApp è utilizzato solo per notifiche automatiche. Non è possibile rispondere a questo messaggio.'
+    ),
+  },
+
+  // ---------------------------------------------------------------------------
   // Debug helpers (safe: non stampare segreti)
   // ---------------------------------------------------------------------------
   _debugDbConfig() {

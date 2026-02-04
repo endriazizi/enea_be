@@ -99,6 +99,10 @@ if (ensureExists('api/centralino', 'API /api/centralino'))
 if (ensureExists('api/whatsapp-webqr', 'API /api/whatsapp-webqr'))
   app.use('/api/whatsapp-webqr', require('./api/whatsapp-webqr'));
 
+// 🆕 WhatsApp Templates (preview + send reservation-received)
+if (ensureExists('api/whatsapp-templates', 'API /api/whatsapp'))
+  app.use('/api/whatsapp', require('./api/whatsapp-templates'));
+
 // 🆕 Gift Vouchers (Buoni Regalo)
 if (ensureExists('api/gift-vouchers', 'API /api/gift-vouchers'))
   app.use('/api/gift-vouchers', require('./api/gift-vouchers')(app));
