@@ -101,6 +101,35 @@ async function connect(logger = console) {
       return content && typeof content === 'object' && ('url' in content || 'thumbnailDirectPath' in content);
     }
 
+    function toStringSafe(val) {
+      if (val == null) return null;
+      if (typeof val === 'string') return val;
+      if (Buffer.isBuffer(val)) return val.toString('utf8');
+      if (typeof val === 'object' && typeof val.toString === 'function') return String(val);
+      return null;
+    }
+
+    function getCaptionFromMessage(message) {
+      if (!message || typeof message !== 'object') return null;
+      const m = message.ephemeralMessage?.message || message.viewOnceMessage?.message || message.viewOnceMessageV2?.message || message;
+      const docWithCap = message.documentWithCaptionMessage || m?.documentWithCaptionMessage;
+      const cap = m?.imageMessage?.caption ?? m?.videoMessage?.caption ?? m?.documentMessage?.caption ?? docWithCap?.caption ?? null;
+      const str = toStringSafe(cap);
+      return (str != null && str.length > 0) ? str.trim().slice(0, 1024) : null;
+    }
+
+    /** Messaggio “contenuto”: unwrap ephemeral/viewOnce/documentWithCaption per leggere conversation/extendedText. */
+    function getContentMessage(message) {
+      if (!message || typeof message !== 'object') return message;
+      const inner =
+        message.ephemeralMessage?.message
+        || message.viewOnceMessage?.message
+        || message.viewOnceMessageV2?.message
+        || message.documentWithCaptionMessage?.message
+        || null;
+      return inner || message;
+    }
+
     sock.ev.on('messages.upsert', ({ type, messages }) => {
       if ((type !== 'notify' && type !== 'append') || !onMessageCb) return;
       const list = messages || [];
@@ -108,28 +137,44 @@ async function connect(logger = console) {
       for (const msg of list) {
         if (msg.key?.fromMe) continue;
         try {
-          const m = msg.message || {};
+          const rawTop = msg.message || {};
+          const m = getContentMessage(rawTop);
           const rawType = Object.keys(m).find(k => k !== 'messageContextInfo') || 'unknown';
           const isMedia = rawType !== 'conversation' && rawType !== 'extendedTextMessage';
-          let text = m.conversation || (m.extendedTextMessage && m.extendedTextMessage.text) || null;
-          if (text == null) text = isMedia ? '[media]' : '[non-text]';
+          let text = m.conversation ?? (m.extendedTextMessage && toStringSafe(m.extendedTextMessage.text)) ?? null;
+          if (text == null && isMedia) {
+            const caption = getCaptionFromMessage(msg.message);
+            text = caption || '[media]';
+            if (caption) logger.info(`${LOG} 📝 caption estratta`, { rawType, captionLen: caption.length, snippet: caption.slice(0, 50) });
+          }
+          if (text == null) text = '[non-text]';
+          const textStr = toStringSafe(text) || String(text);
           const from = msg.key.participant || msg.key.remoteJid || '';
           const fromNumber = (from && typeof from === 'string') ? from.replace(/\D/g, '').slice(-12) || from : '';
           const pushName = (msg.pushName && typeof msg.pushName === 'string') ? msg.pushName.trim() : null;
-          const mediaType = isMedia ? rawType.replace(/Message$/i, '') : null; // imageMessage -> image, videoMessage -> video, etc.
+          const mediaType = isMedia ? rawType.replace(/Message$/i, '') : null;
           const normalized = {
             id: msg.key?.id || `${Date.now()}-${Math.random().toString(36).slice(2)}`,
             ts: Number(msg.messageTimestamp) * 1000 || Date.now(),
             from,
             fromNumber: fromNumber || from,
             pushName: pushName || undefined,
-            text: String(text).slice(0, 1024),
+            text: textStr.slice(0, 1024),
             rawType,
             hasMedia: !!isMedia,
             mediaType: mediaType || undefined,
           };
           const canDownloadMedia = isMedia && hasDownloadableMedia(msg.message);
-          logger.info(`${LOG} 📩 message received`, { from: normalized.fromNumber, id: normalized.id, hasMedia: isMedia, canDownload: canDownloadMedia });
+          logger.info(`${LOG} 📩 message received`, {
+            from: normalized.fromNumber,
+            id: normalized.id,
+            rawType,
+            hasMedia: isMedia,
+            textLen: normalized.text.length,
+            textSnippet: normalized.text.slice(0, 60),
+            rawKeys: Object.keys(rawTop),
+            contentKeys: Object.keys(m),
+          });
           onMessageCb(normalized, canDownloadMedia ? msg : null);
         } catch (e) {
           logger.warn(`${LOG} ⚠️ message normalize KO`, e);
@@ -237,8 +282,9 @@ async function sendMessage(to, text, logger = console) {
     throw new Error('WhatsApp WebQR non connesso (status: ' + status + ')');
   }
   const jid = to.includes('@') ? to : `${to.replace(/\D/g, '')}@s.whatsapp.net`;
-  await sock.sendMessage(jid, { text });
+  const result = await sock.sendMessage(jid, { text });
   logger.info(`${LOG} 📤 send ok`, { to: jid });
+  return result;
 }
 
 function registerCallbacks({ onStatus, onQr, onError, onMessage, onMe }) {

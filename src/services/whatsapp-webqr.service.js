@@ -1,7 +1,9 @@
 // src/services/whatsapp-webqr.service.js
-// [WEBQR] Singleton: state in memoria (pairing/connected/disconnected), QR tenuto 90s dopo disconnect
-// per permettere alla UI di mostrarlo anche se la connessione rimbalza.
-// TASK 1: INSTANCE_ID per verificare che /status e /qr vedano la stessa istanza.
+// [WEBQR] Singleton: state in memoria (booting/pairing/open/disconnected).
+// REGOLA ANTI-FALSO-OK: "pronto per invio" SOLO con status === 'open'.
+// Baileys può risultare attivo ma non realmente open (handshake incompleto / creds stale).
+// Se non open, l'API risponde 409 WA_NOT_READY (no "ok" finto).
+// QR tenuto 90s dopo disconnect per permettere alla UI di mostrarlo.
 'use strict';
 
 const path = require('path');
@@ -9,6 +11,7 @@ const fs = require('fs');
 const provider = require('./provider.baileys');
 const logger = require('../logger');
 const { query } = require('../db');
+const { normalizePhoneIT, toBaileysJid } = require('../utils/normalize-phone-it');
 
 // Log a avvio modulo per verificare che .env sia letto (evita 503 per enabled=false)
 logger.info('[WEBQR] env', { WHATSAPP_WEBQR_ENABLED: process.env.WHATSAPP_WEBQR_ENABLED });
@@ -36,7 +39,8 @@ let _qrClearTimer = null;
 
 /**
  * State singleton in memoria: usato da API /status e /qr.
- * status: 'booting' | 'pairing' | 'connected' | 'disconnected' | 'disabled'
+ * status: 'booting' | 'pairing' | 'open' | 'connected' | 'disconnected' | 'disabled'
+ * INVIO CONSENTITO SOLO SE status === 'open' (source of truth per "pronto").
  */
 let state = {
   enabled: false,
@@ -44,12 +48,14 @@ let state = {
   qr: null,
   lastError: null,
   updatedAt: Date.now(),
-  /** Ultimo messaggio ricevuto: { at, from, textSnippet, id } per UI "Ultimo messaggio". */
+  /** Ultimo messaggio ricevuto: { at, from, textSnippet, id } per UI e GET /last-message. */
   lastMessage: null,
-  /** Info account connesso (quando status=connected): jid, number, numberHuman, pushName. */
+  /** Info account connesso (quando status=open): jid, numberRaw, numberHuman, pushName. */
   me: null,
   /** Incrementato a ogni reset per distinguere sessioni; messaggi portano sessionId. */
   sessionId: 0,
+  /** Ultimo tentativo di invio (debug + FE badge): { ts, toHuman, jid, ok, reason, msgId }. */
+  lastSendAttempt: null,
 };
 
 function enabled() {
@@ -70,6 +76,7 @@ function _emitStatus() {
     updatedAt: state.updatedAt,
     me: state.me,
     sessionId: state.sessionId,
+    lastSendAttempt: state.lastSendAttempt,
   });
 }
 
@@ -96,27 +103,26 @@ function start(ioInstance) {
   provider.registerCallbacks({
     onStatus: (payload) => {
       const raw = payload.status;
-      // Mappatura: ready -> connected, qr -> pairing, connecting -> booting
+      // Mappatura: ready -> open (SOLO open = pronto per invio), qr -> pairing, connecting -> booting
       if (raw === 'ready') {
-        state.status = 'connected';
+        state.status = 'open';
         state.qr = null;
         state.lastError = null;
         state.updatedAt = Date.now();
         _clearQrTimer();
-        logger.info('[WEBQR] ✅ connected');
-      }
-      if (raw === 'qr') {
+        logger.info('[WEBQR] 🟢 open (pronto per invio)');
+      } else if (raw === 'qr') {
         state.status = 'pairing';
         state.updatedAt = payload.updatedAt || Date.now();
-        // qr viene impostato da onQr
+        logger.info('[WEBQR] 🔳 pairing (QR pronto)');
       } else if (raw === 'connecting') {
         state.status = 'booting';
         state.updatedAt = payload.updatedAt || Date.now();
+        logger.info('[WEBQR] 🟡 booting');
       } else {
         state.status = 'disconnected';
         state.lastError = payload.lastError || state.lastError;
         state.updatedAt = payload.updatedAt || Date.now();
-        // IMPORTANTE: non azzerare subito state.qr; timer 90s così la UI riesce a visualizzarlo
         _clearQrTimer();
         _qrClearTimer = setTimeout(() => {
           state.qr = null;
@@ -125,7 +131,7 @@ function start(ioInstance) {
           if (_io) _io.to('admins').emit('whatsapp-webqr:status', { status: state.status, lastError: state.lastError, updatedAt: state.updatedAt });
           logger.info('[WEBQR] 🔳 QR azzerato dopo retention (disconnected)');
         }, QR_RETENTION_AFTER_DISCONNECT_MS);
-        logger.warn('[WEBQR] ⚠️ disconnected', { lastError: state.lastError });
+        logger.warn('[WEBQR] 🔴 disconnected', { lastError: state.lastError });
       }
       _emitStatus();
     },
@@ -153,12 +159,12 @@ function start(ioInstance) {
       _emitStatus();
     },
     onMessage: (message, rawMsg) => {
-      // Se riceviamo messaggi ma lo status era "disconnected", la connessione è attiva — allinea lo status (evita badge "disconnected" errato)
+      // Se riceviamo messaggi ma lo status era "disconnected", la connessione è attiva — allinea a open (evita badge "disconnected" errato)
       if (state.status === 'disconnected' && state.me) {
-        state.status = 'connected';
+        state.status = 'open';
         state.lastError = null;
         state.updatedAt = Date.now();
-        logger.info('[WEBQR] ✅ status → connected (msg ricevuto)');
+        logger.info('[WEBQR] 🟢 status → open (msg ricevuto)');
       }
       if (rawMsg && message.id) {
         _mediaMessages.set(message.id, rawMsg);
@@ -212,7 +218,7 @@ function isStarted() {
 
 function getStatus() {
   if (!enabled()) {
-    return { status: 'disabled', enabled: false, updatedAt: Date.now(), lastError: null, qr: null, me: null, sessionId: 0 };
+    return { status: 'disabled', enabled: false, updatedAt: Date.now(), lastError: null, qr: null, me: null, sessionId: 0, lastSendAttempt: null };
   }
   return {
     enabled: state.enabled,
@@ -222,6 +228,7 @@ function getStatus() {
     updatedAt: state.updatedAt,
     me: state.me || null,
     sessionId: state.sessionId ?? 0,
+    lastSendAttempt: state.lastSendAttempt || null,
   };
 }
 
@@ -333,16 +340,49 @@ async function getMediaBuffer(messageId) {
 }
 
 async function send({ to, text }) {
-  if (!enabled()) throw new Error('whatsapp_webqr_disabled');
-  await provider.sendMessage(to, text, logger);
-  // Se l’invio va a buon fine ma lo status era "disconnected", la connessione è attiva — allinea lo status
-  if (state.status === 'disconnected' && state.me) {
-    state.status = 'connected';
-    state.lastError = null;
-    state.updatedAt = Date.now();
-    logger.info('[WEBQR] ✅ status → connected (send ok)');
-    if (_io) _io.to('admins').emit('whatsapp-webqr:status', { status: state.status, lastError: null, updatedAt: state.updatedAt });
+  if (!enabled()) {
+    logger.warn('[WEBQR] send rifiutato: disabled');
+    throw Object.assign(new Error('whatsapp_webqr_disabled'), { code: 'WA_DISABLED' });
   }
+  if (state.status !== 'open') {
+    logger.warn('[WEBQR] send rifiutato: WA_NOT_READY', { status: state.status });
+    state.lastSendAttempt = { ts: Date.now(), toHuman: to, jid: null, ok: false, reason: 'WA_NOT_READY', msgId: null };
+    state.updatedAt = Date.now();
+    _emitStatus();
+    throw Object.assign(new Error('WA non pronto (status: ' + state.status + ')'), { code: 'WA_NOT_READY' });
+  }
+  let e164, jid;
+  try {
+    e164 = normalizePhoneIT(to);
+    jid = toBaileysJid(e164);
+  } catch (err) {
+    const code = (err && err.code) ? err.code : 'INVALID_PHONE';
+    logger.warn('[WEBQR] send: numero non valido', { to, code });
+    state.lastSendAttempt = { ts: Date.now(), toHuman: to, jid: null, ok: false, reason: code, msgId: null };
+    state.updatedAt = Date.now();
+    _emitStatus();
+    throw err;
+  }
+  const toHuman = e164.replace(/(\d{2})(\d{3})(\d{3})(\d{4})/, '+$1 $2 $3 $4').trim() || e164;
+  logger.info('[WEBQR] tentativo invio', { toHuman, jid, preview: (text || '').toString().slice(0, 40) });
+  try {
+    const result = await provider.sendMessage(jid, text, logger);
+    const msgId = (result && result.key && result.key.id) ? result.key.id : null;
+    state.lastSendAttempt = { ts: Date.now(), toHuman, jid, ok: true, reason: null, msgId };
+    state.updatedAt = Date.now();
+    _emitStatus();
+    logger.info('[WEBQR] invio ok', { toHuman, msgId });
+    return { msgId };
+  } catch (err) {
+    const msg = (err && err.message) ? String(err.message) : String(err);
+    const reason = msg.indexOf('non connesso') !== -1 ? 'WA_NOT_READY' : 'SEND_FAILED';
+    state.lastSendAttempt = { ts: Date.now(), toHuman, jid, ok: false, reason, msgId: null };
+    state.updatedAt = Date.now();
+    _emitStatus();
+    logger.warn('[WEBQR] invio fallito', { toHuman, reason });
+    throw err;
+  }
+  // Se l’invio va a buon fine ma lo status era "disconnected", la connessione è attiva — allinea lo status
 }
 
 function shutdown() {
@@ -362,14 +402,36 @@ function shutdown() {
     lastMessage: null,
     me: null,
     sessionId: preservedSessionId,
+    lastSendAttempt: null,
   };
+}
+
+/** Soft restart: shutdown + start (ricrea socket senza cancellare auth). */
+function restart(ioInstance) {
+  logger.info('[WEBQR] 🔁 restart requested', { statusPre: state.status });
+  shutdown();
+  if (ioInstance && enabled()) {
+    start(ioInstance);
+  }
+  logger.info('[WEBQR] 🔁 restart done', { statusPost: state.status });
+}
+
+/** Ultimo messaggio ricevuto (per GET /last-message debug). */
+function getLastMessage() {
+  return state.lastMessage || null;
 }
 
 /**
  * Reset: shutdown, cancella cartella auth (sessione corrotta), riavvia il service.
- * Utile per ripartire pulito. Chiamare con io (es. require('../sockets').io()).
+ * Consentito solo se WA_RESET_ENABLED=1 o NODE_ENV=development.
  */
 function reset(ioInstance) {
+  const allowReset = String(process.env.WA_RESET_ENABLED || '0') === '1' ||
+    process.env.NODE_ENV === 'development';
+  if (!allowReset) {
+    logger.warn('[WEBQR] ❌ reset rifiutato: WA_RESET_ENABLED non attivo e NODE_ENV!=development');
+    throw Object.assign(new Error('reset non consentito'), { code: 'RESET_DISABLED' });
+  }
   logger.info('[WEBQR] ♻️ reset requested');
   // Azzera buffer messaggi, lastMessage, qr, lastError, me; incrementa sessionId per distinguere sessioni
   state.sessionId = (state.sessionId ?? 0) + 1;
@@ -434,8 +496,10 @@ module.exports = {
   getMessagesForApi,
   getMediaMessage,
   getMediaBuffer,
+  getLastMessage,
   send,
   shutdown,
+  restart,
   reset,
   getDebugInfo,
   INSTANCE_ID,
