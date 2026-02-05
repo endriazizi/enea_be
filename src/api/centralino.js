@@ -21,15 +21,17 @@ module.exports = (app) => {
 
   const normDigits = (v) => String(v || '').replace(/\D+/g, '');
 
-  function isTasto1(raw) {
-    const s = String(raw || '').trim().toLowerCase();
-    return s === 'tasto1' || s === 'tasto 1' || s === 'tasto_1';
+  /** Normalizza remark: lowerCase + trim + rimuovi spazi (es: "Tasto 3" => "tasto3") */
+  function normRemark(raw) {
+    return String(raw || '').trim().toLowerCase().replace(/\s+/g, '').replace(/_/g, '');
   }
 
-  function isTasto2(raw) {
-    const s = String(raw || '').trim().toLowerCase();
-    return s === 'tasto2' || s === 'tasto 2' || s === 'tasto_2';
-  }
+  const ROUTE_PRENOTAZIONE = '/prenota';
+  const routeByRemark = {
+    tasto1: '/asporto',
+    tasto2: ROUTE_PRENOTAZIONE,
+    tasto3: '/scelta',
+  };
 
   async function lookupCustomerByPhone(phoneRaw) {
     const digits = normDigits(phoneRaw);
@@ -70,19 +72,13 @@ module.exports = (app) => {
     const calledid = String(req.query.calledid || '');
     const uniqueid = String(req.query.uniqueid || '');
 
-    log.info('📞 [Centralino] call', {
-      callerid,
-      calledid,
-      uniqueid,
-      remark,
-      remark2,
-      remark3,
-    });
+    const norm = normRemark(remark);
+    const chosenPath = routeByRemark[norm] || (norm ? null : routeByRemark.tasto1);
 
-    const is1 = isTasto1(remark);
-    const is2 = isTasto2(remark);
+    log.info('[CENTRALINO] 📞 call ricevuta callerid=' + callerid + ' remark=' + remark);
+    log.info('[CENTRALINO] 🧭 route scelta: ' + (chosenPath || '(ignore)'));
 
-    if (!is1 && !is2) {
+    if (!chosenPath) {
       return res.json({ ok: true, action: 'ignore' });
     }
 
@@ -128,8 +124,8 @@ module.exports = (app) => {
     if (customer?.first_name) params.set('customer_first', customer.first_name);
     if (customer?.last_name) params.set('customer_last', customer.last_name);
 
-    const path = is2 ? '/prenota' : '/asporto';
-    const url = `${base}${path}?${params.toString()}`;
+    const url = `${base}${chosenPath}?${params.toString()}`;
+    log.info('[CENTRALINO] 🔗 url finale: ' + url);
     return res.redirect(302, url);
   });
 
