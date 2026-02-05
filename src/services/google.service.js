@@ -69,12 +69,12 @@ async function revokeForOwner() {
 // Exchange 'code' (GIS popup) → tokens
 // ----------------------------------------------------------------------------
 async function exchangeCode(code) {
+  logger.info('[Google BE] exchangeCode: chiamata a Google getToken (redirect_uri=postmessage)');
   const { oAuth2Client } = getOAuthClient();
   // NB: con GIS popup serve passare redirect_uri='postmessage'
   const { tokens } = await oAuth2Client.getToken({ code, redirect_uri: 'postmessage' });
-  // Salvo anche expiry_date (numero ms epoch) se presente
   await saveTokens(tokens);
-  logger.info('🔐 [Google] Code exchanged, tokens saved', { has_refresh: !!tokens.refresh_token });
+  logger.info('[Google BE] exchangeCode OK, token salvati in google_tokens', { has_refresh: !!tokens.refresh_token });
   return tokens;
 }
 
@@ -85,6 +85,7 @@ async function exchangeCode(code) {
 async function ensureAuth() {
   const tokens = await loadTokens();
   if (!tokens?.refresh_token) {
+    logger.warn('[Google BE] ensureAuth: nessun refresh_token in DB → consent_required');
     const err = new Error('Consent required');
     err.code = 'consent_required';
     throw err;
@@ -98,18 +99,16 @@ async function ensureAuth() {
     expiry_date: tokens.expiry_date || undefined
   });
 
-  // se scaduto/assente → refresh
   const needsRefresh = !tokens.access_token || !tokens.expiry_date || (Date.now() >= Number(tokens.expiry_date) - 30_000);
   if (needsRefresh) {
+    logger.info('[Google BE] ensureAuth: access token scaduto/assente, refresh in corso');
     try {
       const newTokens = (await oAuth2Client.refreshAccessToken())?.credentials || {};
-      // persisto i nuovi token
       await saveTokens(newTokens);
       oAuth2Client.setCredentials(newTokens);
-      logger.info('🔄 [Google] access token refreshed');
+      logger.info('[Google BE] ensureAuth: access token refreshed OK');
     } catch (e) {
-      logger.error('🔄❌ [Google] token refresh failed', { error: String(e) });
-      // se fallisce il refresh, meglio richiedere nuovamente consenso
+      logger.error('[Google BE] ensureAuth: token refresh failed', { error: String(e) });
       const err = new Error('Consent required');
       err.code = 'consent_required';
       throw err;

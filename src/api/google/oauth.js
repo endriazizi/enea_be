@@ -10,14 +10,18 @@ const { exchangeCode } = require('../../services/google.service');
 // Scambia il "code" ottenuto dal popup GIS e persiste i token.
 router.post('/exchange', async (req, res) => {
   const code = String(req.body?.code || '');
-  if (!code) return res.status(400).json({ ok: false, message: 'Missing code' });
+  logger.info('[Google BE] POST /api/google/oauth/exchange ricevuto', { codeLength: code.length });
+  if (!code) {
+    logger.warn('[Google BE] OAuth exchange: code mancante');
+    return res.status(400).json({ ok: false, message: 'Missing code' });
+  }
 
   try {
     await exchangeCode(code);
-    logger.info('🔄 OAuth exchange OK');
+    logger.info('[Google BE] OAuth exchange OK, token salvati in google_tokens');
     return res.json({ ok: true });
   } catch (e) {
-    logger.error('🔄 OAuth exchange KO', { error: String(e) });
+    logger.error('[Google BE] OAuth exchange KO', { error: String(e) });
     return res.status(500).json({ ok: false, message: 'oauth_exchange_failed' });
   }
 });

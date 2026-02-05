@@ -66,7 +66,8 @@ module.exports = (app) => {
     }
 
     const callerid = String(req.query.callerid || '');
-    const remark = String(req.query.remark || '');
+    // MyCentralino può inviare marcatore1 invece di remark (campo "marcatore1" nella config)
+    const remark = String(req.query.remark || req.query.marcatore1 || '');
     const remark2 = String(req.query.remark2 || '');
     const remark3 = String(req.query.remark3 || '');
     const calledid = String(req.query.calledid || '');
