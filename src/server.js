@@ -27,6 +27,16 @@ app.set('logger', logger);
 app.use(express.json());
 app.use(cors({ origin: true, credentials: true }));
 
+// Consenti embed in iframe da altri siti (prenota = contenuto incorporabile)
+// Imposta Content-Security-Policy: frame-ancestors; default * (tutti). Su Plesk l’HTML è servito da Apache/Nginx: vedi docs/EMBED-IFRAME-PLESK.md
+const frameAncestors = (env.FRAME_ANCESTORS || '*').trim();
+if (frameAncestors) {
+  app.use((_req, res, next) => {
+    res.set('Content-Security-Policy', `frame-ancestors ${frameAncestors}`);
+    next();
+  });
+}
+
 function ensureExists(relPath, friendlyName) {
   const abs = path.join(__dirname, relPath);
   const ok =

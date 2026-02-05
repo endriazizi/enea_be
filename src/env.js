@@ -173,6 +173,12 @@ const env = {
   },
 
   // ---------------------------------------------------------------------------
+  // EMBED IFRAME (consentire ad altri siti di incorporare prenota.pizzerialalanterna.it)
+  // Content-Security-Policy: frame-ancestors. * = tutti; oppure elenco origini separate da spazio.
+  // ---------------------------------------------------------------------------
+  FRAME_ANCESTORS: str(process.env.FRAME_ANCESTORS, '*').trim(),
+
+  // ---------------------------------------------------------------------------
   // CENTRALINO (PBX → /asporto)
   // ---------------------------------------------------------------------------
   CENTRALINO_KEY: str(process.env.CENTRALINO_KEY, ''),
