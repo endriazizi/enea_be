@@ -39,16 +39,32 @@ try {
 // Risponde: { ok, text, mapsUrl, brand }
 // ----------------------------------------------------------------------------
 router.get('/templates/reservation-received/preview', requireAuth, (req, res) => {
+  const customer_first = (req.query.customer_first || '').toString().trim();
+  const customer_last = (req.query.customer_last || '').toString().trim();
   const name = (req.query.name || '').toString().trim() || 'Cliente';
-  const date = (req.query.date || '').toString().trim() || '04/02';
-  const time = (req.query.time || '').toString().trim() || '18:30';
+  const dateStr = (req.query.date || '').toString().trim();
+  const timeStr = (req.query.time || '').toString().trim() || '18:30';
   const people = Math.max(0, Math.floor(Number(req.query.people) || 2));
+  const phone = (req.query.phone || '').toString().trim();
+  const start_at = (req.query.start_at || '').toString().trim();
+  const booking_code = (req.query.booking_code || req.query.code || '').toString().trim();
+  const reservation_id = Number(req.query.reservation_id || req.query.reservationId);
+  const notes = (req.query.notes || '').toString().trim();
 
   const payload = {
+    customer_first: customer_first || undefined,
+    customer_last: customer_last || undefined,
     customerName: name,
-    dateStr: date,
-    timeStr: time,
+    dateStr: dateStr || undefined,
+    timeStr: timeStr,
     people,
+    phone: phone || undefined,
+    start_at: start_at || undefined,
+    booking_code: booking_code || undefined,
+    code: booking_code || undefined,
+    id: Number.isFinite(reservation_id) && reservation_id > 0 ? reservation_id : undefined,
+    reservationId: Number.isFinite(reservation_id) && reservation_id > 0 ? reservation_id : undefined,
+    notes: notes || undefined,
   };
 
   const cfg = env.WHATSAPP_TEMPLATE || {};
@@ -97,15 +113,18 @@ router.post('/send/reservation-received', requireAuth, async (req, res) => {
     }
   }
 
-  // Payload per builder: da reservation o da body
+  // Payload per builder: da reservation o da body (phone per mascheramento, id per codice)
   const payload = reservation
     ? {
         customer_first: reservation.customer_first,
         customer_last: reservation.customer_last,
         display_name: reservation.display_name,
+        phone: reservation.phone,
         start_at: reservation.start_at,
         party_size: reservation.party_size,
+        notes: reservation.notes,
         reservationId: reservation.id,
+        id: reservation.id,
       }
     : {
         customerName: req.body?.name || 'Cliente',

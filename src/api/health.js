@@ -25,12 +25,14 @@ router.get('/time', async (_req, res) => {
       envTZ: process.env.TZ || '(unset)'
     };
 
+    // 🕒 Diagnostica TZ DB: diff_session_vs_utc = NOW - UTC_TIMESTAMP (positivo = CET)
     const rows = await query(`
       SELECT 
-        NOW()              AS dbNowLocal, 
-        UTC_TIMESTAMP()    AS dbNowUTC,
-        @@time_zone        AS dbTimeZone,
-        TIMESTAMPDIFF(MINUTE, UTC_TIMESTAMP(), NOW()) AS dbOffsetMinutes
+        @@global.time_zone AS global_time_zone,
+        @@session.time_zone AS session_time_zone,
+        NOW()              AS now_session,
+        UTC_TIMESTAMP()    AS now_utc,
+        TIMEDIFF(NOW(), UTC_TIMESTAMP()) AS diff_session_vs_utc
     `);
 
     const db = rows && rows[0] ? rows[0] : {};

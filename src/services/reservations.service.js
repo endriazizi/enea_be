@@ -25,54 +25,68 @@ function toDayRange(fromYmd, toYmd) {
 }
 
 /**
- * Converte qualunque input (stringa ISO, Date, oppure 'YYYY-MM-DD HH:mm:ss'
- * locale) in una stringa MySQL DATETIME "YYYY-MM-DD HH:mm:ss" in **UTC**.
+ * 🕒 FIX TZ: DB è in CET (system_time_zone = CET).
+ * Converte qualunque input in stringa MySQL DATETIME "YYYY-MM-DD HH:mm:ss"
+ * in ORA LOCALE (CET/Europe/Rome) — NON più UTC.
  *
- * Pipeline che vogliamo:
- * - Il FE lavora in ORA LOCALE (Europe/Rome nel tuo caso).
- *   (logica gemella di toUTCFromLocalDateTimeInput sul FE: src/app/shared/utils.date.ts).
- * - Quando manda al BE valori tipo "2025-11-15T19:00" o "2025-11-15 19:00:00",
- *   qui li interpretiamo come locali e li convertiamo in UTC.
- * - Il DB è configurato con time_zone = '+00:00', quindi il DATETIME salvato
- *   è già UTC e quando lo rileggiamo/serializziamo va verso il FE come ISO con 'Z'.
+ * - Se start_at è già "YYYY-MM-DD HH:mm:ss" (senza Z/offset) → salva così com'è.
+ * - Se contiene 'Z' o offset (+/-) → converti a ORA LOCALE CET e serializza.
  */
 function isoToMysql(iso) {
   if (!iso) return null;
-  if (iso instanceof Date) return dateToMysqlUtc(iso);
+  if (iso instanceof Date) return dateToMysqlLocal(iso);
   const s = String(iso).trim();
 
-  // Se è già nel formato MySQL "YYYY-MM-DD HH:mm:ss" lo tratto come ORA LOCALE
-  // del ristorante e lo porto in UTC.
+  // Già "YYYY-MM-DD HH:mm:ss" (ora locale) → salva così
   const mysqlLike = /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/;
-  if (mysqlLike.test(s)) {
-    const [datePart, timePart] = s.split(' ');
-    const [y, m, d] = datePart.split('-').map((n) => parseInt(n, 10));
-    const [hh, mm, ss] = timePart.split(':').map((n) => parseInt(n, 10));
-    const local = new Date(y, m - 1, d, hh, mm, ss); // 👉 locale
-    if (!Number.isNaN(local.getTime())) return dateToMysqlUtc(local);
+  if (mysqlLike.test(s)) return s;
+
+  // Ha 'Z' o offset (+/-) → NON salvare diretto: converti a CET
+  const hasOffset = /Z$|[+-]\d{2}:?\d{2}$/.test(s);
+  if (hasOffset) {
+    const d = new Date(s);
+    if (!Number.isNaN(d.getTime())) return dateToMysqlLocalCET(d);
   }
 
-  // Per tutto il resto ("YYYY-MM-DDTHH:mm", ISO con 'Z', ecc.) lascio che il
-  // costruttore Date si arrangi. Se è senza 'Z' verrà interpretato come locale,
-  // se ha 'Z' è già UTC.
+  // "YYYY-MM-DDTHH:mm" (senza Z) → Date interpreta come locale, ok
   const d = new Date(s);
-  if (!Number.isNaN(d.getTime())) return dateToMysqlUtc(d);
+  if (!Number.isNaN(d.getTime())) return dateToMysqlLocal(d);
 
-  // Fallback compat per formati strani: mantengo il tuo vecchio comportamento.
   return s.replace('T', ' ').slice(0, 19);
 }
 
 /**
- * Helper interno: Date → stringa MySQL DATETIME in UTC.
+ * Date → "YYYY-MM-DD HH:mm:ss" in ORA LOCALE del server (getHours, getMonth, ecc.)
  */
-function dateToMysqlUtc(d) {
+function dateToMysqlLocal(d) {
   const pad = (n) => String(n).padStart(2, '0');
-  const y = d.getUTCFullYear();
-  const m = pad(d.getUTCMonth() + 1);
-  const day = pad(d.getUTCDate());
-  const hh = pad(d.getUTCHours());
-  const mm = pad(d.getUTCMinutes());
-  const ss = pad(d.getUTCSeconds());
+  const y = d.getFullYear();
+  const m = pad(d.getMonth() + 1);
+  const day = pad(d.getDate());
+  const hh = pad(d.getHours());
+  const mm = pad(d.getMinutes());
+  const ss = pad(d.getSeconds());
+  return `${y}-${m}-${day} ${hh}:${mm}:${ss}`;
+}
+
+/**
+ * Date → "YYYY-MM-DD HH:mm:ss" in Europe/Rome (CET).
+ * Usato quando il payload contiene ISO con Z o offset.
+ */
+function dateToMysqlLocalCET(d) {
+  const fmt = new Intl.DateTimeFormat('en-CA', {
+    timeZone: 'Europe/Rome',
+    year: 'numeric', month: '2-digit', day: '2-digit',
+    hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false,
+  });
+  const parts = fmt.formatToParts(d);
+  const pad = (n) => String(n).padStart(2, '0');
+  const y = parts.find((p) => p.type === 'year').value;
+  const m = pad(parts.find((p) => p.type === 'month').value);
+  const day = pad(parts.find((p) => p.type === 'day').value);
+  const hh = pad(parts.find((p) => p.type === 'hour').value);
+  const mm = pad(parts.find((p) => p.type === 'minute').value);
+  const ss = pad(parts.find((p) => p.type === 'second').value);
   return `${y}-${m}-${day} ${hh}:${mm}:${ss}`;
 }
 
@@ -117,8 +131,8 @@ function computeEndAtFromStart(startAtIso) {
   const localEnd = new Date(localStart.getTime() + addMin * 60 * 1000);
 
   return {
-    startMysql: dateToMysqlUtc(localStart),
-    endMysql  : dateToMysqlUtc(localEnd),
+    startMysql: dateToMysqlLocal(localStart),
+    endMysql  : dateToMysqlLocal(localEnd),
   };
 }
 
@@ -366,6 +380,15 @@ async function create(dto, { user } = {}) {
     ? { startMysql: isoToMysql(startIso), endMysql: isoToMysql(endIso) }
     : computeEndAtFromStart(startIso);
 
+  // 🧭 TZ DEBUG: diagnostica fuso orario prenotazioni
+  logger.info('🧭 TZ DEBUG', {
+    received: startIso,
+    normalized: startMysql,
+    newDateReceived: startIso ? new Date(startIso).toString() : null,
+    toISOString: startIso ? new Date(startIso).toISOString() : null,
+    serverTZ: Intl.DateTimeFormat().resolvedOptions().timeZone,
+  });
+
   const res = await query(
     `INSERT INTO reservations
       (customer_first, customer_last, phone, email,
@@ -410,6 +433,14 @@ async function update(id, dto, { user } = {}) {
       ? { startMysql: isoToMysql(dto.start_at), endMysql: isoToMysql(endIso) }
       : computeEndAtFromStart(dto.start_at);
     startMysql = c.startMysql; endMysql = c.endMysql;
+
+    logger.info('🧭 TZ DEBUG', {
+      received: dto.start_at,
+      normalized: startMysql,
+      newDateReceived: new Date(dto.start_at).toString(),
+      toISOString: new Date(dto.start_at).toISOString(),
+      serverTZ: Intl.DateTimeFormat().resolvedOptions().timeZone,
+    });
   }
   const fields = [], pr = [];
   if (userId !== null) { fields.push('user_id=?'); pr.push(userId); }

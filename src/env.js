@@ -256,10 +256,11 @@ const env = {
     brandAddressLine: str(process.env.BRAND_ADDRESS_LINE, 'Largo della Libertà, 4'),
     brandMapsQuery: str(process.env.BRAND_MAPS_QUERY, ''),
     brandMapsUrl: str(process.env.BRAND_MAPS_URL, ''),
+    privacyPolicyUrl: str(process.env.PRIVACY_POLICY_URL, 'https://www.iubenda.com/privacy-policy/90366241'),
     footerMode: str(process.env.WHATSAPP_FOOTER_MODE, 'no-reply'),
     notificationsOnlyText: str(
       process.env.WHATSAPP_NOTIFICATIONS_ONLY_TEXT,
-      'Questo numero WhatsApp è utilizzato solo per notifiche automatiche. Non è possibile rispondere a questo messaggio.'
+      'WhatsApp usato solo per notifiche di servizio.'
     ),
   },
 
