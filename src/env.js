@@ -185,6 +185,11 @@ const env = {
   CENTRALINO_REDIRECT_BASE: str(process.env.CENTRALINO_REDIRECT_BASE, ''),
 
   // ---------------------------------------------------------------------------
+  // PRENOTA — pagina "ci dispiace" quando prenotazioni online OFF
+  // ---------------------------------------------------------------------------
+  PRENOTA_PHONE_CALL: str(process.env.PRENOTA_PHONE_CALL, '0737642142'),
+
+  // ---------------------------------------------------------------------------
   // MAIL
   // ---------------------------------------------------------------------------
   MAIL: {

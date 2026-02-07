@@ -2104,7 +2104,9 @@ router.post('/print-jobs/:id/cancel', requireAuth, async (req, res) => {
 
 router.get('/public-asporto-settings', async (_req, res) => {
   try {
+    const env = require('../env');
     const data = await getPublicAsportoSettings();
+    data.prenota_phone_call = env.PRENOTA_PHONE_CALL || '0737642142';
     res.set('Cache-Control', 'no-store');
     return res.json(data);
   } catch (e) {
