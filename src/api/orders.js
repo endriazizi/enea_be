@@ -665,6 +665,7 @@ async function getOrderFullById(id) {
             i.qty,
             i.price,
             i.notes,
+            COALESCE(i.extra_total, 0) AS extra_total,
             i.created_at,
             COALESCE(c.name, 'Altro') AS category
      FROM order_items i
@@ -1088,6 +1089,7 @@ router.get('/', async (req, res) => {
          o.note,
          o.created_at,
          o.updated_at,
+         (SELECT COALESCE(SUM(i.qty), 0) FROM order_items i WHERE i.order_id = o.id) AS items_count,
          t.table_number,
          COALESCE(NULLIF(t.table_number, ''), CONCAT('T', t.id)) AS table_name,
          rm.id   AS room_id,
@@ -1346,6 +1348,7 @@ router.post('/:id(\\d+)/items', async (req, res) => {
         qty,
         price: priceNum,
         notes: it.notes || null,
+        extra_total: toNum(it.extra_total, 0),
       });
     }
 
@@ -1364,6 +1367,7 @@ router.post('/:id(\\d+)/items', async (req, res) => {
 
     // INSERT riga-per-riga (volumi contenuti, leggibile)
     for (const it of normalized) {
+      const extraTotal = toNum(it.extra_total, 0);
       const result = await query(
         `INSERT INTO order_items (
            order_id,
@@ -1371,9 +1375,10 @@ router.post('/:id(\\d+)/items', async (req, res) => {
            name,
            qty,
            price,
-           notes
+           notes,
+           extra_total
          )
-         VALUES (?,?,?,?,?,?)`,
+         VALUES (?,?,?,?,?,?,?)`,
         [
           id,
           it.product_id,
@@ -1381,6 +1386,7 @@ router.post('/:id(\\d+)/items', async (req, res) => {
           it.qty,
           it.price,
           it.notes,
+          extraTotal,
         ],
       );
       insertedRows += Number(result && result.affectedRows || 0);
@@ -1629,6 +1635,7 @@ router.post('/', async (req, res) => {
     const orderId = r.insertId;
 
     for (const it of items) {
+      const extraTotal = toNum(it.extra_total, 0);
       await query(
         `INSERT INTO order_items (
            order_id,
@@ -1636,9 +1643,10 @@ router.post('/', async (req, res) => {
            name,
            qty,
            price,
-           notes
+           notes,
+           extra_total
          )
-         VALUES (?,?,?,?,?,?)`,
+         VALUES (?,?,?,?,?,?,?)`,
         [
           orderId,
           it.product_id != null ? it.product_id : null,
@@ -1646,6 +1654,7 @@ router.post('/', async (req, res) => {
           toNum(it.qty, 1),
           toNum(it.price),
           it.notes || null,
+          extraTotal,
         ],
       );
     }
