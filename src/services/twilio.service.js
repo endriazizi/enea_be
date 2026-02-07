@@ -32,13 +32,17 @@ const token = (env.WA?.authToken || process.env.TWILIO_AUTH_TOKEN || '').trim();
 const smsFrom = (process.env.SMS_FROM || process.env.TWILIO_SMS_FROM || '').trim();
 
 const hasCreds = !!(sid && token);
+const disableTwilioEnv = !!(env.DISABLE_TWILIO || process.env.DISABLE_TWILIO === '1' || process.env.DISABLE_TWILIO === 'true');
 const enabledRaw = (env.TWILIO?.enabledRaw || process.env.TWILIO_ENABLED || '').toString().trim();
 const wantEnabled = enabledRaw === '1' || enabledRaw === 'true' || enabledRaw === 'yes';
 const explicitlyDisabled = enabledRaw === '0' || enabledRaw === 'false';
 
 // Default: 0 se mancano credenziali, altrimenti 1 solo se tutto presente (env non impostato = abilita se creds ok)
+// DISABLE_TWILIO=1 → override: forza disabled ovunque
 let _enabled = false;
-if (explicitlyDisabled) {
+if (disableTwilioEnv) {
+  _enabled = false;
+} else if (explicitlyDisabled) {
   _enabled = false;
 } else if (enabledRaw === '') {
   _enabled = hasCreds;
@@ -104,8 +108,8 @@ async function sendWhatsApp(payload, meta = {}) {
   const kind = meta.kind || 'whatsapp';
 
   if (!_enabled) {
-    const reason = blockReason || 'TWILIO_ENABLED=0';
-    logger.warn('🛑 [TWILIO] disabled — skip sendWhatsApp to=+' + toMask + ' reason=' + reason);
+    const reason = disableTwilioEnv ? 'DISABLE_TWILIO=1 (WhatsApp/Twilio disabilitato via env)' : (blockReason || 'TWILIO_ENABLED=0');
+    logger.warn('⛔ WhatsApp/Twilio disabilitato via env — skip sendWhatsApp', { to: toMask, reason });
     return { ok: true, disabled: true, reason };
   }
 
@@ -143,8 +147,8 @@ async function sendSms({ to, body, meta = {} }) {
   const kind = meta.kind || 'sms';
 
   if (!_enabled) {
-    const reason = blockReason || 'TWILIO_ENABLED=0';
-    logger.warn('🛑 [TWILIO] disabled — skip sendSms to=+' + toMask + ' reason=' + reason);
+    const reason = disableTwilioEnv ? 'DISABLE_TWILIO=1 (WhatsApp/Twilio disabilitato via env)' : (blockReason || 'TWILIO_ENABLED=0');
+    logger.warn('⛔ WhatsApp/Twilio disabilitato via env — skip sendSms', { to: toMask, reason });
     return { ok: true, disabled: true, reason };
   }
 

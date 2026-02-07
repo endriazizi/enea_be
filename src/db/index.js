@@ -50,6 +50,9 @@ function getPool() {
 
     // timeouts “umani”
     connectTimeout: 10_000,
+
+    // 🧭 FIX TZ: DATETIME/TIMESTAMP tornano come stringhe, NON come Date (evita toISOString → UTC)
+    dateStrings: true,
   });
 
   logger.info('🗄️  DB Pool created', {
@@ -60,6 +63,7 @@ function getPool() {
     user: user ? (String(user).slice(0, 2) + '…') : '',
     envFileLoaded: env._envFileLoaded || '(none)',
   });
+  logger.info('🧭 DB dateStrings enabled: true (DATETIME → stringa locale, no UTC ISO)');
 
   return _pool;
 }

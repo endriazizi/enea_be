@@ -200,6 +200,14 @@ const env = {
   },
 
   // ---------------------------------------------------------------------------
+  // DISABLE NOTIFICATIONS (override globale)
+  // DISABLE_TWILIO=1 → nessun WhatsApp/Twilio (override su TWILIO_ENABLED)
+  // DISABLE_EMAIL=1 → nessuna email prenotazione confermata
+  // ---------------------------------------------------------------------------
+  DISABLE_TWILIO: bool(process.env.DISABLE_TWILIO, false),
+  DISABLE_EMAIL: bool(process.env.DISABLE_EMAIL, false),
+
+  // ---------------------------------------------------------------------------
   // TWILIO GATE (globale: WhatsApp + SMS — disattivabile via env senza toccare codice)
   // Regola: Twilio è attivo solo se TWILIO_ENABLED=1 E credenziali minime presenti.
   // Se mancano credenziali → forzare disabled + log warn (gestito in twilio.service).

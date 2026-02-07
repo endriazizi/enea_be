@@ -159,21 +159,29 @@ router.put('/:id(\\d+)/status', requireAuth, async (req, res) => {
     // (2) ricarico riga “idratata”
     const updated = await svc.getById(id);
 
-    // (3) email best-effort
+    // (3) Email "PRENOTAZIONE CONFERMATA" — SOLO quando status passa a accepted
     try {
-      const mustNotify = (notify === true) || (notify === undefined && !!env.RESV?.notifyAlways);
-      if (mustNotify) {
-        const dest = toEmail || updated?.contact_email || updated?.email || null;
-        if (dest && mailer?.sendStatusChangeEmail) {
-          await mailer.sendStatusChangeEmail({
-            to: dest, reservation: updated, newStatus: updated.status, reason, replyTo
+      const dest = toEmail || updated?.contact_email || updated?.email || null;
+      if (updated?.status === 'accepted') {
+        if (env.DISABLE_EMAIL) {
+          logger.info('⛔ 📧 Email disabilitato via env (DISABLE_EMAIL=1)');
+        } else if (!dest) {
+          logger.info('ℹ️ 📧 Email mancante: skip', { id, note: 'cliente senza email' });
+        } else if (mailer?.sendReservationConfirmedEmail) {
+          const out = await mailer.sendReservationConfirmedEmail({
+            to: dest, reservation: updated, replyTo
           });
-          logger.info('📧 status-change mail ✅', { id, to: dest, status: updated.status });
+          if (out?.sent) {
+            logger.info('📧 Email inviata', { reservationId: id, to: dest });
+          } else {
+            logger.warn('⚠️ 📧 Email saltata', { id, reason: out?.reason || 'unknown' });
+          }
         } else {
-          logger.warn('📧 status-change mail SKIP (no email or mailer)', { id, status: updated?.status || '' });
+          logger.warn('⚠️ 📧 Email saltata — sendReservationConfirmedEmail non disponibile', { id });
         }
       }
-    } catch (e) { logger.error('📧 status-change mail ❌', { id, error: String(e) }); }
+      // NO email su: pending (create), rejected, cancelled, deleted
+    } catch (e) { logger.error('📧 Email errore', { id, error: String(e) }); }
 
     // (4) whatsapp best-effort
     try {

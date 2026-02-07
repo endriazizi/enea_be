@@ -4,6 +4,7 @@
 
 const router = require('express').Router();
 const { query } = require('../db');
+const logger = require('../logger');
 const twilioService = require('../services/twilio.service');
 
 router.get('/twilio', (_req, res) => {
@@ -16,18 +17,19 @@ router.get('/twilio', (_req, res) => {
 });
 
 router.get('/time', async (_req, res) => {
+  logger.info('🧪 TZ CHECK');
   try {
     const now = new Date();
     const app = {
-      nowLocal: now.toString(),          // locale del server
-      nowUTC: now.toISOString(),         // UTC
-      tzResolved: Intl.DateTimeFormat().resolvedOptions().timeZone || '(unknown)',
-      envTZ: process.env.TZ || '(unset)'
+      serverTZ: Intl.DateTimeFormat().resolvedOptions().timeZone || '(unknown)',
+      nodeNow: now.toString(),
+      nodeIso: now.toISOString(),
+      envTZ: process.env.TZ || '(unset)',
     };
 
-    // 🕒 Diagnostica TZ DB: diff_session_vs_utc = NOW - UTC_TIMESTAMP (positivo = CET)
+    // 🧪 TZ CHECK: diagnostica fuso orario DB (NOW − UTC_TIMESTAMP = diff CET)
     const rows = await query(`
-      SELECT 
+      SELECT
         @@global.time_zone AS global_time_zone,
         @@session.time_zone AS session_time_zone,
         NOW()              AS now_session,

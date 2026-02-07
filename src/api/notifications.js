@@ -208,18 +208,17 @@ router.post('/wa/inbound',
         const reservation = await reservationsSvc.getById(id).catch(() => null);
 
         if (reservation) {
-          // Best-effort notify (email + WA status change)
+          // Best-effort notify (email PRENOTAZIONE CONFERMATA solo se accepted + DISABLE_EMAIL non attivo)
           try {
-            if (reservation.contact_email) {
-              await mailer.sendStatusChangeEmail?.({
-                to: reservation.contact_email,
+            const toAddr = reservation.contact_email || reservation.email;
+            if (reservation.status === 'accepted' && toAddr && !env.DISABLE_EMAIL) {
+              await mailer.sendReservationConfirmedEmail?.({
+                to: toAddr,
                 reservation,
-                status: reservation.status,
-                reason: `Confermato da WhatsApp (${action})`
               });
             }
           } catch (e) {
-            logger.warn('⚠️ Email status change fallita (ok)', { service: 'server', error: String(e) });
+            logger.warn('⚠️ Email conferma fallita (ok)', { service: 'server', error: String(e) });
           }
 
           try {

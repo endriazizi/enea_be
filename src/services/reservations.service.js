@@ -206,6 +206,7 @@ async function list({ status, from, to, q } = {}) {
   if (range.from) { where.push('r.start_at >= ?'); params.push(range.from); }
   if (range.to)   { where.push('r.start_at <= ?'); params.push(range.to);   }
 
+  // 🧭 FIX TZ: DATE_FORMAT forza output "YYYY-MM-DD HH:mm:ss" (no UTC ISO)
   const sql = `
     SELECT
       r.id,
@@ -215,8 +216,8 @@ async function list({ status, from, to, q } = {}) {
       r.email,
       r.user_id,
       r.party_size,
-      r.start_at,
-      r.end_at,
+      DATE_FORMAT(r.start_at, '%Y-%m-%d %H:%i:%s') AS start_at,
+      DATE_FORMAT(r.end_at, '%Y-%m-%d %H:%i:%s') AS end_at,
       r.room_id,
       r.notes,
       r.status,
@@ -226,10 +227,10 @@ async function list({ status, from, to, q } = {}) {
       r.status_changed_at,
       r.client_token,
       r.table_id,
-      r.created_at,
-      r.updated_at,
-      r.checkin_at,
-      r.checkout_at,
+      DATE_FORMAT(r.created_at, '%Y-%m-%d %H:%i:%s') AS created_at,
+      DATE_FORMAT(r.updated_at, '%Y-%m-%d %H:%i:%s') AS updated_at,
+      DATE_FORMAT(r.checkin_at, '%Y-%m-%d %H:%i:%s') AS checkin_at,
+      DATE_FORMAT(r.checkout_at, '%Y-%m-%d %H:%i:%s') AS checkout_at,
       r.dwell_sec,
       u.first_name   AS user_first_name,
       u.last_name    AS user_last_name,
@@ -247,6 +248,7 @@ async function list({ status, from, to, q } = {}) {
 }
 
 async function getById(id) {
+  // 🧭 FIX TZ: DATE_FORMAT forza output "YYYY-MM-DD HH:mm:ss" (no UTC ISO)
   const sql = `
     SELECT
       r.id,
@@ -256,8 +258,8 @@ async function getById(id) {
       r.email,
       r.user_id,
       r.party_size,
-      r.start_at,
-      r.end_at,
+      DATE_FORMAT(r.start_at, '%Y-%m-%d %H:%i:%s') AS start_at,
+      DATE_FORMAT(r.end_at, '%Y-%m-%d %H:%i:%s') AS end_at,
       r.room_id,
       r.notes,
       r.status,
@@ -267,10 +269,10 @@ async function getById(id) {
       r.status_changed_at,
       r.client_token,
       r.table_id,
-      r.created_at,
-      r.updated_at,
-      r.checkin_at,
-      r.checkout_at,
+      DATE_FORMAT(r.created_at, '%Y-%m-%d %H:%i:%s') AS created_at,
+      DATE_FORMAT(r.updated_at, '%Y-%m-%d %H:%i:%s') AS updated_at,
+      DATE_FORMAT(r.checkin_at, '%Y-%m-%d %H:%i:%s') AS checkin_at,
+      DATE_FORMAT(r.checkout_at, '%Y-%m-%d %H:%i:%s') AS checkout_at,
       r.dwell_sec,
       u.first_name   AS user_first_name,
       u.last_name    AS user_last_name,
