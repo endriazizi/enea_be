@@ -276,11 +276,15 @@ function resolveComandaCenter(raw, settings, order = null) {
   return 'PIZZERIA';
 }
 
-function resolveComandaLayout(raw, settings) {
+function resolveComandaLayout(raw, settings, order = null) {
   if (raw != null && raw !== '') {
     const v = String(raw).trim().toLowerCase();
+    if (v === 'asporto' || v === 'mcd' || v === 'classic') return v;
     return v === 'mcd' ? 'mcd' : 'classic';
   }
+  // Ordini asporto: layout dedicato con caratteri grandi 80mm
+  const fulfillment = String(order?.fulfillment || '').toLowerCase();
+  if (fulfillment === 'takeaway') return 'asporto';
   const st = String(settings?.comanda_layout || 'classic').trim().toLowerCase();
   return st === 'mcd' ? 'mcd' : 'classic';
 }
@@ -353,6 +357,24 @@ function normalizePublicAsportoSettings(raw) {
     ? leadNum
     : PUBLIC_ASPORTO_DEFAULTS.asporto_lead_minutes;
 
+  // Da env: somma extra nel totale (default true) + toggle visibile (default false = nascosto)
+  const includeExtras =
+    typeof src.order_include_extras_in_total_default === 'boolean'
+      ? src.order_include_extras_in_total_default
+      : !!Number(
+        src.order_include_extras_in_total_default ??
+          process.env.ASPORTO_ORDER_INCLUDE_EXTRAS_IN_TOTAL ??
+          '1',
+      );
+  const showToggle =
+    typeof src.order_extra_show_toggle === 'boolean'
+      ? src.order_extra_show_toggle
+      : !!Number(
+        src.order_extra_show_toggle ??
+          process.env.ASPORTO_ORDER_EXTRA_SHOW_TOGGLE ??
+          '0',
+      );
+
   return {
     enable_public_asporto: enable,
     public_whatsapp_to: publicWhatsapp,
@@ -363,6 +385,8 @@ function normalizePublicAsportoSettings(raw) {
     whatsapp_show_prices: showPrices,
     public_asporto_allow_takeaway: allowTakeaway,
     public_asporto_allow_delivery: allowDelivery,
+    order_include_extras_in_total_default: includeExtras,
+    order_extra_show_toggle: showToggle,
   };
 }
 
@@ -676,6 +700,24 @@ async function getOrderFullById(id) {
     [id],
   );
 
+  // Extra/opzioni (AGGIUNGI/SENZA) per stampa comanda
+  const opts = await query(
+    `SELECT order_item_id, type, name FROM order_item_options
+     WHERE order_item_id IN (SELECT id FROM order_items WHERE order_id = ?)
+     ORDER BY order_item_id, id ASC`,
+    [id],
+  );
+  const optsByItem = new Map();
+  for (const o of opts || []) {
+    const oid = Number(o.order_item_id);
+    if (!optsByItem.has(oid)) optsByItem.set(oid, []);
+    optsByItem.get(oid).push({ type: o.type, name: o.name });
+  }
+  const itemsWithOpts = (items || []).map((r) => ({
+    ...r,
+    options: optsByItem.get(Number(r.id)) || [],
+  }));
+
   // Meta tavolo/sala
   const meta = await resolveLocationMeta(o);
   const resolvedTableId = (meta.table && meta.table.id) || o.table_id || null;
@@ -701,7 +743,7 @@ async function getOrderFullById(id) {
           room    : meta.room,
         }
       : null,
-    items,
+    items: itemsWithOpts,
   };
 }
 
@@ -1870,6 +1912,7 @@ async function handlePrintComanda(req, res) {
         (req.query && (req.query.layoutKey || req.query.layout_key)) ||
         null,
       st,
+      full,
     );
 
     // Tn: ogni volta che invio COMANDA registro un batch

@@ -83,12 +83,27 @@ async function loadOrderForPrint(orderId) {
     [orderId],
   );
 
+  const opts = await query(
+    `SELECT order_item_id, type, name
+     FROM order_item_options
+     WHERE order_item_id IN (SELECT id FROM order_items WHERE order_id = ?)
+     ORDER BY order_item_id, id ASC`,
+    [orderId],
+  );
+  const optsByItem = new Map();
+  for (const o of opts || []) {
+    const id = Number(o.order_item_id);
+    if (!optsByItem.has(id)) optsByItem.set(id, []);
+    optsByItem.get(id).push({ type: o.type, name: o.name });
+  }
+
   return {
     ...h,
     items: (items || []).map((r) => ({
       ...r,
       qty: Number(r.qty || 0),
       price: Number(r.price || 0),
+      options: optsByItem.get(Number(r.id)) || [],
     })),
   };
 }
@@ -275,9 +290,13 @@ async function processPrintQueueOnce({ limit } = {}) {
           : {};
         const centerRaw = String(payload?.center || 'ALL').toUpperCase();
         const copies = Math.max(1, Number(payload?.copies || 1));
-        const layoutKey = String(payload?.layoutKey || 'classic')
+        let layoutKey = String(payload?.layoutKey || 'classic')
           .trim()
           .toLowerCase();
+        // Fallback: ordine asporto → layout dedicato (caratteri grandi 80mm)
+        if (layoutKey === 'classic' && full && String(full.fulfillment || '').toLowerCase() === 'takeaway') {
+          layoutKey = 'asporto';
+        }
 
         const orderId = Number(job.order_id || 0);
         const full = await loadOrderForPrint(orderId);

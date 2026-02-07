@@ -8,6 +8,7 @@
 //   + spaziatura maggiore e wrapping note (leggibile per dislessia)
 //   + prezzi per riga (in piccolo) e totale finale (senza simbolo €)
 //   + orario “DOMENICA 10/11/2025  ore 04:42”
+// - layout ASPORTO: caratteri grandi (3x3) pizze+extra, font leggibile, 80mm
 // ============================================================================
 // Nota: manteniamo lo stile verboso con emoji nei log, come da progetto.
 // ============================================================================
@@ -65,6 +66,8 @@ function boldOff(sock){ sock.write(esc(0x1B,0x45,0x00)); }             // ESC E 
 function sizeNormal(sock){ sock.write(esc(0x1D,0x21,0x00)); }          // GS ! 0 (1x)
 function sizeTall(sock){ sock.write(esc(0x1D,0x21,0x01)); }            // GS ! 1 (2x altezza)
 function sizeBig(sock){ sock.write(esc(0x1D,0x21,0x11)); }             // GS ! 17 (2x larghezza+altezza)
+// sizeExtraLarge: 3x3 (GS ! n, n=(w-1)<<4|(h-1) = 0x22) — max leggibile 80mm
+function sizeExtraLarge(sock){ sock.write(esc(0x1D,0x21,0x22)); }     // GS ! 34 (3x3)
 function fontA(sock){ sock.write(esc(0x1B,0x4D,0x00)); }               // ESC M 0 → Font A (leggibile)
 function charSpacing(sock, n){ sock.write(esc(0x1B,0x20, Math.max(0,Math.min(255,n)))); } // ESC SP n
 function setLineSpacing(sock, n){ sock.write(esc(0x1B,0x33, Math.max(0,Math.min(255,n)))); } // ESC 3 n
@@ -97,7 +100,10 @@ function writeLine(sock, s) {
 
 // --- Layout/Wrap COMANDA -----------------------------------------------------
 const COMANDA_MAX_COLS = 42;        // stima sicura per 80mm con Font A
-const COMANDA_LINE_SP  = 48;        // spaziatura righe “larga” per leggibilità
+const COMANDA_LINE_SP  = 48;
+// Asporto: caratteri grandi 3x3 → ~16 col/riga su 80mm
+const COMANDA_ASPORTO_MAX_COLS = 16;
+const COMANDA_ASPORTO_LINE_SP  = 56;        // spaziatura righe “larga” per leggibilità
 
 function wrapText(s, max = COMANDA_MAX_COLS) {
   const text = sanitizeForEscpos(s);
@@ -468,9 +474,117 @@ async function printComandaSlipMcd(title, order, cfg) {
   sock.end();
 }
 
-// --- Facade: layout selezionabile (classic | mcd) ----------------------------
+// --- Stampa COMANDA ASPORTO — layout 80mm, caratteri GRANDI pizze+extra -----
+// Font A leggibile, sizeExtraLarge (3x3) per pizza e extra, spaziatura ampia
+async function printComandaSlipAsporto(title, order, cfg) {
+  const sock = await openSocket(cfg);
+  const maxCols = COMANDA_ASPORTO_MAX_COLS;
+  const lineSp = COMANDA_ASPORTO_LINE_SP;
+
+  init(sock);
+  codepageCP1252(sock);
+  fontA(sock);
+  setLineSpacing(sock, lineSp);
+  charSpacing(sock, 1);
+
+  // Header: ASPORTO enorme
+  alignCenter(sock);
+  sizeExtraLarge(sock); boldOn(sock); writeLine(sock, 'ASPORTO'); boldOff(sock);
+  sizeBig(sock); boldOn(sock); writeLine(sock, title); boldOff(sock);
+
+  const client = (order.customer_name || 'Cliente').toString().trim();
+  sizeBig(sock); boldOn(sock); writeLine(sock, client); boldOff(sock);
+
+  sizeNormal(sock);
+  writeLine(sock, '==============================');
+  alignLeft(sock);
+  writeLine(sock, `Ord. #${order.id}`);
+  if (order.scheduled_at) writeLine(sock, `Ritiro: ${fmtComandaDate(order.scheduled_at)}`);
+  if (order.phone) writeLine(sock, `Tel: ${order.phone}`);
+  if (order.note) {
+    const nlines = wrapText(`Note: ${order.note}`, maxCols);
+    for (const ln of nlines) writeLine(sock, ln);
+  }
+  writeLine(sock, '------------------------------');
+
+  const groups = new Map();
+  for (const it of (order.items || [])) {
+    const cat = (it.category || 'Altro').toString();
+    if (!groups.has(cat)) groups.set(cat, []);
+    groups.get(cat).push(it);
+  }
+  const categories = Array.from(groups.keys()).sort((a, b) => {
+    const ra = categoryRank(a), rb = categoryRank(b);
+    return ra === rb ? a.localeCompare(b, 'it') : ra - rb;
+  });
+
+  let grand = 0;
+  for (const cat of categories) {
+    const list = groups.get(cat) || [];
+    writeLine(sock, '');
+    boldOn(sock); sizeBig(sock); writeLine(sock, cat.toUpperCase()); boldOff(sock); sizeNormal(sock);
+    writeLine(sock, '------------------------------');
+
+    for (const it of list) {
+      const qty = Math.max(1, Number(it.qty) || 1);
+      const qtyTxt = qtyStr(qty);
+      const name = (it.name || '').toString().trim().toUpperCase();
+
+      // PIZZA/Prodotto: GRANDE (3x3) + bold
+      sizeExtraLarge(sock); boldOn(sock);
+      const nameLines = wrapText(`${qtyTxt} x ${name}`, maxCols);
+      for (const ln of nameLines) writeLine(sock, ln);
+      boldOff(sock); sizeNormal(sock);
+
+      // EXTRA: da notes (AGGIUNGI/SENZA) oppure order_item_options — stampa in grande
+      const notesNorm = normalizeNotesForKitchen(it.notes);
+      const optsExtras = (it.options || []).map(o => {
+        const label = o.type === 'add' ? 'AGGIUNGI' : 'SENZA';
+        const n = (o.name || '').toString().trim();
+        return n ? `${label}: ${n}` : null;
+      }).filter(Boolean);
+      const extraLines = notesNorm ? notesNorm.split(/\n+/).map(s => s.trim()).filter(Boolean) : [];
+      optsExtras.forEach(e => { if (e && !extraLines.includes(e)) extraLines.push(e); });
+      if (extraLines.length) {
+        sizeBig(sock); boldOn(sock);
+        for (const ln of extraLines) {
+          const wlines = wrapText(ln, maxCols);
+          for (const wl of wlines) writeLine(sock, '  ' + wl);
+        }
+        boldOff(sock); sizeNormal(sock);
+      }
+
+      const unit = Number(it.price || 0);
+      const rowTot = unit * qty;
+      if (unit > 0) {
+        sizeNormal(sock);
+        writeLine(sock, `  prezzo: ${money(unit)}  riga: ${money(rowTot)}`);
+      }
+      grand += rowTot;
+      feedLines(sock, 1);
+    }
+  }
+
+  alignCenter(sock);
+  writeLine(sock, '==============================');
+  boldOn(sock); sizeBig(sock); writeLine(sock, `TOTALE: ${money(grand)}`); boldOff(sock);
+
+  writeLine(sock, '');
+  writeLine(sock, 'COMANDA ASPORTO');
+  writeLine(sock, '');
+
+  resetLineSpacing(sock);
+  charSpacing(sock, 0);
+  cutIfEnabled(sock, cfg);
+  sock.end();
+}
+
+// --- Facade: layout selezionabile (classic | mcd | asporto) ------------------
 async function printComandaSlip({ title, order, cfg, layoutKey = 'classic' }) {
   const key = String(layoutKey || 'classic').trim().toLowerCase();
+  if (key === 'asporto') {
+    return printComandaSlipAsporto(title, order, cfg);
+  }
   if (key === 'mcd') {
     return printComandaSlipMcd(title, order, cfg);
   }
