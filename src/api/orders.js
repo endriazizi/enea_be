@@ -315,6 +315,7 @@ const PUBLIC_ASPORTO_DEFAULTS = {
   whatsapp_show_prices       : true,
   public_asporto_allow_takeaway: true,
   public_asporto_allow_delivery: false,
+  prenota_online_enabled     : true,
 };
 
 function normalizePublicAsportoSettings(raw) {
@@ -374,6 +375,10 @@ function normalizePublicAsportoSettings(raw) {
           process.env.ASPORTO_ORDER_EXTRA_SHOW_TOGGLE ??
           '0',
       );
+  const prenotaOnlineEnabled =
+    typeof src.prenota_online_enabled === 'boolean'
+      ? src.prenota_online_enabled
+      : !!Number(src.prenota_online_enabled ?? PUBLIC_ASPORTO_DEFAULTS.prenota_online_enabled ?? 1);
 
   return {
     enable_public_asporto: enable,
@@ -387,6 +392,7 @@ function normalizePublicAsportoSettings(raw) {
     public_asporto_allow_delivery: allowDelivery,
     order_include_extras_in_total_default: includeExtras,
     order_extra_show_toggle: showToggle,
+    prenota_online_enabled: prenotaOnlineEnabled,
   };
 }
 
@@ -402,7 +408,8 @@ async function getPublicAsportoSettings() {
          asporto_lead_minutes,
          whatsapp_show_prices,
          public_asporto_allow_takeaway,
-         public_asporto_allow_delivery
+         public_asporto_allow_delivery,
+         prenota_online_enabled
        FROM public_asporto_settings
        ORDER BY id ASC
        LIMIT 1`,
@@ -428,9 +435,10 @@ async function savePublicAsportoSettings(next) {
        asporto_lead_minutes,
        whatsapp_show_prices,
        public_asporto_allow_takeaway,
-       public_asporto_allow_delivery
+       public_asporto_allow_delivery,
+       prenota_online_enabled
      ) VALUES (
-       1, ?, ?, ?, ?, ?, ?, ?, ?, ?
+       1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
      )
      ON DUPLICATE KEY UPDATE
        enable_public_asporto = VALUES(enable_public_asporto),
@@ -441,7 +449,8 @@ async function savePublicAsportoSettings(next) {
        asporto_lead_minutes = VALUES(asporto_lead_minutes),
        whatsapp_show_prices = VALUES(whatsapp_show_prices),
        public_asporto_allow_takeaway = VALUES(public_asporto_allow_takeaway),
-       public_asporto_allow_delivery = VALUES(public_asporto_allow_delivery)`,
+       public_asporto_allow_delivery = VALUES(public_asporto_allow_delivery),
+       prenota_online_enabled = VALUES(prenota_online_enabled)`,
     [
       p.enable_public_asporto ? 1 : 0,
       p.public_whatsapp_to,
@@ -452,6 +461,7 @@ async function savePublicAsportoSettings(next) {
       p.whatsapp_show_prices ? 1 : 0,
       p.public_asporto_allow_takeaway ? 1 : 0,
       p.public_asporto_allow_delivery ? 1 : 0,
+      p.prenota_online_enabled ? 1 : 0,
     ],
   );
   return p;

@@ -1,6 +1,151 @@
 # 🧩 Project code (file ammessi in .)
 
-_Generato: Tue, Feb  3, 2026  2:22:07 AM_
+_Generato: Sun, Feb  8, 2026  2:27:00 AM_
+
+### ./AUDIT_RESERVATIONS_NOTIFICATIONS.md
+```
+# AUDIT — Prenotazioni, Email, WhatsApp/Twilio
+
+**Data**: 2026-02-07  
+**Scope**: Backend Node/Express + MySQL, PWA Ionic/Angular
+
+---
+
+## 1) Rotte e servizi prenotazioni
+
+| File | Ruolo |
+|------|-------|
+| `src/api/reservations.js` | Router REST: GET/POST/PUT/DELETE, PUT `/:id/status`, checkin/checkout, print |
+| `src/services/reservations.service.js` | CRUD DB: create, update, remove, getById, list |
+| `src/services/reservations-status.service.js` | State machine: updateStatus(action) → accepted/rejected/cancelled/… |
+
+**Rotte chiave**:
+- `PUT /api/reservations/:id/status` — Cambio stato (action: accept, reject, cancel, …)
+- `DELETE /api/reservations/:id` — Hard delete (nessuna email)
+
+---
+
+## 2) WhatsApp "PRENOTAZIONE RICEVUTA"
+
+| Dove | File | Funzione/Rotta |
+|------|------|----------------|
+| **Composizione testo** | `src/utils/whatsapp-templates.js` | `buildReservationReceivedMessage()` |
+| **Invio** | `src/api/whatsapp-templates.js` | `POST /send/reservation-received` |
+| **Canali** | WebQR (`whatsapp-webqr.service`) oppure Twilio (`whatsapp.service.sendText`) |
+
+**Quando parte**: Su creazione prenotazione (status pending) — FE chiama POST dopo create.
+
+**Codice prenotazione**: `R-{DDMM}-{HHMM}-{ultime4}` da `start_at` + `phone`; fallback `R-${id}`.
+
+---
+
+## 3) Email esistente
+
+| Evento | Esiste? | File | Funzione |
+|--------|---------|------|----------|
+| **Status change generico** | ✅ Sì | `mailer.service.js` | `sendStatusChangeEmail()` |
+| **Prenotazione rifiutata** | ✅ Sì | `mailer.service.js` | `sendReservationRejectionEmail()` |
+| **Prenotazione CONFERMATA (accepted)** | ❌ No | — | — |
+
+**Dove viene inviata**:
+- `src/api/reservations.js` PUT `/:id/status`: chiama `sendStatusChangeEmail` per **qualunque** cambio stato (se `notify` o `env.RESV.notifyAlways`).
+- **Non** esiste una email dedicata "PRENOTAZIONE CONFERMATA" inviata **solo** su `accepted`.
+
+**Provider**: `mailer.service.js` usa `nodemailer`, env: `MAIL.enabled`, `SMTP_HOST`, `SMTP_PORT`, `SMTP_USER`, `SMTP_PASS`, `MAIL_FROM`.
+
+---
+
+## 4) Flag disabilitazione notifiche
+
+| Flag | Esiste? | Nome | Dove letto |
+|------|---------|------|------------|
+| **Twilio/WhatsApp** | ✅ Parziale | `TWILIO_ENABLED` | `env.js` → `twilio.service.js` |
+| **DISABLE_TWILIO** | ❌ No | — | — |
+| **DISABLE_EMAIL** | ❌ No | — | — |
+| **MAIL** | ✅ Sì | `MAIL_ENABLED` | `mailer.service.js` (disabilita tutto) |
+
+**Twilio**: `TWILIO_ENABLED=0` disabilita; `twilio.service.isTwilioEnabled()` è il gate. **Non** esiste `DISABLE_TWILIO=1` come alias.
+
+---
+
+## 5) File coinvolti nell’implementazione
+
+```
+enea_be/
+├── src/
+│   ├── env.js                    # + DISABLE_TWILIO, DISABLE_EMAIL
+│   ├── api/
+│   │   └── reservations.js       # Email solo su accepted + guard DISABLE_EMAIL
+│   ├── services/
+│   │   ├── mailer.service.js     # + sendReservationConfirmedEmail()
+│   │   └── twilio.service.js    # + check DISABLE_TWILIO (via env)
+│   └── ...
+├── .env.example                  # + DISABLE_TWILIO, DISABLE_EMAIL, SMTP_*
+└── AUDIT_RESERVATIONS_NOTIFICATIONS.md
+```
+
+---
+
+## 6) Riepilogo
+
+- **Email "PRENOTAZIONE CONFERMATA"**: non implementata; va aggiunta **solo** su transizione a `accepted`.
+- **Flag Twilio**: esiste `TWILIO_ENABLED`; va aggiunto `DISABLE_TWILIO=1` come override.
+- **Flag Email**: va aggiunto `DISABLE_EMAIL=1` per disabilitare invio email su accepted.
+- **Delete**: già senza email (nessuna chiamata mail in `svc.remove`).
+
+---
+
+## 7) Checklist test manuale
+
+| Scenario | Atteso |
+|----------|--------|
+| create pending | NO email |
+| update → accepted (con email cliente) | ✅ Email inviata |
+| update → accepted (senza email cliente) | ⚠️ Log "ℹ️ 📧 Email mancante: skip" |
+| update → rejected | NO email |
+| delete | NO email |
+| DISABLE_TWILIO=1 | Nessun WhatsApp/Twilio |
+| DISABLE_EMAIL=1 | Nessuna email confermata |
+
+---
+
+## 8) Esempio email (template "Prenotazione confermata")
+
+- **name**: Endri
+- **date**: 07/02/2026
+- **time**: 19:30
+- **people**: 8
+- **bookingCode**: R-123 (o R-{DDMM}-{HHMM}-{ultime4} se disponibili)
+
+---
+
+## 9) Tree file coinvolti (prima/dopo)
+
+```
+enea_be/
+├── src/
+│   ├── env.js                         # + DISABLE_TWILIO, DISABLE_EMAIL
+│   ├── api/
+│   │   ├── reservations.js            # Email solo su accepted + guard DISABLE_EMAIL
+│   │   └── notifications.js          # WA webhook: sendReservationConfirmedEmail
+│   ├── services/
+│   │   ├── mailer.service.js          # + sendReservationConfirmedEmail()
+│   │   └── twilio.service.js          # + check DISABLE_TWILIO
+│   └── ...
+├── .env.example                       # + DISABLE_TWILIO, DISABLE_EMAIL, SMTP_*
+└── AUDIT_RESERVATIONS_NOTIFICATIONS.md
+```
+
+---
+
+## 10) Git commands suggeriti
+
+```bash
+git checkout -b feat/reservations-email-accepted
+git add .
+git commit -m "feat(reservations): send confirmation email on accepted + env disable notifications"
+```
+```
 
 ### ./docs/canvas-backend.md
 ```
@@ -257,6 +402,16 @@ Stato, regole e roadmap del backend ordini + prenotazioni + NFC + stampa.
     - Migrazioni numerate incrementalmente (`007_*.sql`, `008_*.sql`, ecc.)
 ```
 
+### ./nodemon.json
+```
+{
+  "watch": ["src"],
+  "ext": "js,json",
+  "ignore": ["node_modules", "data", "logs", "exports", "assets", "docs", "*.md"],
+  "delay": "1"
+}
+```
+
 ### ./package.json
 ```
 {
@@ -266,10 +421,11 @@ Stato, regole e roadmap del backend ordini + prenotazioni + NFC + stampa.
     "main": "src/server.js",
     "scripts": {
         "start": "node src/server.js",
-        "dev": "cross-env NODE_ENV=development nodemon server.js"
+        "dev": "cross-env NODE_ENV=development NODE_OPTIONS=--max-old-space-size=512 nodemon server.js"
     },
     "dependencies": {
         "@ngrok/ngrok": "1.7.0",
+        "@whiskeysockets/baileys": "6.7.21",
         "bcryptjs": "3.0.2",
         "cors": "^2.8.5",
         "dotenv": "^16.4.5",
@@ -469,10 +625,17 @@ module.exports = (app) => {
 
   const normDigits = (v) => String(v || '').replace(/\D+/g, '');
 
-  function isTasto1(raw) {
-    const s = String(raw || '').trim().toLowerCase();
-    return s === 'tasto1' || s === 'tasto 1' || s === 'tasto_1';
+  /** Normalizza remark: lowerCase + trim + rimuovi spazi (es: "Tasto 3" => "tasto3") */
+  function normRemark(raw) {
+    return String(raw || '').trim().toLowerCase().replace(/\s+/g, '').replace(/_/g, '');
   }
+
+  const ROUTE_PRENOTAZIONE = '/prenota';
+  const routeByRemark = {
+    tasto1: '/asporto',
+    tasto2: ROUTE_PRENOTAZIONE,
+    tasto3: '/scelta',
+  };
 
   async function lookupCustomerByPhone(phoneRaw) {
     const digits = normDigits(phoneRaw);
@@ -507,22 +670,20 @@ module.exports = (app) => {
     }
 
     const callerid = String(req.query.callerid || '');
-    const remark = String(req.query.remark || '');
+    // MyCentralino può inviare marcatore1 invece di remark (campo "marcatore1" nella config)
+    const remark = String(req.query.remark || req.query.marcatore1 || '');
     const remark2 = String(req.query.remark2 || '');
     const remark3 = String(req.query.remark3 || '');
     const calledid = String(req.query.calledid || '');
     const uniqueid = String(req.query.uniqueid || '');
 
-    log.info('📞 [Centralino] call', {
-      callerid,
-      calledid,
-      uniqueid,
-      remark,
-      remark2,
-      remark3,
-    });
+    const norm = normRemark(remark);
+    const chosenPath = routeByRemark[norm] || (norm ? null : routeByRemark.tasto1);
 
-    if (!isTasto1(remark)) {
+    log.info('[CENTRALINO] 📞 call ricevuta callerid=' + callerid + ' remark=' + remark);
+    log.info('[CENTRALINO] 🧭 route scelta: ' + (chosenPath || '(ignore)'));
+
+    if (!chosenPath) {
       return res.json({ ok: true, action: 'ignore' });
     }
 
@@ -568,7 +729,8 @@ module.exports = (app) => {
     if (customer?.first_name) params.set('customer_first', customer.first_name);
     if (customer?.last_name) params.set('customer_last', customer.last_name);
 
-    const url = `${base}/asporto?${params.toString()}`;
+    const url = `${base}${chosenPath}?${params.toString()}`;
+    log.info('[CENTRALINO] 🔗 url finale: ' + url);
     return res.redirect(302, url);
   });
 
@@ -723,6 +885,12 @@ module.exports = (app) => {
   router.put('/:id(\\d+)', async (req, res) => {
     const id = Number(req.params.id);
     const { full_name, first_name, last_name, phone, email, note, tags, is_active } = req.body || {};
+
+    const first = (first_name ?? '').toString().trim();
+    const last = (last_name ?? '').toString().trim();
+    const full = (full_name ?? '').toString().trim();
+    const fullNameEffective = !full && (first || last) ? `${first} ${last}`.trim() : (full || null);
+
     try {
       await q(`
         UPDATE users SET
@@ -735,8 +903,17 @@ module.exports = (app) => {
           tags      = COALESCE(?, tags),
           is_active = COALESCE(?, is_active)
         WHERE id=?`,
-        [full_name, first_name, last_name, phone, email, note, tags,
-         ([0,1].includes(is_active)? is_active : null), id]);
+        [
+          fullNameEffective,
+          first_name,
+          last_name,
+          phone,
+          email,
+          note,
+          tags,
+          ([0,1].includes(is_active) ? is_active : null),
+          id,
+        ]);
       const out = (await q(`SELECT * FROM users WHERE id=?`, [id]))?.[0] || null;
       log.info('✏️  [Customers] update id=', id);
       res.json(out);
@@ -1640,14 +1817,18 @@ const { exchangeCode } = require('../../services/google.service');
 // Scambia il "code" ottenuto dal popup GIS e persiste i token.
 router.post('/exchange', async (req, res) => {
   const code = String(req.body?.code || '');
-  if (!code) return res.status(400).json({ ok: false, message: 'Missing code' });
+  logger.info('[Google BE] POST /api/google/oauth/exchange ricevuto', { codeLength: code.length });
+  if (!code) {
+    logger.warn('[Google BE] OAuth exchange: code mancante');
+    return res.status(400).json({ ok: false, message: 'Missing code' });
+  }
 
   try {
     await exchangeCode(code);
-    logger.info('🔄 OAuth exchange OK');
+    logger.info('[Google BE] OAuth exchange OK, token salvati in google_tokens');
     return res.json({ ok: true });
   } catch (e) {
-    logger.error('🔄 OAuth exchange KO', { error: String(e) });
+    logger.error('[Google BE] OAuth exchange KO', { error: String(e) });
     return res.status(500).json({ ok: false, message: 'oauth_exchange_failed' });
   }
 });
@@ -1679,6 +1860,7 @@ const logger = require('../../logger');
 const {
   searchContacts,
   createContact,
+  updateContact,
   ensureAuth
 } = require('../../services/google.service');
 
@@ -1686,20 +1868,22 @@ const {
 router.get('/search', async (req, res) => {
   const q = String(req.query.q || '').trim();
   const limit = Math.min(50, Math.max(1, parseInt(req.query.limit || '12', 10)));
+  logger.info('[Google BE] GET /api/google/people/search', { q, limit });
 
   if (q.length < 2) return res.json({ ok: true, items: [] });
 
   try {
-    // ensureAuth usato per segnalare 401 in caso di mancanza token
     await ensureAuth();
     const items = await searchContacts(q, limit);
+    logger.info('[Google BE] people/search OK', { count: items.length });
     return res.json({ ok: true, items });
   } catch (e) {
     const code = e?.code || '';
     if (code === 'consent_required') {
+      logger.warn('[Google BE] people/search: consenso mancante → 401 google_consent_required');
       return res.status(401).json({ ok: false, reason: 'google_consent_required' });
     }
-    logger.error('🔎❌ [Google] people.search failed', { error: String(e) });
+    logger.error('[Google BE] people/search KO', { error: String(e) });
     return res.status(500).json({ ok: false, message: 'search_failed' });
   }
 });
@@ -1708,20 +1892,63 @@ router.get('/search', async (req, res) => {
 // body: { displayName?, givenName?, familyName?, email?, phone?, note? }
 router.post('/create', express.json(), async (req, res) => {
   const { displayName, givenName, familyName, email, phone, note } = req.body || {};
+  logger.info('[Google BE] POST /api/google/people/create', { displayName: displayName || email || '(no name)' });
 
   try {
     const out = await createContact({ displayName, givenName, familyName, email, phone, note });
+    logger.info('[Google BE] people/create OK', { resourceName: out?.resourceName });
     return res.json(out);
   } catch (e) {
     const code = e?.code || '';
     if (code === 'consent_required') {
+      logger.warn('[Google BE] people/create: consenso mancante → 401 google_consent_required');
       return res.status(401).json({ ok: false, reason: 'google_consent_required' });
     }
     if (code === 'write_scope_required') {
+      logger.warn('[Google BE] people/create: scope scrittura mancante → 403 google_scope_write_required');
       return res.status(403).json({ ok: false, reason: 'google_scope_write_required' });
     }
-    logger.error('👤❌ [Google] people.create failed', { error: String(e) });
+    logger.error('[Google BE] people/create KO', { error: String(e) });
     return res.status(500).json({ ok: false, message: 'create_failed' });
+  }
+});
+
+// PATCH /api/google/people/update — aggiorna contatto esistente (match da ricerca)
+// body: { resourceName, etag?, displayName?, givenName?, familyName?, email?, phone?, note? }
+router.patch('/update', express.json(), async (req, res) => {
+  const { resourceName, etag, displayName, givenName, familyName, email, phone, note } = req.body || {};
+  logger.info('[Google BE] PATCH /api/google/people/update', { resourceName });
+
+  if (!resourceName || typeof resourceName !== 'string') {
+    logger.warn('[Google BE] people/update: resourceName mancante');
+    return res.status(400).json({ ok: false, reason: 'resourceName_required' });
+  }
+
+  try {
+    const out = await updateContact({
+      resourceName,
+      etag,
+      displayName,
+      givenName,
+      familyName,
+      email,
+      phone,
+      note,
+    });
+    logger.info('[Google BE] people/update OK', { resourceName: out?.resourceName });
+    return res.json(out);
+  } catch (e) {
+    const code = e?.code || '';
+    if (code === 'consent_required') {
+      logger.warn('[Google BE] people/update: consenso mancante → 401 google_consent_required');
+      return res.status(401).json({ ok: false, reason: 'google_consent_required' });
+    }
+    if (code === 'write_scope_required') {
+      logger.warn('[Google BE] people/update: scope scrittura mancante → 403 google_scope_write_required');
+      return res.status(403).json({ ok: false, reason: 'google_scope_write_required' });
+    }
+    logger.error('[Google BE] people/update KO', { error: String(e) });
+    return res.status(500).json({ ok: false, message: 'update_failed' });
   }
 });
 
@@ -1732,26 +1959,41 @@ module.exports = router;
 ```
 // src/api/health.js
 // Endpoints di diagnostica. /api/health/time mostra orari server+DB.
+// GET /api/health/twilio = stato gate Twilio (enabled, dryRun, reason, hasCreds).
 
 const router = require('express').Router();
 const { query } = require('../db');
+const logger = require('../logger');
+const twilioService = require('../services/twilio.service');
+
+router.get('/twilio', (_req, res) => {
+  try {
+    const state = twilioService.getHealthState();
+    res.json(state);
+  } catch (err) {
+    res.status(500).json({ ok: false, error: String(err) });
+  }
+});
 
 router.get('/time', async (_req, res) => {
+  logger.info('🧪 TZ CHECK');
   try {
     const now = new Date();
     const app = {
-      nowLocal: now.toString(),          // locale del server
-      nowUTC: now.toISOString(),         // UTC
-      tzResolved: Intl.DateTimeFormat().resolvedOptions().timeZone || '(unknown)',
-      envTZ: process.env.TZ || '(unset)'
+      serverTZ: Intl.DateTimeFormat().resolvedOptions().timeZone || '(unknown)',
+      nodeNow: now.toString(),
+      nodeIso: now.toISOString(),
+      envTZ: process.env.TZ || '(unset)',
     };
 
+    // 🧪 TZ CHECK: diagnostica fuso orario DB (NOW − UTC_TIMESTAMP = diff CET)
     const rows = await query(`
-      SELECT 
-        NOW()              AS dbNowLocal, 
-        UTC_TIMESTAMP()    AS dbNowUTC,
-        @@time_zone        AS dbTimeZone,
-        TIMESTAMPDIFF(MINUTE, UTC_TIMESTAMP(), NOW()) AS dbOffsetMinutes
+      SELECT
+        @@global.time_zone AS global_time_zone,
+        @@session.time_zone AS session_time_zone,
+        NOW()              AS now_session,
+        UTC_TIMESTAMP()    AS now_utc,
+        TIMEDIFF(NOW(), UTC_TIMESTAMP()) AS diff_session_vs_utc
     `);
 
     const db = rows && rows[0] ? rows[0] : {};
@@ -2570,6 +2812,43 @@ router.post('/mail/test', requireAuth, safeRoute('mail.test', async (req, res) =
 }));
 
 // ----------------------------------------------------------------------------
+// POST /whatsapp/twilio — FE invia { kind: 'reservation-pending', reservation } o { kind: 'order-created', order }
+// Se Twilio disabilitato: 200 { ok: true, disabled: true } (no regressione FE)
+// ----------------------------------------------------------------------------
+router.post('/whatsapp/twilio', requireAuth, safeRoute('whatsapp.twilio', async (req, res) => {
+  const kind = req.body?.kind || null;
+  const reservation = req.body?.reservation || null;
+  const order = req.body?.order || null;
+
+  if (kind === 'reservation-pending' && reservation) {
+    const phone = reservation.contact_phone || reservation.phone || null;
+    const name = [reservation.customer_first, reservation.customer_last].filter(Boolean).join(' ') || reservation.display_name || 'Cliente';
+    const start = reservation.start_at ? new Date(reservation.start_at) : null;
+    const dateStr = start ? new Intl.DateTimeFormat('it-IT', { weekday: 'long', day: '2-digit', month: '2-digit', year: 'numeric' }).format(start) : '';
+    const timeStr = start ? `${String(start.getHours()).padStart(2, '0')}:${String(start.getMinutes()).padStart(2, '0')}` : '';
+    const peopleStr = reservation.party_size != null ? String(reservation.party_size) : '';
+    const out = await wa.sendReservationConfirmTemplate({
+      to: phone,
+      name,
+      dateStr,
+      timeStr,
+      peopleStr,
+      reservationId: reservation.id || null,
+    });
+    return res.json(out);
+  }
+
+  if (kind === 'order-created' && order) {
+    const to = order.customer_phone || order.phone || order.contact_phone || null;
+    const text = (req.body?.text || 'Ordine ricevuto. Grazie.').toString().trim();
+    const out = await wa.sendText({ to, text });
+    return res.json(out);
+  }
+
+  return res.status(400).json({ ok: false, error: 'missing_kind_or_payload' });
+}));
+
+// ----------------------------------------------------------------------------
 // WA FREE TEXT (protetta) - dentro finestra 24h (se blocco attivo)
 // ----------------------------------------------------------------------------
 router.post('/wa/send', requireAuth, safeRoute('wa.send', async (req, res) => {
@@ -2646,18 +2925,17 @@ router.post('/wa/inbound',
         const reservation = await reservationsSvc.getById(id).catch(() => null);
 
         if (reservation) {
-          // Best-effort notify (email + WA status change)
+          // Best-effort notify (email PRENOTAZIONE CONFERMATA solo se accepted + DISABLE_EMAIL non attivo)
           try {
-            if (reservation.contact_email) {
-              await mailer.sendStatusChangeEmail?.({
-                to: reservation.contact_email,
+            const toAddr = reservation.contact_email || reservation.email;
+            if (reservation.status === 'accepted' && toAddr && !env.DISABLE_EMAIL) {
+              await mailer.sendReservationConfirmedEmail?.({
+                to: toAddr,
                 reservation,
-                status: reservation.status,
-                reason: `Confermato da WhatsApp (${action})`
               });
             }
           } catch (e) {
-            logger.warn('⚠️ Email status change fallita (ok)', { service: 'server', error: String(e) });
+            logger.warn('⚠️ Email conferma fallita (ok)', { service: 'server', error: String(e) });
           }
 
           try {
@@ -2859,6 +3137,19 @@ try {
   });
 }
 
+// Google Contacts upsert (best-effort)
+let upsertContactFromUser = async (_user) => null;
+try {
+  const g = require('../services/google.service');
+  if (typeof g?.upsertContactFromUser === 'function') {
+    upsertContactFromUser = g.upsertContactFromUser;
+  }
+} catch (e) {
+  logger.warn('ℹ️ [orders] google.service upsert non disponibile', {
+    error: String((e && e.message) || e),
+  });
+}
+
 // ============================================================================
 // Helpers
 // ============================================================================
@@ -2895,6 +3186,45 @@ function normalizeFulfillment(raw) {
   if (v === 'takeaway' || v === 'asporto' || v === 'take-away') return 'takeaway';
   if (v === 'delivery' || v === 'domicilio') return 'delivery';
   return null;
+}
+
+async function tryUpsertGoogleContactForOrder(customerUserId, dto) {
+  if (!customerUserId) return;
+  try {
+    const rows = await query(
+      `SELECT
+         id,
+         first_name,
+         last_name,
+         full_name,
+         name,
+         email,
+         phone,
+         note,
+         google_resource_name,
+         google_etag
+       FROM users
+       WHERE id = ? LIMIT 1`,
+      [customerUserId],
+    );
+    const user = rows && rows[0] ? rows[0] : null;
+    if (!user) return;
+
+    const customerName = (dto?.customer_name || '').toString().trim();
+    const merged = {
+      ...user,
+      full_name: customerName || user.full_name,
+      name: customerName || user.name,
+      email: dto?.email || user.email,
+      phone: dto?.phone || user.phone,
+    };
+    await upsertContactFromUser(merged);
+  } catch (e) {
+    logger.warn('👤⚠️ [orders] google upsert KO', {
+      error: String((e && e.message) || e),
+      customerUserId,
+    });
+  }
 }
 
 // ============================================================================
@@ -2942,11 +3272,15 @@ function resolveComandaCenter(raw, settings, order = null) {
   return 'PIZZERIA';
 }
 
-function resolveComandaLayout(raw, settings) {
+function resolveComandaLayout(raw, settings, order = null) {
   if (raw != null && raw !== '') {
     const v = String(raw).trim().toLowerCase();
+    if (v === 'asporto' || v === 'mcd' || v === 'classic') return v;
     return v === 'mcd' ? 'mcd' : 'classic';
   }
+  // Ordini asporto: layout dedicato con caratteri grandi 80mm
+  const fulfillment = String(order?.fulfillment || '').toLowerCase();
+  if (fulfillment === 'takeaway') return 'asporto';
   const st = String(settings?.comanda_layout || 'classic').trim().toLowerCase();
   return st === 'mcd' ? 'mcd' : 'classic';
 }
@@ -2977,6 +3311,7 @@ const PUBLIC_ASPORTO_DEFAULTS = {
   whatsapp_show_prices       : true,
   public_asporto_allow_takeaway: true,
   public_asporto_allow_delivery: false,
+  prenota_online_enabled     : true,
 };
 
 function normalizePublicAsportoSettings(raw) {
@@ -3019,6 +3354,28 @@ function normalizePublicAsportoSettings(raw) {
     ? leadNum
     : PUBLIC_ASPORTO_DEFAULTS.asporto_lead_minutes;
 
+  // Da env: somma extra nel totale (default true) + toggle visibile (default false = nascosto)
+  const includeExtras =
+    typeof src.order_include_extras_in_total_default === 'boolean'
+      ? src.order_include_extras_in_total_default
+      : !!Number(
+        src.order_include_extras_in_total_default ??
+          process.env.ASPORTO_ORDER_INCLUDE_EXTRAS_IN_TOTAL ??
+          '1',
+      );
+  const showToggle =
+    typeof src.order_extra_show_toggle === 'boolean'
+      ? src.order_extra_show_toggle
+      : !!Number(
+        src.order_extra_show_toggle ??
+          process.env.ASPORTO_ORDER_EXTRA_SHOW_TOGGLE ??
+          '0',
+      );
+  const prenotaOnlineEnabled =
+    typeof src.prenota_online_enabled === 'boolean'
+      ? src.prenota_online_enabled
+      : !!Number(src.prenota_online_enabled ?? PUBLIC_ASPORTO_DEFAULTS.prenota_online_enabled ?? 1);
+
   return {
     enable_public_asporto: enable,
     public_whatsapp_to: publicWhatsapp,
@@ -3029,6 +3386,9 @@ function normalizePublicAsportoSettings(raw) {
     whatsapp_show_prices: showPrices,
     public_asporto_allow_takeaway: allowTakeaway,
     public_asporto_allow_delivery: allowDelivery,
+    order_include_extras_in_total_default: includeExtras,
+    order_extra_show_toggle: showToggle,
+    prenota_online_enabled: prenotaOnlineEnabled,
   };
 }
 
@@ -3044,7 +3404,8 @@ async function getPublicAsportoSettings() {
          asporto_lead_minutes,
          whatsapp_show_prices,
          public_asporto_allow_takeaway,
-         public_asporto_allow_delivery
+         public_asporto_allow_delivery,
+         prenota_online_enabled
        FROM public_asporto_settings
        ORDER BY id ASC
        LIMIT 1`,
@@ -3070,9 +3431,10 @@ async function savePublicAsportoSettings(next) {
        asporto_lead_minutes,
        whatsapp_show_prices,
        public_asporto_allow_takeaway,
-       public_asporto_allow_delivery
+       public_asporto_allow_delivery,
+       prenota_online_enabled
      ) VALUES (
-       1, ?, ?, ?, ?, ?, ?, ?, ?, ?
+       1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
      )
      ON DUPLICATE KEY UPDATE
        enable_public_asporto = VALUES(enable_public_asporto),
@@ -3083,7 +3445,8 @@ async function savePublicAsportoSettings(next) {
        asporto_lead_minutes = VALUES(asporto_lead_minutes),
        whatsapp_show_prices = VALUES(whatsapp_show_prices),
        public_asporto_allow_takeaway = VALUES(public_asporto_allow_takeaway),
-       public_asporto_allow_delivery = VALUES(public_asporto_allow_delivery)`,
+       public_asporto_allow_delivery = VALUES(public_asporto_allow_delivery),
+       prenota_online_enabled = VALUES(prenota_online_enabled)`,
     [
       p.enable_public_asporto ? 1 : 0,
       p.public_whatsapp_to,
@@ -3094,6 +3457,7 @@ async function savePublicAsportoSettings(next) {
       p.whatsapp_show_prices ? 1 : 0,
       p.public_asporto_allow_takeaway ? 1 : 0,
       p.public_asporto_allow_delivery ? 1 : 0,
+      p.prenota_online_enabled ? 1 : 0,
     ],
   );
   return p;
@@ -3331,6 +3695,7 @@ async function getOrderFullById(id) {
             i.qty,
             i.price,
             i.notes,
+            COALESCE(i.extra_total, 0) AS extra_total,
             i.created_at,
             COALESCE(c.name, 'Altro') AS category
      FROM order_items i
@@ -3340,6 +3705,24 @@ async function getOrderFullById(id) {
      ORDER BY i.id ASC`,
     [id],
   );
+
+  // Extra/opzioni (AGGIUNGI/SENZA) per stampa comanda
+  const opts = await query(
+    `SELECT order_item_id, type, name FROM order_item_options
+     WHERE order_item_id IN (SELECT id FROM order_items WHERE order_id = ?)
+     ORDER BY order_item_id, id ASC`,
+    [id],
+  );
+  const optsByItem = new Map();
+  for (const o of opts || []) {
+    const oid = Number(o.order_item_id);
+    if (!optsByItem.has(oid)) optsByItem.set(oid, []);
+    optsByItem.get(oid).push({ type: o.type, name: o.name });
+  }
+  const itemsWithOpts = (items || []).map((r) => ({
+    ...r,
+    options: optsByItem.get(Number(r.id)) || [],
+  }));
 
   // Meta tavolo/sala
   const meta = await resolveLocationMeta(o);
@@ -3366,7 +3749,7 @@ async function getOrderFullById(id) {
           room    : meta.room,
         }
       : null,
-    items,
+    items: itemsWithOpts,
   };
 }
 
@@ -3754,6 +4137,7 @@ router.get('/', async (req, res) => {
          o.note,
          o.created_at,
          o.updated_at,
+         (SELECT COALESCE(SUM(i.qty), 0) FROM order_items i WHERE i.order_id = o.id) AS items_count,
          t.table_number,
          COALESCE(NULLIF(t.table_number, ''), CONCAT('T', t.id)) AS table_name,
          rm.id   AS room_id,
@@ -4012,6 +4396,7 @@ router.post('/:id(\\d+)/items', async (req, res) => {
         qty,
         price: priceNum,
         notes: it.notes || null,
+        extra_total: toNum(it.extra_total, 0),
       });
     }
 
@@ -4030,6 +4415,7 @@ router.post('/:id(\\d+)/items', async (req, res) => {
 
     // INSERT riga-per-riga (volumi contenuti, leggibile)
     for (const it of normalized) {
+      const extraTotal = toNum(it.extra_total, 0);
       const result = await query(
         `INSERT INTO order_items (
            order_id,
@@ -4037,9 +4423,10 @@ router.post('/:id(\\d+)/items', async (req, res) => {
            name,
            qty,
            price,
-           notes
+           notes,
+           extra_total
          )
-         VALUES (?,?,?,?,?,?)`,
+         VALUES (?,?,?,?,?,?,?)`,
         [
           id,
           it.product_id,
@@ -4047,6 +4434,7 @@ router.post('/:id(\\d+)/items', async (req, res) => {
           it.qty,
           it.price,
           it.notes,
+          extraTotal,
         ],
       );
       insertedRows += Number(result && result.affectedRows || 0);
@@ -4154,6 +4542,12 @@ router.post('/', async (req, res) => {
           phone,
           displayName,
           customer_user_id,
+        });
+        // Best-effort: upsert contatto Google dopo resolve
+        await tryUpsertGoogleContactForOrder(customer_user_id, {
+          customer_name: dto.customer_name || displayName || null,
+          email,
+          phone,
         });
       }
     } catch (e) {
@@ -4289,6 +4683,7 @@ router.post('/', async (req, res) => {
     const orderId = r.insertId;
 
     for (const it of items) {
+      const extraTotal = toNum(it.extra_total, 0);
       await query(
         `INSERT INTO order_items (
            order_id,
@@ -4296,9 +4691,10 @@ router.post('/', async (req, res) => {
            name,
            qty,
            price,
-           notes
+           notes,
+           extra_total
          )
-         VALUES (?,?,?,?,?,?)`,
+         VALUES (?,?,?,?,?,?,?)`,
         [
           orderId,
           it.product_id != null ? it.product_id : null,
@@ -4306,6 +4702,7 @@ router.post('/', async (req, res) => {
           toNum(it.qty, 1),
           toNum(it.price),
           it.notes || null,
+          extraTotal,
         ],
       );
     }
@@ -4521,6 +4918,7 @@ async function handlePrintComanda(req, res) {
         (req.query && (req.query.layoutKey || req.query.layout_key)) ||
         null,
       st,
+      full,
     );
 
     // Tn: ogni volta che invio COMANDA registro un batch
@@ -4712,7 +5110,9 @@ router.post('/print-jobs/:id/cancel', requireAuth, async (req, res) => {
 
 router.get('/public-asporto-settings', async (_req, res) => {
   try {
+    const env = require('../env');
     const data = await getPublicAsportoSettings();
+    data.prenota_phone_call = env.PRENOTA_PHONE_CALL || '0737642142';
     res.set('Cache-Control', 'no-store');
     return res.json(data);
   } catch (e) {
@@ -5791,21 +6191,29 @@ router.put('/:id(\\d+)/status', requireAuth, async (req, res) => {
     // (2) ricarico riga “idratata”
     const updated = await svc.getById(id);
 
-    // (3) email best-effort
+    // (3) Email "PRENOTAZIONE CONFERMATA" — SOLO quando status passa a accepted
     try {
-      const mustNotify = (notify === true) || (notify === undefined && !!env.RESV?.notifyAlways);
-      if (mustNotify) {
-        const dest = toEmail || updated?.contact_email || updated?.email || null;
-        if (dest && mailer?.sendStatusChangeEmail) {
-          await mailer.sendStatusChangeEmail({
-            to: dest, reservation: updated, newStatus: updated.status, reason, replyTo
+      const dest = toEmail || updated?.contact_email || updated?.email || null;
+      if (updated?.status === 'accepted') {
+        if (env.DISABLE_EMAIL) {
+          logger.info('⛔ 📧 Email disabilitato via env (DISABLE_EMAIL=1)');
+        } else if (!dest) {
+          logger.info('ℹ️ 📧 Email mancante: skip', { id, note: 'cliente senza email' });
+        } else if (mailer?.sendReservationConfirmedEmail) {
+          const out = await mailer.sendReservationConfirmedEmail({
+            to: dest, reservation: updated, replyTo
           });
-          logger.info('📧 status-change mail ✅', { id, to: dest, status: updated.status });
+          if (out?.sent) {
+            logger.info('📧 Email inviata', { reservationId: id, to: dest });
+          } else {
+            logger.warn('⚠️ 📧 Email saltata', { id, reason: out?.reason || 'unknown' });
+          }
         } else {
-          logger.warn('📧 status-change mail SKIP (no email or mailer)', { id, status: updated?.status || '' });
+          logger.warn('⚠️ 📧 Email saltata — sendReservationConfirmedEmail non disponibile', { id });
         }
       }
-    } catch (e) { logger.error('📧 status-change mail ❌', { id, error: String(e) }); }
+      // NO email su: pending (create), rejected, cancelled, deleted
+    } catch (e) { logger.error('📧 Email errore', { id, error: String(e) }); }
 
     // (4) whatsapp best-effort
     try {
@@ -6005,6 +6413,61 @@ router.get('/', async (req, res) => {
 module.exports = router;
 ```
 
+### ./src/api/support.dev.js
+```
+// src/api/support.dev.js
+// [DEV] Route per riavvio server Node: SOLO in dev (NODE_ENV !== 'production') e con DEV_ALLOW_RESTART=1.
+// Utile per pagina /whatsapp-webqr: pulsante "Aggiorna status" in dev = restart + wait server up + reload.
+// IMPORTANTE: funziona solo se il server gira sotto nodemon/pm2 che lo rialza.
+'use strict';
+
+const express = require('express');
+const router = express.Router();
+const requireAuth = require('../middleware/auth');
+const logger = require('../logger');
+
+const isProduction = process.env.NODE_ENV === 'production';
+const devAllowRestart = String(process.env.DEV_ALLOW_RESTART || '0') === '1';
+const RESTART_DELAY_MS = 300;
+
+function setNoCache(res) {
+  res.set('Cache-Control', 'no-store, no-cache, must-revalidate');
+  res.set('Pragma', 'no-cache');
+  res.set('Expires', '0');
+}
+
+/** POST /restart — riavvia il processo (solo dev + DEV_ALLOW_RESTART=1). */
+router.post('/restart', requireAuth, (req, res) => {
+  setNoCache(res);
+
+  if (isProduction) {
+    logger.warn('[DEV] 🔒 restart rifiutato: NODE_ENV=production');
+    return res.status(403).json({ ok: false, error: 'restart_only_in_dev' });
+  }
+  if (!devAllowRestart) {
+    logger.warn('[DEV] 🔒 restart rifiutato: imposta DEV_ALLOW_RESTART=1');
+    return res.status(403).json({
+      ok: false,
+      error: 'restart_disabled',
+      message: 'Imposta DEV_ALLOW_RESTART=1 e avvia con nodemon (es. npm run dev)',
+    });
+  }
+
+  const by = req.user?.email || req.user?.id || 'unknown';
+  const ip = req.ip || req.connection?.remoteAddress || '';
+  logger.info('[DEV] 🔁 restart requested', { by, ip, reason: 'whatsapp-webqr button' });
+  logger.info('[DEV] ℹ️ Assicurati di aver avviato con nodemon (npm run dev) o pm2 per il restart automatico.');
+  res.json({ ok: true, restarting: true, at: Date.now() });
+
+  setTimeout(() => {
+    logger.info('[DEV] 💥 process.exit(0) in 300ms (nodemon/pm2 will restart)');
+    process.exit(0);
+  }, RESTART_DELAY_MS);
+});
+
+module.exports = router;
+```
+
 ### ./src/api/support/support/db-debug.js
 ```
 const express = require('express');
@@ -6144,6 +6607,438 @@ router.patch('/:id/status', async (req, res) => {
   } catch (err) {
     logger.error('❌ [PATCH] /api/tables/:id/status', { id, error: String(err) });
     res.status(500).json({ error: 'Update table status failed' });
+  }
+});
+
+module.exports = router;
+```
+
+### ./src/api/whatsapp-templates.js
+```
+'use strict';
+
+/**
+ * api/whatsapp-templates.js
+ * -----------------------------------------------------------------------------
+ * Router per template WhatsApp prenotazione:
+ * - GET /templates/reservation-received/preview — anteprima testo (debug + FE compose)
+ * - POST /send/reservation-received — invio messaggio prenotazione ricevuta
+ *
+ * Mount: app.use('/api/whatsapp', require('./api/whatsapp-templates'))
+ */
+
+const express = require('express');
+const router = express.Router();
+
+const logger = require('../logger');
+const env = require('../env');
+const {
+  buildReservationReceivedMessage,
+  getMapsUrl,
+} = require('../utils/whatsapp-templates');
+
+const reservationsSvc = require('../services/reservations.service');
+const waService = require('../services/whatsapp.service');
+const webqrService = require('../services/whatsapp-webqr.service');
+const twilioService = require('../services/twilio.service');
+
+// ----------------------------------------------------------------------------
+// Auth middleware (fallback DEV)
+// ----------------------------------------------------------------------------
+let requireAuth = (req, res, next) => next();
+try {
+  ({ requireAuth } = require('../middleware/auth'));
+} catch (_) {}
+
+// ----------------------------------------------------------------------------
+// GET /templates/reservation-received/preview
+// Query: name, date, time, people (opzionali) — per test e FE compose
+// Risponde: { ok, text, mapsUrl, brand }
+// ----------------------------------------------------------------------------
+router.get('/templates/reservation-received/preview', requireAuth, (req, res) => {
+  const customer_first = (req.query.customer_first || '').toString().trim();
+  const customer_last = (req.query.customer_last || '').toString().trim();
+  const name = (req.query.name || '').toString().trim() || 'Cliente';
+  const dateStr = (req.query.date || '').toString().trim();
+  const timeStr = (req.query.time || '').toString().trim() || '18:30';
+  const people = Math.max(0, Math.floor(Number(req.query.people) || 2));
+  const phone = (req.query.phone || '').toString().trim();
+  const start_at = (req.query.start_at || '').toString().trim();
+  const booking_code = (req.query.booking_code || req.query.code || '').toString().trim();
+  const reservation_id = Number(req.query.reservation_id || req.query.reservationId);
+  const notes = (req.query.notes || '').toString().trim();
+
+  const payload = {
+    customer_first: customer_first || undefined,
+    customer_last: customer_last || undefined,
+    customerName: name,
+    dateStr: dateStr || undefined,
+    timeStr: timeStr,
+    people,
+    phone: phone || undefined,
+    start_at: start_at || undefined,
+    booking_code: booking_code || undefined,
+    code: booking_code || undefined,
+    id: Number.isFinite(reservation_id) && reservation_id > 0 ? reservation_id : undefined,
+    reservationId: Number.isFinite(reservation_id) && reservation_id > 0 ? reservation_id : undefined,
+    notes: notes || undefined,
+  };
+
+  const cfg = env.WHATSAPP_TEMPLATE || {};
+  const text = buildReservationReceivedMessage(payload, cfg);
+  const mapsUrl = getMapsUrl(cfg);
+
+  // Formato telefono umano
+  const brandPhone = (cfg.brandPhone || '0737642142').toString();
+  const phoneFormatted = brandPhone.length >= 6
+    ? `${brandPhone.slice(0, 4)} ${brandPhone.slice(4)}`
+    : brandPhone;
+
+  return res.json({
+    ok: true,
+    text,
+    mapsUrl,
+    brand: {
+      name: cfg.brandName || 'Pizzeria La Lanterna',
+      city: cfg.brandCity || 'Castelraimondo',
+      phone: phoneFormatted,
+      addressLine: cfg.brandAddressLine || 'Largo della Libertà, 4',
+    },
+  });
+});
+
+// ----------------------------------------------------------------------------
+// POST /send/reservation-received
+// Body: { to: "39339...", reservationId: 123 }
+// Recupera prenotazione dal DB, compone testo, invia via WebQR o Twilio.
+// Se entrambi disabilitati: 200 { ok: true, disabled: true, textPreview }
+// ----------------------------------------------------------------------------
+router.post('/send/reservation-received', requireAuth, async (req, res) => {
+  const to = (req.body?.to || '').toString().trim();
+  const reservationId = Number(req.body?.reservationId);
+
+  if (!to) {
+    return res.status(400).json({ ok: false, error: 'missing_to' });
+  }
+
+  let reservation = null;
+  if (reservationId && Number.isFinite(reservationId)) {
+    try {
+      reservation = await reservationsSvc.getById(reservationId);
+    } catch (e) {
+      logger.warn('🧩 [WA-TPL] reservation not found', { reservationId, error: String(e) });
+    }
+  }
+
+  // Payload per builder: da reservation o da body (phone per mascheramento, id per codice)
+  const payload = reservation
+    ? {
+        customer_first: reservation.customer_first,
+        customer_last: reservation.customer_last,
+        display_name: reservation.display_name,
+        phone: reservation.phone,
+        start_at: reservation.start_at,
+        party_size: reservation.party_size,
+        notes: reservation.notes,
+        reservationId: reservation.id,
+        id: reservation.id,
+      }
+    : {
+        customerName: req.body?.name || 'Cliente',
+        dateStr: req.body?.date || '--/--',
+        timeStr: req.body?.time || '--:--',
+        people: Math.max(0, Math.floor(Number(req.body?.people) || 1)),
+      };
+
+  const cfg = env.WHATSAPP_TEMPLATE || {};
+  const text = buildReservationReceivedMessage(payload, cfg);
+  const customerName = payload.customer_first && payload.customer_last
+    ? `${payload.customer_first} ${payload.customer_last}`.trim()
+    : payload.customerName || payload.display_name || '';
+
+  logger.info('🧩 [WA-TPL] reservation-received built', {
+    to: `${String(to).slice(0, 6)}…`,
+    name: customerName || '(no-name)',
+    preview: text.length > 80 ? `${text.slice(0, 80)}…` : text,
+  });
+
+  const webqrEnabled = String(process.env.WHATSAPP_WEBQR_ENABLED || '0') === '1';
+  const twilioEnabled = twilioService?.isTwilioEnabled?.() ?? false;
+
+  // 1) Prova WebQR (se abilitato e connesso)
+  if (webqrEnabled && webqrService?.enabled?.()) {
+    try {
+      const st = webqrService.getStatus?.();
+      if (st?.status === 'open') {
+        const result = await webqrService.send({ to, text });
+        if (result?.msgId) {
+          logger.info('📲 [WA-TPL] inviato via WebQR', { to: `${to.slice(0, 6)}…`, msgId: result.msgId });
+          return res.json({ ok: true, sent: true, channel: 'webqr', msgId: result.msgId });
+        }
+      }
+    } catch (e) {
+      logger.warn('📲 [WA-TPL] WebQR send KO (fallback Twilio)', { error: String(e) });
+    }
+  }
+
+  // 2) Prova Twilio (se abilitato)
+  if (twilioEnabled && waService?.sendText) {
+    try {
+      const result = await waService.sendText({
+        to,
+        text,
+        allowOutsideWindow: true, // messaggio iniziale prenotazione
+      });
+      if (result?.ok && !result?.skipped) {
+        logger.info('📲 [WA-TPL] inviato via Twilio', { to: `${to.slice(0, 6)}…`, sid: result?.sid });
+        return res.json({ ok: true, sent: true, channel: 'twilio', sid: result?.sid });
+      }
+      if (result?.disabled) {
+        logger.info('🛑 [WA-TPL] Twilio disabled — skip send');
+        return res.json({
+          ok: true,
+          disabled: true,
+          textPreview: text.length > 80 ? `${text.slice(0, 80)}…` : text,
+        });
+      }
+    } catch (e) {
+      logger.warn('📲 [WA-TPL] Twilio send KO', { error: String(e) });
+    }
+  }
+
+  // 3) Entrambi disabilitati o falliti
+  logger.info('🛑 [WA-TPL] canali disabilitati — skip send', {
+    webqrEnabled,
+    twilioEnabled,
+  });
+  return res.json({
+    ok: true,
+    disabled: true,
+    textPreview: text.length > 80 ? `${text.slice(0, 80)}…` : text,
+  });
+});
+
+module.exports = router;
+```
+
+### ./src/api/whatsapp-webqr.js
+```
+// src/api/whatsapp-webqr.js
+// [WEBQR] REST: GET /status, GET /qr, POST /send, GET /last-message, POST /restart, POST /reset (con guard ENV).
+// Invio consentito SOLO se status === 'open'; altrimenti 409 WA_NOT_READY (anti-falso-OK).
+// TASK 2: lazy-start su GET /status e GET /qr. TASK 3: no-cache. TASK 7: GET /debug.
+'use strict';
+
+const express = require('express');
+const router = express.Router();
+const requireAuth = require('../middleware/auth');
+const webqrService = require('../services/whatsapp-webqr.service');
+const logger = require('../logger');
+
+/** TASK 3: no 304/ETag — imposta header per evitare cache browser. */
+function setNoCache(res) {
+  res.set('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
+  res.set('Pragma', 'no-cache');
+  res.set('Expires', '0');
+  res.removeHeader('ETag');
+}
+
+const SEND_RATE_LIMIT = 20;   // max richieste per finestra
+const SEND_WINDOW_MS = 60_000; // 1 minuto
+let sendCount = 0;
+let sendWindowStart = Date.now();
+
+function checkSendRateLimit(_req, res, next) {
+  const now = Date.now();
+  if (now - sendWindowStart >= SEND_WINDOW_MS) {
+    sendCount = 0;
+    sendWindowStart = now;
+  }
+  sendCount++;
+  if (sendCount > SEND_RATE_LIMIT) {
+    return res.status(429).json({ ok: false, error: 'rate_limit', message: 'Troppi invii, riprova più tardi' });
+  }
+  next();
+}
+
+router.get('/status', requireAuth, (req, res) => {
+  setNoCache(res);
+  try {
+    const { io } = require('../sockets');
+    webqrService.ensureStarted(io());
+  } catch (_) {}
+  const data = webqrService.getStatus();
+  logger.info('[WEBQR] 📡 /status hit', { status: data.status, hasQr: !!data.qr, lastError: data.lastError ?? null, lastSendOk: data.lastSendAttempt?.ok ?? null });
+  res.json({ ok: true, ...data });
+});
+
+router.get('/qr', requireAuth, (req, res) => {
+  if (!webqrService.enabled()) {
+    return res.status(503).json({ ok: false, error: 'whatsapp_webqr_disabled' });
+  }
+  setNoCache(res);
+  try {
+    const { io } = require('../sockets');
+    webqrService.ensureStarted(io());
+  } catch (_) {}
+  const st = webqrService.getStatus();
+  logger.info('[WEBQR] 📡 /qr hit', { status: st.status, hasQr: !!st.qr });
+  res.json({
+    ok: true,
+    status: st.status,
+    qr: st.qr || null,
+    updatedAt: st.updatedAt,
+    lastError: st.lastError,
+    me: st.me || null,
+    sessionId: st.sessionId ?? 0,
+  });
+});
+
+// TASK 7: diagnostica — enabled, started, INSTANCE_ID, authDir, retryCount, proxy, ecc.
+router.get('/debug', requireAuth, (_req, res) => {
+  setNoCache(res);
+  const info = webqrService.getDebugInfo();
+  res.json({ ok: true, ...info });
+});
+
+router.get('/messages', requireAuth, async (_req, res) => {
+  setNoCache(res);
+  try {
+    if (!webqrService.enabled()) {
+      return res.status(503).json({ ok: false, error: 'whatsapp_webqr_disabled' });
+    }
+    const { messages, lastMessage } = await webqrService.getMessagesForApi();
+    const count = Array.isArray(messages) ? messages.length : 0;
+    logger.info('[WEBQR] 📡 /messages hit', { count, hasLast: !!lastMessage });
+    res.json({ ok: true, messages: messages || [], lastMessage: lastMessage || null });
+  } catch (e) {
+    logger.warn('[WEBQR] /messages fallback vuoto', { error: String(e?.message || e) });
+    res.json({ ok: true, messages: [], lastMessage: null });
+  }
+});
+
+// GET /media/:messageId — scarica il media del messaggio (immagine, video, documento, ecc.)
+router.get('/media/:messageId', requireAuth, async (req, res) => {
+  if (!webqrService.enabled()) {
+    return res.status(503).json({ ok: false, error: 'whatsapp_webqr_disabled' });
+  }
+  const messageId = (req.params.messageId || '').trim();
+  if (!messageId) return res.status(400).json({ ok: false, error: 'missing_message_id' });
+  try {
+    const result = await webqrService.getMediaBuffer(messageId);
+    if (!result) return res.status(404).json({ ok: false, error: 'media_not_found' });
+    res.set('Content-Type', result.contentType);
+    res.send(result.buffer);
+  } catch (e) {
+    const msg = e?.message || String(e);
+    logger.warn('[WEBQR] /media/:messageId KO', { messageId, error: msg });
+    res.status(500).json({ ok: false, error: 'download_failed', message: msg });
+  }
+});
+
+// POST /restart — soft restart (ricrea socket, non cancella auth)
+router.post('/restart', requireAuth, (req, res) => {
+  if (!webqrService.enabled()) {
+    return res.status(503).json({ ok: false, error: 'whatsapp_webqr_disabled' });
+  }
+  try {
+    const { io } = require('../sockets');
+    webqrService.restart(io());
+    const data = webqrService.getStatus();
+    logger.info('[WEBQR] 📡 /restart ok', { statusPost: data.status });
+    res.json({ ok: true, restart: true, status: data.status, updatedAt: data.updatedAt });
+  } catch (e) {
+    const msg = e?.message || String(e);
+    logger.warn('[WEBQR] /restart KO', { error: msg });
+    res.status(500).json({ ok: false, error: 'restart_failed', message: msg });
+  }
+});
+
+// Reset: cancella sessione auth e riavvia (solo se WA_RESET_ENABLED=1 o NODE_ENV=development)
+router.post('/reset', requireAuth, (req, res) => {
+  if (!webqrService.enabled()) {
+    return res.status(503).json({ ok: false, error: 'whatsapp_webqr_disabled' });
+  }
+  try {
+    const { io } = require('../sockets');
+    webqrService.reset(io());
+    res.json({ ok: true, reset: true });
+  } catch (e) {
+    const code = e?.code || 'reset_failed';
+    const msg = e?.message || String(e);
+    if (code === 'RESET_DISABLED') {
+      return res.status(403).json({ ok: false, error: code, message: msg });
+    }
+    res.status(500).json({ ok: false, error: 'reset_failed', message: msg });
+  }
+});
+
+// GET /last-message — ultimo messaggio ricevuto (debug)
+router.get('/last-message', requireAuth, (req, res) => {
+  setNoCache(res);
+  if (!webqrService.enabled()) {
+    return res.status(503).json({ ok: false, error: 'whatsapp_webqr_disabled' });
+  }
+  const last = webqrService.getLastMessage();
+  logger.info('[WEBQR] 📡 /last-message hit', { hasLast: !!last });
+  res.json({ ok: true, lastMessage: last || null });
+});
+
+router.post('/send', requireAuth, checkSendRateLimit, async (req, res) => {
+  if (!webqrService.enabled()) {
+    return res.status(503).json({ ok: false, error: 'whatsapp_webqr_disabled' });
+  }
+  const { to, text } = req.body || {};
+  const toStr = (to != null && String(to).trim()) ? String(to).trim() : '';
+  const textStr = (text != null && String(text).trim()) ? String(text).trim() : '';
+  if (!toStr) {
+    return res.status(400).json({ ok: false, error: 'missing_to' });
+  }
+  try {
+    const result = await webqrService.send({ to: toStr, text: textStr });
+    logger.info('[WEBQR] 📡 /send 200', { to: toStr, msgId: result?.msgId ?? null });
+    res.json({ ok: true, sent: true, msgId: result?.msgId ?? null });
+  } catch (e) {
+    const code = e?.code || '';
+    const msg = e?.message || String(e);
+    if (code === 'WA_NOT_READY' || code === 'WA_DISABLED') {
+      return res.status(409).json({ ok: false, error: code, message: msg });
+    }
+    if (code === 'INVALID_PHONE') {
+      return res.status(400).json({ ok: false, error: code, message: msg });
+    }
+    if (msg.includes('disabled') || msg.includes('non connesso')) {
+      return res.status(409).json({ ok: false, error: 'WA_NOT_READY', message: msg });
+    }
+    res.status(500).json({ ok: false, error: 'send_failed', message: msg });
+  }
+});
+
+// POST /test-send — alias di POST /send (stesse guardie e reason codes)
+router.post('/test-send', requireAuth, checkSendRateLimit, async (req, res) => {
+  if (!webqrService.enabled()) {
+    return res.status(503).json({ ok: false, error: 'whatsapp_webqr_disabled' });
+  }
+  const { to, text } = req.body || {};
+  const toStr = (to != null && String(to).trim()) ? String(to).trim() : '';
+  const textStr = (text != null && String(text).trim()) ? String(text).trim() : '';
+  if (!toStr) {
+    return res.status(400).json({ ok: false, error: 'missing_to' });
+  }
+  try {
+    const result = await webqrService.send({ to: toStr, text: textStr || 'Test' });
+    logger.info('[WEBQR] 📡 /test-send 200', { to: toStr, msgId: result?.msgId ?? null });
+    res.json({ ok: true, sent: true, msgId: result?.msgId ?? null });
+  } catch (e) {
+    const code = e?.code || '';
+    const msg = e?.message || String(e);
+    if (code === 'WA_NOT_READY' || code === 'WA_DISABLED') {
+      return res.status(409).json({ ok: false, error: code, message: msg });
+    }
+    if (code === 'INVALID_PHONE') {
+      return res.status(400).json({ ok: false, error: code, message: msg });
+    }
+    res.status(500).json({ ok: false, error: 'send_failed', message: msg });
   }
 });
 
@@ -6468,6 +7363,9 @@ function getPool() {
 
     // timeouts “umani”
     connectTimeout: 10_000,
+
+    // 🧭 FIX TZ: DATETIME/TIMESTAMP tornano come stringhe, NON come Date (evita toISOString → UTC)
+    dateStrings: true,
   });
 
   logger.info('🗄️  DB Pool created', {
@@ -6478,6 +7376,7 @@ function getPool() {
     user: user ? (String(user).slice(0, 2) + '…') : '',
     envFileLoaded: env._envFileLoaded || '(none)',
   });
+  logger.info('🧭 DB dateStrings enabled: true (DATETIME → stringa locale, no UTC ISO)');
 
   return _pool;
 }
@@ -6827,20 +7726,40 @@ function tryLoadDotEnv() {
   }
 
   const cwd = process.cwd();
+  // Cartella backend (be/): env.js è in be/src, quindi __dirname/.. = be/
+  const backendRoot = path.resolve(__dirname, '..');
 
-  // ordine: più specifico → più generico
-  const candidates = [
-    `.env.${NODE_ENV}.local`,
-    `.env.${NODE_ENV}`,
-    `.env.local`,
-    `.env`,
-    // fallback “umani” (succede quando ci si salva .env con nome diverso)
-    `.env copy`,
-    `.env copy 2`,
-    `env/.env`,
-    `env/.env.${NODE_ENV}`,
-  ];
+  let loadedAny = false;
+  // 1) Base da be/: carica .env poi overlay .env.${NODE_ENV} così WHATSAPP_WEBQR_ENABLED non si perde
+  const baseEnv = path.join(backendRoot, '.env');
+  if (fs.existsSync(baseEnv)) {
+    try {
+      dotenv.config({ path: baseEnv });
+      loadedAny = true;
+    } catch (_) {}
+  }
+  const overlayEnv = path.join(backendRoot, `.env.${NODE_ENV}`);
+  if (fs.existsSync(overlayEnv)) {
+    try {
+      dotenv.config({ path: overlayEnv });
+      loadedAny = true;
+    } catch (_) {}
+  }
+  if (loadedAny) return { loaded: true, file: baseEnv };
 
+  // 2) Fallback: ordine storico da backendRoot
+  const candidates = [`.env.${NODE_ENV}.local`, `.env.${NODE_ENV}`, `.env.local`, `.env`, `.env copy`, `.env copy 2`, `env/.env`, `env/.env.${NODE_ENV}`];
+  for (const name of candidates) {
+    const full = path.join(backendRoot, name);
+    try {
+      if (fs.existsSync(full)) {
+        dotenv.config({ path: full });
+        return { loaded: true, file: full };
+      }
+    } catch (_) {}
+  }
+
+  // 3) Fallback: cwd
   for (const name of candidates) {
     const full = path.join(cwd, name);
     try {
@@ -6944,10 +7863,21 @@ const env = {
   },
 
   // ---------------------------------------------------------------------------
+  // EMBED IFRAME (consentire ad altri siti di incorporare prenota.pizzerialalanterna.it)
+  // Content-Security-Policy: frame-ancestors. * = tutti; oppure elenco origini separate da spazio.
+  // ---------------------------------------------------------------------------
+  FRAME_ANCESTORS: str(process.env.FRAME_ANCESTORS, '*').trim(),
+
+  // ---------------------------------------------------------------------------
   // CENTRALINO (PBX → /asporto)
   // ---------------------------------------------------------------------------
   CENTRALINO_KEY: str(process.env.CENTRALINO_KEY, ''),
   CENTRALINO_REDIRECT_BASE: str(process.env.CENTRALINO_REDIRECT_BASE, ''),
+
+  // ---------------------------------------------------------------------------
+  // PRENOTA — pagina "ci dispiace" quando prenotazioni online OFF
+  // ---------------------------------------------------------------------------
+  PRENOTA_PHONE_CALL: str(process.env.PRENOTA_PHONE_CALL, '0737642142'),
 
   // ---------------------------------------------------------------------------
   // MAIL
@@ -6962,6 +7892,26 @@ const env = {
     from: str(process.env.MAIL_FROM, 'Prenotazioni <no-reply@example.com>'),
     replyTo: str(process.env.MAIL_REPLY_TO, ''),
     bizName: str(process.env.BIZ_NAME, str(process.env.BRAND_NAME, 'La tua attività')),
+  },
+
+  // ---------------------------------------------------------------------------
+  // DISABLE NOTIFICATIONS (override globale)
+  // DISABLE_TWILIO=1 → nessun WhatsApp/Twilio (override su TWILIO_ENABLED)
+  // DISABLE_EMAIL=1 → nessuna email prenotazione confermata
+  // ---------------------------------------------------------------------------
+  DISABLE_TWILIO: bool(process.env.DISABLE_TWILIO, false),
+  DISABLE_EMAIL: bool(process.env.DISABLE_EMAIL, false),
+
+  // ---------------------------------------------------------------------------
+  // TWILIO GATE (globale: WhatsApp + SMS — disattivabile via env senza toccare codice)
+  // Regola: Twilio è attivo solo se TWILIO_ENABLED=1 E credenziali minime presenti.
+  // Se mancano credenziali → forzare disabled + log warn (gestito in twilio.service).
+  // ---------------------------------------------------------------------------
+  TWILIO: {
+    // '0' | '1' — default non impostato: in twilio.service si deriva da presenza credenziali
+    enabledRaw: str(process.env.TWILIO_ENABLED, ''),
+    dryRun: bool(process.env.TWILIO_DRY_RUN, false),
+    blockReason: str(process.env.TWILIO_BLOCK_REASON, '').trim(),
   },
 
   // ---------------------------------------------------------------------------
@@ -6997,6 +7947,24 @@ const env = {
 
     // log contenuto messaggi (di solito NO)
     logContent: bool(process.env.WA_LOG_CONTENT, false),
+  },
+
+  // ---------------------------------------------------------------------------
+  // WHATSAPP TEMPLATE — Brand, Maps, Footer (prenotazione ricevuta)
+  // ---------------------------------------------------------------------------
+  WHATSAPP_TEMPLATE: {
+    brandName: str(process.env.BRAND_NAME, str(process.env.BIZ_NAME, 'Pizzeria La Lanterna')),
+    brandCity: str(process.env.BRAND_CITY, 'Castelraimondo'),
+    brandPhone: str(process.env.BRAND_PHONE, '0737642142'),
+    brandAddressLine: str(process.env.BRAND_ADDRESS_LINE, 'Largo della Libertà, 4'),
+    brandMapsQuery: str(process.env.BRAND_MAPS_QUERY, ''),
+    brandMapsUrl: str(process.env.BRAND_MAPS_URL, ''),
+    privacyPolicyUrl: str(process.env.PRIVACY_POLICY_URL, 'https://www.iubenda.com/privacy-policy/90366241'),
+    footerMode: str(process.env.WHATSAPP_FOOTER_MODE, 'no-reply'),
+    notificationsOnlyText: str(
+      process.env.WHATSAPP_NOTIFICATIONS_ONLY_TEXT,
+      'WhatsApp usato solo per notifiche di servizio.'
+    ),
   },
 
   // ---------------------------------------------------------------------------
@@ -7238,6 +8206,16 @@ app.set('logger', logger);
 app.use(express.json());
 app.use(cors({ origin: true, credentials: true }));
 
+// Consenti embed in iframe da altri siti (prenota = contenuto incorporabile)
+// Imposta Content-Security-Policy: frame-ancestors; default * (tutti). Su Plesk l’HTML è servito da Apache/Nginx: vedi docs/EMBED-IFRAME-PLESK.md
+const frameAncestors = (env.FRAME_ANCESTORS || '*').trim();
+if (frameAncestors) {
+  app.use((_req, res, next) => {
+    res.set('Content-Security-Policy', `frame-ancestors ${frameAncestors}`);
+    next();
+  });
+}
+
 function ensureExists(relPath, friendlyName) {
   const abs = path.join(__dirname, relPath);
   const ok =
@@ -7306,6 +8284,14 @@ if (ensureExists('api/customers', 'API /api/customers'))
 if (ensureExists('api/centralino', 'API /api/centralino'))
   app.use('/api/centralino', require('./api/centralino')(app));
 
+// 🆕 WhatsApp WebQR (BLOCCO 3 — stub: GET /status, /qr, POST /send)
+if (ensureExists('api/whatsapp-webqr', 'API /api/whatsapp-webqr'))
+  app.use('/api/whatsapp-webqr', require('./api/whatsapp-webqr'));
+
+// 🆕 WhatsApp Templates (preview + send reservation-received)
+if (ensureExists('api/whatsapp-templates', 'API /api/whatsapp'))
+  app.use('/api/whatsapp', require('./api/whatsapp-templates'));
+
 // 🆕 Gift Vouchers (Buoni Regalo)
 if (ensureExists('api/gift-vouchers', 'API /api/gift-vouchers'))
   app.use('/api/gift-vouchers', require('./api/gift-vouchers')(app));
@@ -7317,6 +8303,10 @@ if (ensureExists('api/public-voucher', 'API /api/public/voucher'))
 // Health
 if (ensureExists('api/health', 'API /api/health'))
   app.use('/api/health', require('./api/health'));
+
+// [DEV] Support dev: POST /api/support/dev/restart (solo NODE_ENV!==production + DEV_ALLOW_RESTART=1)
+if (ensureExists('api/support.dev', 'API /api/support/dev'))
+  app.use('/api/support/dev', require('./api/support.dev'));
 
 // (Eventuali) Socket.IO
 const { Server } = require('socket.io');
@@ -7352,6 +8342,16 @@ if (ensureExists('db/migrator', 'DB migrator')) {
       }),
     );
 }
+
+// TASK E: error handler finale per loggare 500 e rispondere JSON
+app.use((err, _req, res, _next) => {
+  const path = _req?.path ?? _req?.url ?? '';
+  const method = _req?.method ?? '';
+  logger.error('[API] 💥 500', { path, method, err: String(err?.message || err) });
+  if (!res.headersSent) {
+    res.status(500).json({ ok: false, error: 'internal_error' });
+  }
+});
 
 server.listen(env.PORT, () =>
   logger.info(`🚀 HTTP listening on :${env.PORT}`),
@@ -7745,6 +8745,7 @@ module.exports = {
 'use strict';
 
 const { google } = require('googleapis');
+const crypto = require('crypto');
 // ✅ FIX path relativi dal folder /services → vai su ../logger e ../db:
 const logger = require('../logger');
 const { query } = require('../db');
@@ -7803,12 +8804,12 @@ async function revokeForOwner() {
 // Exchange 'code' (GIS popup) → tokens
 // ----------------------------------------------------------------------------
 async function exchangeCode(code) {
+  logger.info('[Google BE] exchangeCode: chiamata a Google getToken (redirect_uri=postmessage)');
   const { oAuth2Client } = getOAuthClient();
   // NB: con GIS popup serve passare redirect_uri='postmessage'
   const { tokens } = await oAuth2Client.getToken({ code, redirect_uri: 'postmessage' });
-  // Salvo anche expiry_date (numero ms epoch) se presente
   await saveTokens(tokens);
-  logger.info('🔐 [Google] Code exchanged, tokens saved', { has_refresh: !!tokens.refresh_token });
+  logger.info('[Google BE] exchangeCode OK, token salvati in google_tokens', { has_refresh: !!tokens.refresh_token });
   return tokens;
 }
 
@@ -7819,6 +8820,7 @@ async function exchangeCode(code) {
 async function ensureAuth() {
   const tokens = await loadTokens();
   if (!tokens?.refresh_token) {
+    logger.warn('[Google BE] ensureAuth: nessun refresh_token in DB → consent_required');
     const err = new Error('Consent required');
     err.code = 'consent_required';
     throw err;
@@ -7832,18 +8834,16 @@ async function ensureAuth() {
     expiry_date: tokens.expiry_date || undefined
   });
 
-  // se scaduto/assente → refresh
   const needsRefresh = !tokens.access_token || !tokens.expiry_date || (Date.now() >= Number(tokens.expiry_date) - 30_000);
   if (needsRefresh) {
+    logger.info('[Google BE] ensureAuth: access token scaduto/assente, refresh in corso');
     try {
       const newTokens = (await oAuth2Client.refreshAccessToken())?.credentials || {};
-      // persisto i nuovi token
       await saveTokens(newTokens);
       oAuth2Client.setCredentials(newTokens);
-      logger.info('🔄 [Google] access token refreshed');
+      logger.info('[Google BE] ensureAuth: access token refreshed OK');
     } catch (e) {
-      logger.error('🔄❌ [Google] token refresh failed', { error: String(e) });
-      // se fallisce il refresh, meglio richiedere nuovamente consenso
+      logger.error('[Google BE] ensureAuth: token refresh failed', { error: String(e) });
       const err = new Error('Consent required');
       err.code = 'consent_required';
       throw err;
@@ -7909,8 +8909,9 @@ async function createContact({ givenName, familyName, displayName, email, phone,
 
     const resp = await people.people.createContact({ requestBody });
     const resourceName = resp.data?.resourceName || null;
+    const etag = resp.data?.etag || null;
     logger.info('👤 [Google] contact created', { resourceName });
-    return { ok: true, resourceName };
+    return { ok: true, resourceName, etag };
   } catch (e) {
     const msg = String(e?.message || e);
     // se i token non includono scope write → 403 insufficient permissions
@@ -7971,7 +8972,304 @@ async function updateContact({ resourceName, etag, givenName, familyName, displa
 
   const updated = resp?.data || {};
   logger.info('👤 [Google] contact updated', { resourceName, fields: updateFields });
-  return { ok: true, resourceName: updated.resourceName || resourceName };
+  return { ok: true, resourceName: updated.resourceName || resourceName, etag: updated.etag || contactEtag };
+}
+
+// ----------------------------------------------------------------------------
+// Upsert "pro"
+// ----------------------------------------------------------------------------
+function normalizePhone(v) {
+  return String(v || '').replace(/\D+/g, '');
+}
+
+function isPhoneMatch(a, b) {
+  const na = normalizePhone(a);
+  const nb = normalizePhone(b);
+  if (!na || !nb) return false;
+  if (na === nb) return true;
+  if (na.length >= 8 && nb.length >= 8) return na.slice(-8) === nb.slice(-8);
+  return false;
+}
+
+function isEmailMatch(a, b) {
+  const ea = String(a || '').trim().toLowerCase();
+  const eb = String(b || '').trim().toLowerCase();
+  if (!ea || !eb) return false;
+  return ea === eb;
+}
+
+function buildContactPayloadFromUser(user) {
+  const first = String(user?.first_name || '').trim();
+  const last = String(user?.last_name || '').trim();
+  const full =
+    String(user?.full_name || '').trim() ||
+    String(user?.name || '').trim() ||
+    `${first} ${last}`.trim();
+
+  return {
+    givenName: first || undefined,
+    familyName: last || undefined,
+    displayName: full || undefined,
+    email: String(user?.email || '').trim() || undefined,
+    phone: String(user?.phone || '').trim() || undefined,
+    note: String(user?.note || '').trim() || undefined,
+  };
+}
+
+function buildLocalSnapshot(payload) {
+  return {
+    displayName: payload.displayName || null,
+    givenName: payload.givenName || null,
+    familyName: payload.familyName || null,
+    email: payload.email || null,
+    phone: payload.phone || null,
+    note: payload.note || null,
+  };
+}
+
+function buildHash(snapshot) {
+  const json = JSON.stringify(snapshot || {});
+  return crypto.createHash('sha256').update(json).digest('hex');
+}
+
+function toContactSnapshot(raw) {
+  return {
+    resourceName: raw?.resourceName || null,
+    etag: raw?.etag || null,
+    displayName: raw?.displayName || null,
+    givenName: raw?.givenName || null,
+    familyName: raw?.familyName || null,
+    email: raw?.email || null,
+    phone: raw?.phone || null,
+    note: raw?.note || null,
+  };
+}
+
+async function getContact(resourceName) {
+  if (!resourceName) return null;
+  const auth = await ensureAuth();
+  const people = peopleClient(auth);
+  const resp = await people.people.get({
+    resourceName,
+    personFields: 'names,emailAddresses,phoneNumbers,biographies',
+  });
+  const p = resp?.data || {};
+  const name = p.names?.[0] || {};
+  const email = p.emailAddresses?.[0] || {};
+  const phone = p.phoneNumbers?.[0] || {};
+  const bio = p.biographies?.[0] || {};
+  return toContactSnapshot({
+    resourceName: p.resourceName || resourceName,
+    etag: p.etag || null,
+    displayName: name.displayName || null,
+    givenName: name.givenName || null,
+    familyName: name.familyName || null,
+    email: email.value || null,
+    phone: phone.value || null,
+    note: bio.value || null,
+  });
+}
+
+function isEtagMismatchError(e) {
+  const code = e?.code || e?.response?.status || null;
+  if (code === 412 || code === 409) return true;
+  const msg = String(e?.message || e || '').toLowerCase();
+  return msg.includes('etag') || msg.includes('precondition');
+}
+
+function detectConflict(localSnap, googleSnap) {
+  if (!googleSnap) return false;
+  const localPhone = normalizePhone(localSnap?.phone);
+  const googlePhone = normalizePhone(googleSnap?.phone);
+  const phoneConflict =
+    localPhone && googlePhone && localPhone !== googlePhone;
+
+  const localEmail = String(localSnap?.email || '').trim().toLowerCase();
+  const googleEmail = String(googleSnap?.email || '').trim().toLowerCase();
+  const emailConflict =
+    localEmail && googleEmail && localEmail !== googleEmail;
+
+  const localName = String(localSnap?.displayName || '').trim().toLowerCase();
+  const googleName = String(googleSnap?.displayName || '').trim().toLowerCase();
+  const nameConflict =
+    localName && googleName && localName !== googleName;
+
+  return phoneConflict || emailConflict || nameConflict;
+}
+
+async function insertConflict(userId, localSnap, googleSnap) {
+  const localJson = JSON.stringify(localSnap || {});
+  const googleJson = JSON.stringify(googleSnap || {});
+  try {
+    const res = await query(
+      `INSERT INTO google_contact_conflicts
+        (user_id, local_snapshot_json, google_snapshot_json, status, created_at)
+       VALUES (?, ?, ?, 'pending', UTC_TIMESTAMP())`,
+      [userId, localJson, googleJson],
+    );
+    return res?.insertId || null;
+  } catch (e) {
+    logger.warn('👤⚠️ [Google] conflict insert KO', { error: String(e), userId });
+    return null;
+  }
+}
+
+async function updateUserGoogleMeta(userId, { resourceName, etag, hash }) {
+  if (!userId) return;
+  await query(
+    `UPDATE users
+     SET
+       google_resource_name = COALESCE(?, google_resource_name),
+       google_etag = COALESCE(?, google_etag),
+       google_sync_hash = COALESCE(?, google_sync_hash),
+       google_sync_at = UTC_TIMESTAMP()
+     WHERE id = ?`,
+    [resourceName || null, etag || null, hash || null, userId],
+  );
+}
+
+async function findBestMatchByPhoneEmail({ phone, email }) {
+  const items = [];
+  if (phone) {
+    const list = await searchContacts(phone, 10);
+    items.push(...(list || []));
+  }
+  if (email) {
+    const list = await searchContacts(email, 10);
+    items.push(...(list || []));
+  }
+  const byPhone = items.find((it) => isPhoneMatch(phone, it.phone));
+  if (byPhone) return toContactSnapshot(byPhone);
+  const byEmail = items.find((it) => isEmailMatch(email, it.email));
+  if (byEmail) return toContactSnapshot(byEmail);
+  return null;
+}
+
+async function upsertContactFromUser(user = {}) {
+  const userId = user?.id || null;
+  if (!userId) return { ok: false, reason: 'missing_user_id' };
+
+  const payload = buildContactPayloadFromUser(user);
+  const localSnap = buildLocalSnapshot(payload);
+  const hash = buildHash(localSnap);
+
+  if (!payload.phone && !payload.email && !payload.displayName) {
+    return { ok: false, reason: 'empty_payload' };
+  }
+
+  const resourceName = user.google_resource_name || null;
+  const etag = user.google_etag || null;
+
+  // 1) Se ho già resourceName → update con etag
+  if (resourceName) {
+    try {
+      const res = await updateContact({
+        resourceName,
+        etag,
+        ...payload,
+      });
+      await updateUserGoogleMeta(userId, {
+        resourceName: res.resourceName || resourceName,
+        etag: res.etag || etag,
+        hash,
+      });
+      return { ok: true, resourceName: res.resourceName || resourceName };
+    } catch (e) {
+      if (isEtagMismatchError(e)) {
+        const remote = await getContact(resourceName);
+        if (detectConflict(localSnap, remote)) {
+          const conflictId = await insertConflict(userId, localSnap, remote);
+          logger.warn('👤⚠️ [Google] conflict detected (etag mismatch)', {
+            userId,
+            resourceName,
+            conflictId,
+          });
+          return { ok: false, reason: 'conflict', conflictId };
+        }
+        try {
+          const res = await updateContact({
+            resourceName,
+            etag: remote?.etag || null,
+            ...payload,
+          });
+          await updateUserGoogleMeta(userId, {
+            resourceName: res.resourceName || resourceName,
+            etag: res.etag || remote?.etag || null,
+            hash,
+          });
+          return { ok: true, resourceName: res.resourceName || resourceName };
+        } catch (e2) {
+          logger.warn('👤⚠️ [Google] update retry failed', {
+            error: String(e2),
+            resourceName,
+          });
+          const conflictId = await insertConflict(userId, localSnap, remote);
+          return { ok: false, reason: 'update_failed', conflictId };
+        }
+      }
+      logger.warn('👤⚠️ [Google] update failed', { error: String(e), resourceName });
+      return { ok: false, reason: 'update_failed' };
+    }
+  }
+
+  // 2) Se non ho resourceName → search by phone/email
+  try {
+    const match = await findBestMatchByPhoneEmail({
+      phone: payload.phone,
+      email: payload.email,
+    });
+    if (match?.resourceName) {
+      await updateUserGoogleMeta(userId, {
+        resourceName: match.resourceName,
+        etag: match.etag || null,
+        hash,
+      });
+      if (detectConflict(localSnap, match)) {
+        const conflictId = await insertConflict(userId, localSnap, match);
+        logger.warn('👤⚠️ [Google] conflict detected (search match)', {
+          userId,
+          resourceName: match.resourceName,
+          conflictId,
+        });
+        return { ok: false, reason: 'conflict', conflictId };
+      }
+      try {
+        const res = await updateContact({
+          resourceName: match.resourceName,
+          etag: match.etag || null,
+          ...payload,
+        });
+        await updateUserGoogleMeta(userId, {
+          resourceName: res.resourceName || match.resourceName,
+          etag: res.etag || match.etag || null,
+          hash,
+        });
+        return { ok: true, resourceName: res.resourceName || match.resourceName };
+      } catch (e) {
+        logger.warn('👤⚠️ [Google] update after search failed', {
+          error: String(e),
+          resourceName: match.resourceName,
+        });
+        return { ok: false, reason: 'update_failed' };
+      }
+    }
+  } catch (e) {
+    logger.warn('👤⚠️ [Google] search failed', { error: String(e) });
+  }
+
+  // 3) create
+  try {
+    const res = await createContact(payload);
+    await updateUserGoogleMeta(userId, {
+      resourceName: res.resourceName || null,
+      etag: res.etag || null,
+      hash,
+    });
+    return { ok: true, resourceName: res.resourceName || null };
+  } catch (e) {
+    logger.warn('👤⚠️ [Google] create failed', { error: String(e) });
+    return { ok: false, reason: 'create_failed' };
+  }
 }
 
 module.exports = {
@@ -7981,6 +9279,8 @@ module.exports = {
   searchContacts,
   createContact,
   updateContact,
+  getContact,
+  upsertContactFromUser,
   revokeForOwner,
 };
 ```
@@ -8125,6 +9425,84 @@ async function sendStatusChangeEmail({ to, reservation, newStatus, reason, reply
   return { sent: true, messageId: info?.messageId };
 }
 
+/**
+ * Invia email "Prenotazione confermata" al cliente — SOLO quando status passa a accepted.
+ * Non usare su create (pending), reject, delete.
+ * Destinatario: reservation.email / contact_email. Se manca → skip (log).
+ * Template: Ciao {NOME}, conferma, data/ora/persone/note, codice prenotazione, contatti pizzeria, footer privacy.
+ */
+async function sendReservationConfirmedEmail({ to, reservation, replyTo }) {
+  if (env.DISABLE_EMAIL) {
+    logger.info('⛔ 📧 Email disabilitato via env (DISABLE_EMAIL=1)');
+    return { sent: false, reason: 'disabled_by_env' };
+  }
+  if (!env.MAIL?.enabled) {
+    logger.warn('📧 Email mancante: skip — MAIL disabilitato', { id: reservation?.id });
+    return { sent: false, reason: 'disabled' };
+  }
+
+  const dest = safe(to).trim();
+  if (!dest) {
+    logger.info('ℹ️ 📧 Email mancante: skip', { id: reservation?.id, note: 'destinatario vuoto' });
+    return { sent: false, reason: 'no_recipient' };
+  }
+
+  const t = getTransporter();
+  if (!t) {
+    logger.warn('⚠️ 📧 Email saltata — provider non configurato', { id: reservation?.id });
+    return { sent: false, reason: 'no_transporter' };
+  }
+
+  const name =
+    safe(reservation?.display_name) ||
+    [safe(reservation?.customer_first), safe(reservation?.customer_last)].filter(Boolean).join(' ') ||
+    'Cliente';
+
+  const start = reservation?.start_at ? new Date(reservation.start_at) : null;
+  const dateStr = start ? new Intl.DateTimeFormat('it-IT', { day: '2-digit', month: '2-digit', year: 'numeric' }).format(start) : '--/--/----';
+  const timeStr = start ? `${String(start.getHours()).padStart(2, '0')}:${String(start.getMinutes()).padStart(2, '0')}` : '--:--';
+  const people = reservation?.party_size != null ? Number(reservation.party_size) : 0;
+  const notes = safe(reservation?.notes);
+  const bookingCode = reservation?.code || reservation?.booking_code || (reservation?.id != null ? `R-${reservation.id}` : 'R--');
+
+  const brandName = env.WHATSAPP_TEMPLATE?.brandName || env.MAIL?.bizName || 'Pizzeria La Lanterna';
+  const brandPhone = env.WHATSAPP_TEMPLATE?.brandPhone || '0737642142';
+  const brandAddress = env.WHATSAPP_TEMPLATE?.brandAddressLine || 'Largo della Libertà, 4';
+  const brandCity = env.WHATSAPP_TEMPLATE?.brandCity || 'Castelraimondo';
+
+  const subject = `Prenotazione confermata — ${brandName}`;
+  const html = `
+  <div style="font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif">
+    <h2 style="margin:0 0 12px">${brandName}</h2>
+    <p>Ciao <b>${name}</b>,</p>
+    <p>La tua prenotazione è confermata.</p>
+    <p><b>Data:</b> ${dateStr} — <b>Ora:</b> ${timeStr}</p>
+    <p><b>Persone:</b> ${people} coperti</p>
+    ${notes ? `<p><b>Note:</b> ${notes}</p>` : ''}
+    <p><b>Codice prenotazione:</b> ${bookingCode}</p>
+    <p><b>Contatti:</b> ${brandPhone} — ${brandAddress}, ${brandCity}</p>
+    <p style="margin-top:16px;font-size:12px;color:#666">I dati sono utilizzati esclusivamente per gestire la prenotazione.</p>
+    <p>— Lo Staff</p>
+  </div>`;
+
+  const mail = {
+    from: env.MAIL.from,
+    to: dest,
+    subject,
+    html,
+    replyTo: safe(replyTo) || (env.MAIL.replyTo || undefined),
+  };
+
+  try {
+    const info = await t.sendMail(mail);
+    logger.info('📧 Email inviata', { reservationId: reservation?.id, to: dest, messageId: info?.messageId });
+    return { sent: true, messageId: info?.messageId };
+  } catch (e) {
+    logger.error('📧 Email errore', { id: reservation?.id, error: String(e?.message || e), stack: (e?.stack || '').slice(0, 200) });
+    return { sent: false, error: String(e?.message || e) };
+  }
+}
+
 async function sendReservationRejectionEmail({ to, reservation, reason, replyTo }) {
   if (!env.MAIL?.enabled) {
     logger.warn('📧 MAIL SKIPPED (disabled)', { id: reservation?.id });
@@ -8159,6 +9537,7 @@ module.exports = {
   getTransporter,
   verifySmtp,
   sendStatusChangeEmail,
+  sendReservationConfirmedEmail,
   sendReservationRejectionEmail,
 };
 ```
@@ -9390,12 +10769,27 @@ async function loadOrderForPrint(orderId) {
     [orderId],
   );
 
+  const opts = await query(
+    `SELECT order_item_id, type, name
+     FROM order_item_options
+     WHERE order_item_id IN (SELECT id FROM order_items WHERE order_id = ?)
+     ORDER BY order_item_id, id ASC`,
+    [orderId],
+  );
+  const optsByItem = new Map();
+  for (const o of opts || []) {
+    const id = Number(o.order_item_id);
+    if (!optsByItem.has(id)) optsByItem.set(id, []);
+    optsByItem.get(id).push({ type: o.type, name: o.name });
+  }
+
   return {
     ...h,
     items: (items || []).map((r) => ({
       ...r,
       qty: Number(r.qty || 0),
       price: Number(r.price || 0),
+      options: optsByItem.get(Number(r.id)) || [],
     })),
   };
 }
@@ -9582,9 +10976,13 @@ async function processPrintQueueOnce({ limit } = {}) {
           : {};
         const centerRaw = String(payload?.center || 'ALL').toUpperCase();
         const copies = Math.max(1, Number(payload?.copies || 1));
-        const layoutKey = String(payload?.layoutKey || 'classic')
+        let layoutKey = String(payload?.layoutKey || 'classic')
           .trim()
           .toLowerCase();
+        // Fallback: ordine asporto → layout dedicato (caratteri grandi 80mm)
+        if (layoutKey === 'classic' && full && String(full.fulfillment || '').toLowerCase() === 'takeaway') {
+          layoutKey = 'asporto';
+        }
 
         const orderId = Number(job.order_id || 0);
         const full = await loadOrderForPrint(orderId);
@@ -9662,6 +11060,9 @@ const PRINT_SETTINGS_DEFAULTS = {
   takeaway_center: 'pizzeria',          // pizzeria | cucina
   takeaway_copies: 1,                   // 1..3
   takeaway_auto_print: true,
+  // === Nuovi default ========================================================
+  order_include_extras_in_total_default: true,
+  takeaway_force_invia_comanda: true,
   // 🔙 compat: campo legacy (se presente in DB)
   takeaway_comanda_center: 'ALL',
 };
@@ -9686,6 +11087,20 @@ function normalizePrintSettings(raw) {
     ? src.takeaway_auto_print
     : !!Number(
       src.takeaway_auto_print ?? PRINT_SETTINGS_DEFAULTS.takeaway_auto_print,
+    );
+
+  const includeExtrasDefault = typeof src.order_include_extras_in_total_default === 'boolean'
+    ? src.order_include_extras_in_total_default
+    : !!Number(
+      src.order_include_extras_in_total_default ??
+        PRINT_SETTINGS_DEFAULTS.order_include_extras_in_total_default,
+    );
+
+  const forceInviaComanda = typeof src.takeaway_force_invia_comanda === 'boolean'
+    ? src.takeaway_force_invia_comanda
+    : !!Number(
+      src.takeaway_force_invia_comanda ??
+        PRINT_SETTINGS_DEFAULTS.takeaway_force_invia_comanda,
     );
 
   // Layout comanda (classic | mcd)
@@ -9731,31 +11146,58 @@ function normalizePrintSettings(raw) {
     takeaway_center,
     takeaway_copies,
     takeaway_auto_print: autoPrint,
+    order_include_extras_in_total_default: includeExtrasDefault,
+    takeaway_force_invia_comanda: forceInviaComanda,
     takeaway_comanda_center,
   };
 }
 
 async function getPrintSettings() {
   try {
-    const rows = await query(
-      `SELECT
-         printer_enabled,
-         printer_ip,
-         printer_port,
-         comanda_layout,
-         takeaway_center,
-         takeaway_copies,
-         takeaway_auto_print,
-         takeaway_comanda_center
-       FROM print_settings
-       ORDER BY id ASC
-       LIMIT 1`,
-    );
-    const raw = rows && rows[0] ? rows[0] : null;
-    return {
-      ...normalizePrintSettings(raw || PRINT_SETTINGS_DEFAULTS),
-      _source: 'db',
-    };
+    try {
+      const rows = await query(
+        `SELECT
+           printer_enabled,
+           printer_ip,
+           printer_port,
+           comanda_layout,
+           takeaway_center,
+           takeaway_copies,
+           takeaway_auto_print,
+           order_include_extras_in_total_default,
+           takeaway_force_invia_comanda,
+           takeaway_comanda_center
+         FROM print_settings
+         ORDER BY id ASC
+         LIMIT 1`,
+      );
+      const raw = rows && rows[0] ? rows[0] : null;
+      return {
+        ...normalizePrintSettings(raw || PRINT_SETTINGS_DEFAULTS),
+        _source: 'db',
+      };
+    } catch (e) {
+      logger.warn('⚠️ print_settings load (legacy cols) KO', { error: String(e) });
+      const rowsLegacy = await query(
+        `SELECT
+           printer_enabled,
+           printer_ip,
+           printer_port,
+           comanda_layout,
+           takeaway_center,
+           takeaway_copies,
+           takeaway_auto_print,
+           takeaway_comanda_center
+         FROM print_settings
+         ORDER BY id ASC
+         LIMIT 1`,
+      );
+      const rawLegacy = rowsLegacy && rowsLegacy[0] ? rowsLegacy[0] : null;
+      return {
+        ...normalizePrintSettings(rawLegacy || PRINT_SETTINGS_DEFAULTS),
+        _source: 'db',
+      };
+    }
   } catch (e) {
     logger.warn('⚠️ print_settings load KO', { error: String(e) });
     return {
@@ -9767,47 +11209,95 @@ async function getPrintSettings() {
 
 async function savePrintSettings(next) {
   const p = normalizePrintSettings(next);
-  await query(
-    `INSERT INTO print_settings (
-       id,
-       printer_enabled,
-       printer_ip,
-       printer_port,
-       comanda_layout,
-       takeaway_center,
-       takeaway_copies,
-       takeaway_auto_print,
-       takeaway_comanda_center,
-       updated_at
-     ) VALUES (
-       1, ?, ?, ?, ?, ?, ?, ?, ?, UTC_TIMESTAMP()
-     )
-     ON DUPLICATE KEY UPDATE
-       printer_enabled = VALUES(printer_enabled),
-       printer_ip = VALUES(printer_ip),
-       printer_port = VALUES(printer_port),
-       comanda_layout = VALUES(comanda_layout),
-       takeaway_center = VALUES(takeaway_center),
-       takeaway_copies = VALUES(takeaway_copies),
-       takeaway_auto_print = VALUES(takeaway_auto_print),
-       takeaway_comanda_center = VALUES(takeaway_comanda_center),
-       updated_at = UTC_TIMESTAMP()`,
-    [
-      p.printer_enabled ? 1 : 0,
-      p.printer_ip,
-      p.printer_port,
-      p.comanda_layout,
-      p.takeaway_center,
-      p.takeaway_copies,
-      p.takeaway_auto_print ? 1 : 0,
-      p.takeaway_comanda_center,
-    ],
-  );
+  try {
+    await query(
+      `INSERT INTO print_settings (
+         id,
+         printer_enabled,
+         printer_ip,
+         printer_port,
+         comanda_layout,
+         takeaway_center,
+         takeaway_copies,
+         takeaway_auto_print,
+         order_include_extras_in_total_default,
+         takeaway_force_invia_comanda,
+         takeaway_comanda_center,
+         updated_at
+       ) VALUES (
+         1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, UTC_TIMESTAMP()
+       )
+       ON DUPLICATE KEY UPDATE
+         printer_enabled = VALUES(printer_enabled),
+         printer_ip = VALUES(printer_ip),
+         printer_port = VALUES(printer_port),
+         comanda_layout = VALUES(comanda_layout),
+         takeaway_center = VALUES(takeaway_center),
+         takeaway_copies = VALUES(takeaway_copies),
+         takeaway_auto_print = VALUES(takeaway_auto_print),
+         order_include_extras_in_total_default = VALUES(order_include_extras_in_total_default),
+         takeaway_force_invia_comanda = VALUES(takeaway_force_invia_comanda),
+         takeaway_comanda_center = VALUES(takeaway_comanda_center),
+         updated_at = UTC_TIMESTAMP()`,
+      [
+        p.printer_enabled ? 1 : 0,
+        p.printer_ip,
+        p.printer_port,
+        p.comanda_layout,
+        p.takeaway_center,
+        p.takeaway_copies,
+        p.takeaway_auto_print ? 1 : 0,
+        p.order_include_extras_in_total_default ? 1 : 0,
+        p.takeaway_force_invia_comanda ? 1 : 0,
+        p.takeaway_comanda_center,
+      ],
+    );
+  } catch (e) {
+    logger.warn('⚠️ print_settings save (legacy cols) KO', { error: String(e) });
+    await query(
+      `INSERT INTO print_settings (
+         id,
+         printer_enabled,
+         printer_ip,
+         printer_port,
+         comanda_layout,
+         takeaway_center,
+         takeaway_copies,
+         takeaway_auto_print,
+         takeaway_comanda_center,
+         updated_at
+       ) VALUES (
+         1, ?, ?, ?, ?, ?, ?, ?, ?, UTC_TIMESTAMP()
+       )
+       ON DUPLICATE KEY UPDATE
+         printer_enabled = VALUES(printer_enabled),
+         printer_ip = VALUES(printer_ip),
+         printer_port = VALUES(printer_port),
+         comanda_layout = VALUES(comanda_layout),
+         takeaway_center = VALUES(takeaway_center),
+         takeaway_copies = VALUES(takeaway_copies),
+         takeaway_auto_print = VALUES(takeaway_auto_print),
+         takeaway_comanda_center = VALUES(takeaway_comanda_center),
+         updated_at = UTC_TIMESTAMP()`,
+      [
+        p.printer_enabled ? 1 : 0,
+        p.printer_ip,
+        p.printer_port,
+        p.comanda_layout,
+        p.takeaway_center,
+        p.takeaway_copies,
+        p.takeaway_auto_print ? 1 : 0,
+        p.takeaway_comanda_center,
+      ],
+    );
+  }
   logger.info('🧾⚙️ [PrintSettings] saved', {
     comanda_layout: p.comanda_layout,
     takeaway_center: p.takeaway_center,
     takeaway_copies: p.takeaway_copies,
     takeaway_auto_print: p.takeaway_auto_print,
+    order_include_extras_in_total_default: p.order_include_extras_in_total_default,
+    takeaway_force_invia_comanda: p.takeaway_force_invia_comanda,
     printer_enabled: p.printer_enabled,
     printer_ip: p.printer_ip || null,
     printer_port: p.printer_port,
@@ -9952,6 +11442,335 @@ async function remove(id) {
 }
 ```
 
+### ./src/services/provider.baileys.js
+```
+// src/services/provider.baileys.js
+// [WEBQR] Provider Baileys: sessione persistente, QR dataUrl, stati, retry backoff
+'use strict';
+
+const path = require('path');
+const fs = require('fs');
+const QRCode = require('qrcode');
+const { makeWASocket, useMultiFileAuthState, DisconnectReason, downloadMediaMessage: baileysDownloadMedia } = require('@whiskeysockets/baileys');
+
+const LOG = '[WEBQR]';
+const RETRY_DELAYS_MS = [5000, 15000, 60000];
+const AUTH_DIR_DEFAULT = path.join(process.cwd(), 'data', 'wa-webqr');
+
+let sock = null;
+let status = 'disconnected';
+let lastQrDataUrl = null;
+let lastError = null;
+let updatedAt = Date.now();
+let retryCount = 0;
+let retryTimer = null;
+/** Per evitare heap out of memory: logghiamo connection.update solo quando connection o hasQr cambiano (Baileys invia tantissimi update). */
+let _lastLoggedConnection = null;
+let _lastLoggedHasQr = null;
+
+let onStatusCb = null;
+let onQrCb = null;
+let onErrorCb = null;
+let onMessageCb = null;
+let onMeCb = null;
+
+function setStatus(s, err = null) {
+  status = s;
+  if (err) lastError = String(err.message || err);
+  updatedAt = Date.now();
+  if (onStatusCb) onStatusCb({ status, lastError, updatedAt });
+}
+
+function emitQr(dataUrl) {
+  lastQrDataUrl = dataUrl;
+  if (onQrCb) onQrCb(dataUrl);
+}
+
+function emitError(err) {
+  lastError = String(err?.message || err);
+  if (onErrorCb) onErrorCb(lastError);
+}
+
+function getAuthDir() {
+  const dir = (process.env.WHATSAPP_WEBQR_AUTH_DIR || '').trim() || AUTH_DIR_DEFAULT;
+  try {
+    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+  } catch (e) {
+    console.warn(`${LOG} ⚠️ auth dir create KO`, dir, e);
+  }
+  return dir;
+}
+
+async function connect(logger = console) {
+  if (sock) {
+    try { sock.end(undefined); } catch (_) {}
+    sock = null;
+  }
+  setStatus('connecting');
+  lastQrDataUrl = null;
+  _lastLoggedConnection = null;
+  _lastLoggedHasQr = null;
+
+  const authDir = getAuthDir();
+  try {
+    if (!fs.existsSync(authDir)) fs.mkdirSync(authDir, { recursive: true });
+  } catch (e) {
+    logger.warn(`${LOG} ⚠️ auth dir create KO`, authDir, e);
+  }
+  logger.info(`${LOG} 📲 connect start`, { attempt: retryCount + 1, authDir });
+
+  try {
+    const { state, saveCreds } = await useMultiFileAuthState(authDir);
+    // TASK 5: versione WA web (riduce handshake fail); opzionale se fetch fallisce
+    let waVersion = null;
+    try {
+      const baileys = require('@whiskeysockets/baileys');
+      if (typeof baileys.fetchLatestBaileysVersion === 'function') {
+        const v = await baileys.fetchLatestBaileysVersion();
+        waVersion = v?.version;
+        logger.info(`${LOG} 🧪 wa-web version`, { version: waVersion });
+      }
+    } catch (e) {
+      logger.warn(`${LOG} ⚠️ fetch version KO (uso default)`, { error: String(e?.message || e) });
+    }
+    const sockOpts = { auth: state };
+    if (waVersion) sockOpts.version = waVersion;
+    // printQRInTerminal rimosso: deprecato da Baileys; il QR viene gestito da connection.update (qr) e convertito in dataUrl qui sotto
+    sock = makeWASocket(sockOpts);
+
+    sock.ev.on('creds.update', saveCreds);
+
+    function hasDownloadableMedia(message) {
+      if (!message || typeof message !== 'object') return false;
+      const m = message.ephemeralMessage?.message || message.viewOnceMessage?.message || message.viewOnceMessageV2?.message || message.documentWithCaptionMessage?.message || message;
+      const content = m.imageMessage || m.videoMessage || m.documentMessage || m.audioMessage || m.stickerMessage;
+      return content && typeof content === 'object' && ('url' in content || 'thumbnailDirectPath' in content);
+    }
+
+    function toStringSafe(val) {
+      if (val == null) return null;
+      if (typeof val === 'string') return val;
+      if (Buffer.isBuffer(val)) return val.toString('utf8');
+      if (typeof val === 'object' && typeof val.toString === 'function') return String(val);
+      return null;
+    }
+
+    function getCaptionFromMessage(message) {
+      if (!message || typeof message !== 'object') return null;
+      const m = message.ephemeralMessage?.message || message.viewOnceMessage?.message || message.viewOnceMessageV2?.message || message;
+      const docWithCap = message.documentWithCaptionMessage || m?.documentWithCaptionMessage;
+      const cap = m?.imageMessage?.caption ?? m?.videoMessage?.caption ?? m?.documentMessage?.caption ?? docWithCap?.caption ?? null;
+      const str = toStringSafe(cap);
+      return (str != null && str.length > 0) ? str.trim().slice(0, 1024) : null;
+    }
+
+    /** Messaggio “contenuto”: unwrap ephemeral/viewOnce/documentWithCaption per leggere conversation/extendedText. */
+    function getContentMessage(message) {
+      if (!message || typeof message !== 'object') return message;
+      const inner =
+        message.ephemeralMessage?.message
+        || message.viewOnceMessage?.message
+        || message.viewOnceMessageV2?.message
+        || message.documentWithCaptionMessage?.message
+        || null;
+      return inner || message;
+    }
+
+    sock.ev.on('messages.upsert', ({ type, messages }) => {
+      if ((type !== 'notify' && type !== 'append') || !onMessageCb) return;
+      const list = messages || [];
+      logger.info(`${LOG} 📥 messages.upsert`, { type, count: list.length });
+      for (const msg of list) {
+        if (msg.key?.fromMe) continue;
+        try {
+          const rawTop = msg.message || {};
+          const m = getContentMessage(rawTop);
+          const rawType = Object.keys(m).find(k => k !== 'messageContextInfo') || 'unknown';
+          const isMedia = rawType !== 'conversation' && rawType !== 'extendedTextMessage';
+          let text = m.conversation ?? (m.extendedTextMessage && toStringSafe(m.extendedTextMessage.text)) ?? null;
+          if (text == null && isMedia) {
+            const caption = getCaptionFromMessage(msg.message);
+            text = caption || '[media]';
+            if (caption) logger.info(`${LOG} 📝 caption estratta`, { rawType, captionLen: caption.length, snippet: caption.slice(0, 50) });
+          }
+          if (text == null) text = '[non-text]';
+          const textStr = toStringSafe(text) || String(text);
+          const from = msg.key.participant || msg.key.remoteJid || '';
+          const fromNumber = (from && typeof from === 'string') ? from.replace(/\D/g, '').slice(-12) || from : '';
+          const pushName = (msg.pushName && typeof msg.pushName === 'string') ? msg.pushName.trim() : null;
+          const mediaType = isMedia ? rawType.replace(/Message$/i, '') : null;
+          const normalized = {
+            id: msg.key?.id || `${Date.now()}-${Math.random().toString(36).slice(2)}`,
+            ts: Number(msg.messageTimestamp) * 1000 || Date.now(),
+            from,
+            fromNumber: fromNumber || from,
+            pushName: pushName || undefined,
+            text: textStr.slice(0, 1024),
+            rawType,
+            hasMedia: !!isMedia,
+            mediaType: mediaType || undefined,
+          };
+          const canDownloadMedia = isMedia && hasDownloadableMedia(msg.message);
+          logger.info(`${LOG} 📩 message received`, {
+            from: normalized.fromNumber,
+            id: normalized.id,
+            rawType,
+            hasMedia: isMedia,
+            textLen: normalized.text.length,
+            textSnippet: normalized.text.slice(0, 60),
+            rawKeys: Object.keys(rawTop),
+            contentKeys: Object.keys(m),
+          });
+          onMessageCb(normalized, canDownloadMedia ? msg : null);
+        } catch (e) {
+          logger.warn(`${LOG} ⚠️ message normalize KO`, e);
+        }
+      }
+    });
+
+    sock.ev.on('connection.update', async (update) => {
+      const { connection, lastDisconnect, qr } = update;
+      const hasQr = !!qr;
+      const conn = connection ?? 'undefined';
+      // Log solo quando connection o hasQr cambiano (evita migliaia di log e heap out of memory)
+      if (conn !== _lastLoggedConnection || hasQr !== _lastLoggedHasQr) {
+        _lastLoggedConnection = conn;
+        _lastLoggedHasQr = hasQr;
+        const lastDisconnectCode = lastDisconnect?.error?.output?.statusCode;
+        const reason = lastDisconnect?.error?.message;
+        logger.info(`${LOG} 🔌 connection.update`, { connection: conn, hasQr, lastDisconnectCode: lastDisconnectCode ?? null, reason: reason ?? null });
+      }
+      if (qr) {
+        setStatus('qr');
+        try {
+          const dataUrl = await QRCode.toDataURL(qr, { type: 'image/png', margin: 1 });
+          emitQr(dataUrl);
+          logger.info(`${LOG} 🧾 qr generated`);
+        } catch (e) {
+          logger.warn(`${LOG} ⚠️ qr toDataURL KO`, e);
+        }
+      }
+      if (connection === 'close') {
+        const code = lastDisconnect?.error?.output?.statusCode;
+        const reason = lastDisconnect?.error?.message;
+        setStatus('disconnected', lastDisconnect?.error);
+        logger.warn(`${LOG} ⚠️ connection close`, { code, reason });
+        if (code === DisconnectReason.loggedOut) {
+          emitError('Sessione disconnessa (logged out)');
+          return;
+        }
+        const delay = RETRY_DELAYS_MS[Math.min(retryCount, RETRY_DELAYS_MS.length - 1)];
+        retryCount++;
+        logger.info(`${LOG} 🔁 retry in ${delay}ms (attempt ${retryCount})`, { code, reason });
+        retryTimer = setTimeout(() => connect(logger), delay);
+      }
+      if (connection === 'open') {
+        retryCount = 0;
+        if (retryTimer) { clearTimeout(retryTimer); retryTimer = null; }
+        setStatus('ready');
+        lastQrDataUrl = null;
+        // Esponi "me" (jid, numberHuman, pushName) per UI "numero connesso"
+        try {
+          const jid = sock?.user?.id || null;
+          if (jid && onMeCb) {
+            // JID può essere "390737642142@s.whatsapp.net" o "390737642142:15@s.whatsapp.net" — rimuovi :XX prima di estrarre le cifre
+            const jidPart = (jid && typeof jid === 'string') ? jid.split('@')[0] || '' : '';
+            const withoutSuffix = jidPart.replace(/:\d+$/, '');
+            let digits = withoutSuffix.replace(/\D/g, '').slice(-12) || '';
+            // Normalizza numeri italiani: se inizia con 0 e ha 10 cifre (formato nazionale) → 39 + 10 cifre
+            if (digits.startsWith('0') && digits.length === 10) {
+              digits = '39' + digits;
+            }
+            digits = digits.slice(-12);
+            const numberHuman = digits ? '+' + digits.replace(/(\d{2})(\d{3})(\d{3})(\d{4})/, '$1 $2 $3 $4').trim() : '';
+            onMeCb({
+              jid,
+              number: digits,
+              numberHuman: numberHuman || jid,
+              pushName: sock?.user?.name || null,
+            });
+            logger.info(`${LOG} 👤 me`, { jid, numberHuman: numberHuman || jid });
+          }
+        } catch (e) {
+          logger.warn(`${LOG} ⚠️ onMe KO`, { error: String(e?.message || e) });
+        }
+        logger.info(`${LOG} ✅ ready`);
+      }
+    });
+
+    return sock;
+  } catch (err) {
+    setStatus('error', err);
+    emitError(err);
+    logger.error(`${LOG} ❌ connect KO`, err);
+    throw err;
+  }
+}
+
+function getStatus() {
+  return { status, lastError, updatedAt };
+}
+
+function getRetryCount() {
+  return retryCount;
+}
+
+function getQrDataUrl() {
+  return status === 'qr' ? lastQrDataUrl : null;
+}
+
+function getSock() {
+  return sock;
+}
+
+async function sendMessage(to, text, logger = console) {
+  if (!sock || status !== 'ready') {
+    throw new Error('WhatsApp WebQR non connesso (status: ' + status + ')');
+  }
+  const jid = to.includes('@') ? to : `${to.replace(/\D/g, '')}@s.whatsapp.net`;
+  const result = await sock.sendMessage(jid, { text });
+  logger.info(`${LOG} 📤 send ok`, { to: jid });
+  return result;
+}
+
+function registerCallbacks({ onStatus, onQr, onError, onMessage, onMe }) {
+  onStatusCb = onStatus;
+  onQrCb = onQr;
+  onErrorCb = onError;
+  onMessageCb = onMessage;
+  onMeCb = onMe || null;
+}
+
+function shutdown() {
+  if (retryTimer) clearTimeout(retryTimer);
+  retryTimer = null;
+  if (sock) {
+    try { sock.end(undefined); } catch (_) {}
+    sock = null;
+  }
+  setStatus('disconnected');
+}
+
+/** Scarica il media di un messaggio (per GET /media/:id). message = raw msg da messages.upsert. */
+async function downloadMediaMessage(message, loggerInstance = console) {
+  if (!message) throw new Error('message required');
+  return baileysDownloadMedia(message, 'buffer', {}, { logger: loggerInstance });
+}
+
+module.exports = {
+  connect,
+  getStatus,
+  getRetryCount,
+  getAuthDir,
+  getQrDataUrl,
+  getSock,
+  sendMessage,
+  registerCallbacks,
+  shutdown,
+  downloadMediaMessage,
+};
+```
+
 ### ./src/services/reservations.service.js
 ```
 // src/services/reservations.service.js 
@@ -9981,54 +11800,68 @@ function toDayRange(fromYmd, toYmd) {
 }
 
 /**
- * Converte qualunque input (stringa ISO, Date, oppure 'YYYY-MM-DD HH:mm:ss'
- * locale) in una stringa MySQL DATETIME "YYYY-MM-DD HH:mm:ss" in **UTC**.
+ * 🕒 FIX TZ: DB è in CET (system_time_zone = CET).
+ * Converte qualunque input in stringa MySQL DATETIME "YYYY-MM-DD HH:mm:ss"
+ * in ORA LOCALE (CET/Europe/Rome) — NON più UTC.
  *
- * Pipeline che vogliamo:
- * - Il FE lavora in ORA LOCALE (Europe/Rome nel tuo caso).
- *   (logica gemella di toUTCFromLocalDateTimeInput sul FE: src/app/shared/utils.date.ts).
- * - Quando manda al BE valori tipo "2025-11-15T19:00" o "2025-11-15 19:00:00",
- *   qui li interpretiamo come locali e li convertiamo in UTC.
- * - Il DB è configurato con time_zone = '+00:00', quindi il DATETIME salvato
- *   è già UTC e quando lo rileggiamo/serializziamo va verso il FE come ISO con 'Z'.
+ * - Se start_at è già "YYYY-MM-DD HH:mm:ss" (senza Z/offset) → salva così com'è.
+ * - Se contiene 'Z' o offset (+/-) → converti a ORA LOCALE CET e serializza.
  */
 function isoToMysql(iso) {
   if (!iso) return null;
-  if (iso instanceof Date) return dateToMysqlUtc(iso);
+  if (iso instanceof Date) return dateToMysqlLocal(iso);
   const s = String(iso).trim();
 
-  // Se è già nel formato MySQL "YYYY-MM-DD HH:mm:ss" lo tratto come ORA LOCALE
-  // del ristorante e lo porto in UTC.
+  // Già "YYYY-MM-DD HH:mm:ss" (ora locale) → salva così
   const mysqlLike = /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/;
-  if (mysqlLike.test(s)) {
-    const [datePart, timePart] = s.split(' ');
-    const [y, m, d] = datePart.split('-').map((n) => parseInt(n, 10));
-    const [hh, mm, ss] = timePart.split(':').map((n) => parseInt(n, 10));
-    const local = new Date(y, m - 1, d, hh, mm, ss); // 👉 locale
-    if (!Number.isNaN(local.getTime())) return dateToMysqlUtc(local);
+  if (mysqlLike.test(s)) return s;
+
+  // Ha 'Z' o offset (+/-) → NON salvare diretto: converti a CET
+  const hasOffset = /Z$|[+-]\d{2}:?\d{2}$/.test(s);
+  if (hasOffset) {
+    const d = new Date(s);
+    if (!Number.isNaN(d.getTime())) return dateToMysqlLocalCET(d);
   }
 
-  // Per tutto il resto ("YYYY-MM-DDTHH:mm", ISO con 'Z', ecc.) lascio che il
-  // costruttore Date si arrangi. Se è senza 'Z' verrà interpretato come locale,
-  // se ha 'Z' è già UTC.
+  // "YYYY-MM-DDTHH:mm" (senza Z) → Date interpreta come locale, ok
   const d = new Date(s);
-  if (!Number.isNaN(d.getTime())) return dateToMysqlUtc(d);
+  if (!Number.isNaN(d.getTime())) return dateToMysqlLocal(d);
 
-  // Fallback compat per formati strani: mantengo il tuo vecchio comportamento.
   return s.replace('T', ' ').slice(0, 19);
 }
 
 /**
- * Helper interno: Date → stringa MySQL DATETIME in UTC.
+ * Date → "YYYY-MM-DD HH:mm:ss" in ORA LOCALE del server (getHours, getMonth, ecc.)
  */
-function dateToMysqlUtc(d) {
+function dateToMysqlLocal(d) {
   const pad = (n) => String(n).padStart(2, '0');
-  const y = d.getUTCFullYear();
-  const m = pad(d.getUTCMonth() + 1);
-  const day = pad(d.getUTCDate());
-  const hh = pad(d.getUTCHours());
-  const mm = pad(d.getUTCMinutes());
-  const ss = pad(d.getUTCSeconds());
+  const y = d.getFullYear();
+  const m = pad(d.getMonth() + 1);
+  const day = pad(d.getDate());
+  const hh = pad(d.getHours());
+  const mm = pad(d.getMinutes());
+  const ss = pad(d.getSeconds());
+  return `${y}-${m}-${day} ${hh}:${mm}:${ss}`;
+}
+
+/**
+ * Date → "YYYY-MM-DD HH:mm:ss" in Europe/Rome (CET).
+ * Usato quando il payload contiene ISO con Z o offset.
+ */
+function dateToMysqlLocalCET(d) {
+  const fmt = new Intl.DateTimeFormat('en-CA', {
+    timeZone: 'Europe/Rome',
+    year: 'numeric', month: '2-digit', day: '2-digit',
+    hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false,
+  });
+  const parts = fmt.formatToParts(d);
+  const pad = (n) => String(n).padStart(2, '0');
+  const y = parts.find((p) => p.type === 'year').value;
+  const m = pad(parts.find((p) => p.type === 'month').value);
+  const day = pad(parts.find((p) => p.type === 'day').value);
+  const hh = pad(parts.find((p) => p.type === 'hour').value);
+  const mm = pad(parts.find((p) => p.type === 'minute').value);
+  const ss = pad(parts.find((p) => p.type === 'second').value);
   return `${y}-${m}-${day} ${hh}:${mm}:${ss}`;
 }
 
@@ -10073,8 +11906,8 @@ function computeEndAtFromStart(startAtIso) {
   const localEnd = new Date(localStart.getTime() + addMin * 60 * 1000);
 
   return {
-    startMysql: dateToMysqlUtc(localStart),
-    endMysql  : dateToMysqlUtc(localEnd),
+    startMysql: dateToMysqlLocal(localStart),
+    endMysql  : dateToMysqlLocal(localEnd),
   };
 }
 
@@ -10148,6 +11981,7 @@ async function list({ status, from, to, q } = {}) {
   if (range.from) { where.push('r.start_at >= ?'); params.push(range.from); }
   if (range.to)   { where.push('r.start_at <= ?'); params.push(range.to);   }
 
+  // 🧭 FIX TZ: DATE_FORMAT forza output "YYYY-MM-DD HH:mm:ss" (no UTC ISO)
   const sql = `
     SELECT
       r.id,
@@ -10157,8 +11991,8 @@ async function list({ status, from, to, q } = {}) {
       r.email,
       r.user_id,
       r.party_size,
-      r.start_at,
-      r.end_at,
+      DATE_FORMAT(r.start_at, '%Y-%m-%d %H:%i:%s') AS start_at,
+      DATE_FORMAT(r.end_at, '%Y-%m-%d %H:%i:%s') AS end_at,
       r.room_id,
       r.notes,
       r.status,
@@ -10168,10 +12002,10 @@ async function list({ status, from, to, q } = {}) {
       r.status_changed_at,
       r.client_token,
       r.table_id,
-      r.created_at,
-      r.updated_at,
-      r.checkin_at,
-      r.checkout_at,
+      DATE_FORMAT(r.created_at, '%Y-%m-%d %H:%i:%s') AS created_at,
+      DATE_FORMAT(r.updated_at, '%Y-%m-%d %H:%i:%s') AS updated_at,
+      DATE_FORMAT(r.checkin_at, '%Y-%m-%d %H:%i:%s') AS checkin_at,
+      DATE_FORMAT(r.checkout_at, '%Y-%m-%d %H:%i:%s') AS checkout_at,
       r.dwell_sec,
       u.first_name   AS user_first_name,
       u.last_name    AS user_last_name,
@@ -10189,6 +12023,7 @@ async function list({ status, from, to, q } = {}) {
 }
 
 async function getById(id) {
+  // 🧭 FIX TZ: DATE_FORMAT forza output "YYYY-MM-DD HH:mm:ss" (no UTC ISO)
   const sql = `
     SELECT
       r.id,
@@ -10198,8 +12033,8 @@ async function getById(id) {
       r.email,
       r.user_id,
       r.party_size,
-      r.start_at,
-      r.end_at,
+      DATE_FORMAT(r.start_at, '%Y-%m-%d %H:%i:%s') AS start_at,
+      DATE_FORMAT(r.end_at, '%Y-%m-%d %H:%i:%s') AS end_at,
       r.room_id,
       r.notes,
       r.status,
@@ -10209,10 +12044,10 @@ async function getById(id) {
       r.status_changed_at,
       r.client_token,
       r.table_id,
-      r.created_at,
-      r.updated_at,
-      r.checkin_at,
-      r.checkout_at,
+      DATE_FORMAT(r.created_at, '%Y-%m-%d %H:%i:%s') AS created_at,
+      DATE_FORMAT(r.updated_at, '%Y-%m-%d %H:%i:%s') AS updated_at,
+      DATE_FORMAT(r.checkin_at, '%Y-%m-%d %H:%i:%s') AS checkin_at,
+      DATE_FORMAT(r.checkout_at, '%Y-%m-%d %H:%i:%s') AS checkout_at,
       r.dwell_sec,
       u.first_name   AS user_first_name,
       u.last_name    AS user_last_name,
@@ -10260,57 +12095,45 @@ async function updateUserById(id, { first, last, email, phone }) {
   await query(`UPDATE users SET ${fields.join(', ')} WHERE id=?`, params);
 }
 
-function normPhone(p) { return String(p || '').replace(/\D/g, ''); }
-function isPhoneMatch(a, b) {
-  const na = normPhone(a);
-  const nb = normPhone(b);
-  if (!na || !nb) return false;
-  if (na === nb) return true;
-  if (na.length >= 8 && nb.length >= 8) return na.slice(-8) === nb.slice(-8);
-  return false;
+async function loadUserForGoogle(userId, dto) {
+  if (!userId) return null;
+  const rows = await query(
+    `SELECT
+       id,
+       first_name,
+       last_name,
+       full_name,
+       name,
+       email,
+       phone,
+       note,
+       google_resource_name,
+       google_etag
+     FROM users
+     WHERE id = ? LIMIT 1`,
+    [userId],
+  );
+  const user = rows && rows[0] ? rows[0] : null;
+  if (!user) return null;
+
+  return {
+    ...user,
+    first_name: trimOrNull(dto.customer_first) || user.first_name,
+    last_name: trimOrNull(dto.customer_last) || user.last_name,
+    email: trimOrNull(dto.email) || user.email,
+    phone: trimOrNull(dto.phone) || user.phone,
+    note: trimOrNull(dto.google_note) || trimOrNull(dto.notes) || user.note,
+  };
 }
 
-async function syncGoogleContactOnCreate(dto, userId) {
-  const phone = trimOrNull(dto.phone);
-  if (!phone) return;
-
-  let items = [];
+async function upsertGoogleContactForUser(userId, dto) {
+  if (!userId) return;
   try {
-    items = await google.searchContacts(phone, 5);
+    const user = await loadUserForGoogle(userId, dto);
+    if (!user) return;
+    await google.upsertContactFromUser(user);
   } catch (e) {
-    logger.warn('👤⚠️ [Google] search failed', { error: String(e) });
-    return;
-  }
-
-  const match = (items || []).find((it) => isPhoneMatch(phone, it.phone));
-  if (!match?.resourceName) return;
-
-  // Aggiorna DB (utente locale) con dati recenti se abbiamo match Google
-  try {
-    await updateUserById(userId, {
-      first: dto.customer_first,
-      last : dto.customer_last,
-      email: dto.email,
-      phone: dto.phone,
-    });
-  } catch (e) {
-    logger.warn('👤⚠️ [DB] user update failed', { error: String(e), userId });
-  }
-
-  // Aggiorna il contatto Google (best-effort)
-  try {
-    await google.updateContact({
-      resourceName: match.resourceName,
-      etag: match.etag,
-      givenName: trimOrNull(dto.customer_first),
-      familyName: trimOrNull(dto.customer_last),
-      displayName: `${dto.customer_first || ''} ${dto.customer_last || ''}`.trim() || null,
-      email: trimOrNull(dto.email),
-      phone: trimOrNull(dto.phone),
-      note: trimOrNull(dto.google_note) || trimOrNull(dto.notes),
-    });
-  } catch (e) {
-    logger.warn('👤⚠️ [Google] update failed', { error: String(e), resourceName: match.resourceName });
+    logger.warn('👤⚠️ [Google] upsert failed', { error: String(e), userId });
   }
 }
 
@@ -10334,6 +12157,15 @@ async function create(dto, { user } = {}) {
     ? { startMysql: isoToMysql(startIso), endMysql: isoToMysql(endIso) }
     : computeEndAtFromStart(startIso);
 
+  // 🧭 TZ DEBUG: diagnostica fuso orario prenotazioni
+  logger.info('🧭 TZ DEBUG', {
+    received: startIso,
+    normalized: startMysql,
+    newDateReceived: startIso ? new Date(startIso).toString() : null,
+    toISOString: startIso ? new Date(startIso).toISOString() : null,
+    serverTZ: Intl.DateTimeFormat().resolvedOptions().timeZone,
+  });
+
   const res = await query(
     `INSERT INTO reservations
       (customer_first, customer_last, phone, email,
@@ -10350,12 +12182,8 @@ async function create(dto, { user } = {}) {
   const created = await getById(res.insertId);
   logger.info('🆕 reservation created', { id: created.id, by: user?.email || null });
 
-  // Best-effort sync: se il numero matcha un contatto Google, aggiorno DB+Google
-  try {
-    await syncGoogleContactOnCreate(dto, userId);
-  } catch (e) {
-    logger.warn('👤⚠️ [Google] sync failed', { error: String(e) });
-  }
+  // Best-effort sync: upsert contatto Google
+  await upsertGoogleContactForUser(userId, dto);
 
   return created;
 }
@@ -10382,6 +12210,14 @@ async function update(id, dto, { user } = {}) {
       ? { startMysql: isoToMysql(dto.start_at), endMysql: isoToMysql(endIso) }
       : computeEndAtFromStart(dto.start_at);
     startMysql = c.startMysql; endMysql = c.endMysql;
+
+    logger.info('🧭 TZ DEBUG', {
+      received: dto.start_at,
+      normalized: startMysql,
+      newDateReceived: new Date(dto.start_at).toString(),
+      toISOString: new Date(dto.start_at).toISOString(),
+      serverTZ: Intl.DateTimeFormat().resolvedOptions().timeZone,
+    });
   }
   const fields = [], pr = [];
   if (userId !== null) { fields.push('user_id=?'); pr.push(userId); }
@@ -10420,6 +12256,7 @@ async function update(id, dto, { user } = {}) {
   await query(`UPDATE reservations SET ${fields.join(', ')} WHERE id=?`, pr);
   const updated = await getById(id);
   logger.info('✏️ reservation updated', { id, by: user?.email || null });
+  await upsertGoogleContactForUser(updated?.user_id || userId, dto);
   return updated;
 }
 
@@ -11386,6 +13223,225 @@ module.exports = {
 };
 ```
 
+### ./src/services/twilio.service.js
+```
+'use strict';
+
+/**
+ * services/twilio.service.js
+ * -----------------------------------------------------------------------------
+ * Gate centralizzato Twilio: WhatsApp + SMS.
+ *
+ * Obiettivo: spegnere Twilio globalmente solo via env, senza cambiare codice.
+ * - TWILIO_ENABLED=0 → nessuna chiamata API, risposta ok + disabled.
+ * - TWILIO_DRY_RUN=1 → non invia, logga e ritorna ok simulated.
+ * - Nessun crash se mancano TWILIO_* env; log chiaro con emoji.
+ *
+ * ENV (compatibili prod/dev):
+ * - TWILIO_ENABLED=0|1 (default: 0 se mancano credenziali, altrimenti rispetta valore)
+ * - TWILIO_DRY_RUN=0|1 (default: 0)
+ * - TWILIO_BLOCK_REASON="manutenzione" (opzionale, per log/health)
+ * - TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN (minimi per “enabled”)
+ * - SMS: SMS_FROM o TWILIO_SMS_FROM
+ *
+ * Regola: Twilio è attivo solo se TWILIO_ENABLED=1 E credenziali minime presenti.
+ * Se manca qualcosa → forzare disabled + log warn.
+ */
+
+const logger = require('../logger');
+const env = require('../env');
+
+// ----------------------------------------------------------------------------
+// Config e stato (nessun token/SID in chiaro nei log)
+// ----------------------------------------------------------------------------
+const sid = (env.WA?.accountSid || process.env.TWILIO_ACCOUNT_SID || '').trim();
+const token = (env.WA?.authToken || process.env.TWILIO_AUTH_TOKEN || '').trim();
+const smsFrom = (process.env.SMS_FROM || process.env.TWILIO_SMS_FROM || '').trim();
+
+const hasCreds = !!(sid && token);
+const disableTwilioEnv = !!(env.DISABLE_TWILIO || process.env.DISABLE_TWILIO === '1' || process.env.DISABLE_TWILIO === 'true');
+const enabledRaw = (env.TWILIO?.enabledRaw || process.env.TWILIO_ENABLED || '').toString().trim();
+const wantEnabled = enabledRaw === '1' || enabledRaw === 'true' || enabledRaw === 'yes';
+const explicitlyDisabled = enabledRaw === '0' || enabledRaw === 'false';
+
+// Default: 0 se mancano credenziali, altrimenti 1 solo se tutto presente (env non impostato = abilita se creds ok)
+// DISABLE_TWILIO=1 → override: forza disabled ovunque
+let _enabled = false;
+if (disableTwilioEnv) {
+  _enabled = false;
+} else if (explicitlyDisabled) {
+  _enabled = false;
+} else if (enabledRaw === '') {
+  _enabled = hasCreds;
+} else {
+  _enabled = wantEnabled && hasCreds;
+}
+if (wantEnabled && !hasCreds) {
+  _enabled = false;
+  logger.warn('🛑 [TWILIO] disabled — credenziali mancanti (TWILIO_ENABLED=1 ma TWILIO_ACCOUNT_SID/AUTH_TOKEN assenti)', {
+    hasSid: !!sid,
+    hasToken: !!token,
+  });
+}
+
+const dryRun = !!(env.TWILIO?.dryRun || process.env.TWILIO_DRY_RUN === '1' || process.env.TWILIO_DRY_RUN === 'true');
+const blockReason = (env.TWILIO?.blockReason || process.env.TWILIO_BLOCK_REASON || '').trim();
+
+let _client = null;
+let _lastHealthAt = new Date().toISOString();
+
+function _loadClient() {
+  if (_client) return _client;
+  if (!_enabled || dryRun) return null;
+  try {
+    // eslint-disable-next-line global-require
+    const twilio = require('twilio');
+    _client = twilio(sid, token);
+    logger.info('🟢 [TWILIO] client inizializzato (invii reali attivi)');
+    return _client;
+  } catch (e) {
+    logger.warn('🔴 [TWILIO] client non disponibile (modulo twilio?)', { error: String(e?.message || e) });
+    return null;
+  }
+}
+
+// ----------------------------------------------------------------------------
+// API pubbliche
+// ----------------------------------------------------------------------------
+
+function isTwilioEnabled() {
+  return _enabled;
+}
+
+function isTwilioDryRun() {
+  return dryRun;
+}
+
+function getBlockReason() {
+  return blockReason;
+}
+
+/**
+ * Invia messaggio WhatsApp (stesso payload di client.messages.create).
+ * - Disabled: non chiama Twilio, ritorna { ok: true, disabled: true }.
+ * - Dry-run: non chiama Twilio, ritorna { ok: true, simulated: true }.
+ * - Enabled: chiama Twilio, ritorna { ok: true, sid } o { ok: false, lastError }.
+ * @param {object} payload - { from, to, body?, mediaUrl?, statusCallback?, contentSid?, contentVariables? }
+ * @param {object} [meta] - { toMask?, kind? } per log (no SID/token)
+ */
+async function sendWhatsApp(payload, meta = {}) {
+  const rawTo = payload && payload.to ? String(payload.to).trim() : '';
+  const toMask = rawTo ? rawTo.slice(0, 6) + '…' : '+39…';
+  const kind = meta.kind || 'whatsapp';
+
+  if (!_enabled) {
+    const reason = disableTwilioEnv ? 'DISABLE_TWILIO=1 (WhatsApp/Twilio disabilitato via env)' : (blockReason || 'TWILIO_ENABLED=0');
+    logger.warn('⛔ WhatsApp/Twilio disabilitato via env — skip sendWhatsApp', { to: toMask, reason });
+    return { ok: true, disabled: true, reason };
+  }
+
+  if (dryRun) {
+    logger.info('🧪 [TWILIO] dry-run — simulate sendWhatsApp to=+' + toMask + ' kind=' + kind);
+    return { ok: true, simulated: true };
+  }
+
+  const client = _loadClient();
+  if (!client) {
+    logger.warn('🛑 [TWILIO] skip sendWhatsApp (client unavailable) to=+' + toMask);
+    return { ok: false, disabled: true, reason: 'client_unavailable' };
+  }
+
+  try {
+    const msg = await client.messages.create(payload);
+    logger.info('🟢 [TWILIO] sent — channel=whatsapp sid=' + (msg.sid ? msg.sid.slice(0, 10) + '…' : '—') + ' to=+' + toMask);
+    return { ok: true, sid: msg.sid };
+  } catch (e) {
+    const code = e.code || e.status || '';
+    const message = e.message || String(e);
+    logger.error('🔴 [TWILIO] error — code=' + code + ' message=' + message.replace(/token|sid|auth/gi, '***'));
+    return { ok: false, lastError: message, code };
+  }
+}
+
+/**
+ * Invia SMS.
+ * - Disabled/Dry-run: come sendWhatsApp.
+ * - Enabled: usa client.messages.create con from SMS_FROM/TWILIO_SMS_FROM.
+ */
+async function sendSms({ to, body, meta = {} }) {
+  const rawTo = to ? String(to).trim() : '';
+  const toMask = rawTo ? rawTo.slice(0, 6) + '…' : '+39…';
+  const kind = meta.kind || 'sms';
+
+  if (!_enabled) {
+    const reason = disableTwilioEnv ? 'DISABLE_TWILIO=1 (WhatsApp/Twilio disabilitato via env)' : (blockReason || 'TWILIO_ENABLED=0');
+    logger.warn('⛔ WhatsApp/Twilio disabilitato via env — skip sendSms', { to: toMask, reason });
+    return { ok: true, disabled: true, reason };
+  }
+
+  if (dryRun) {
+    logger.info('🧪 [TWILIO] dry-run — simulate sendSms to=+' + toMask);
+    return { ok: true, simulated: true };
+  }
+
+  const client = _loadClient();
+  if (!client) {
+    logger.warn('🛑 [TWILIO] skip sendSms (client unavailable) to=+' + toMask);
+    return { ok: false, disabled: true, reason: 'client_unavailable' };
+  }
+
+  const from = smsFrom || (env.WA?.from || '').replace(/^whatsapp:/, '');
+  if (!from) {
+    logger.warn('🛑 [TWILIO] skip sendSms — SMS_FROM/TWILIO_SMS_FROM mancante');
+    return { ok: false, reason: 'missing_from' };
+  }
+
+  try {
+    const msg = await client.messages.create({ from, to: String(to).trim(), body: String(body || '') });
+    logger.info('🟢 [TWILIO] sent — channel=sms sid=' + (msg.sid ? msg.sid.slice(0, 10) + '…' : '—') + ' to=+' + toMask);
+    return { ok: true, sid: msg.sid };
+  } catch (e) {
+    const code = e.code || e.status || '';
+    const message = e.message || String(e);
+    logger.error('🔴 [TWILIO] error — code=' + code + ' message=' + message.replace(/token|sid|auth/gi, '***'));
+    return { ok: false, lastError: message, code };
+  }
+}
+
+/**
+ * Stato per GET /api/health/twilio.
+ * Logga solo boolean, mai SID/token.
+ */
+function getHealthState() {
+  _lastHealthAt = new Date().toISOString();
+  let reason = '';
+  if (!_enabled) {
+    reason = blockReason || (hasCreds ? 'TWILIO_ENABLED=0' : 'credenziali_mancanti');
+  } else if (dryRun) {
+    reason = 'TWILIO_DRY_RUN=1';
+  } else {
+    reason = 'ok';
+  }
+  return {
+    ok: true,
+    enabled: _enabled,
+    dryRun,
+    reason,
+    hasCreds,
+    updatedAt: _lastHealthAt,
+  };
+}
+
+module.exports = {
+  isTwilioEnabled,
+  isTwilioDryRun,
+  getBlockReason,
+  sendWhatsApp,
+  sendSms,
+  getHealthState,
+};
+```
+
 ### ./src/services/voucher-notify.service.js
 ```
 // ============================================================================
@@ -11400,6 +13456,7 @@ const nodemailer = require('nodemailer');
 const logger = require('../logger');
 const env = require('../env');
 const wa = require('./whatsapp.service');
+const twilioService = require('./twilio.service');
 
 let _transport = null;
 function getTransporter() {
@@ -11496,32 +13553,20 @@ async function sendActivationEmail({ to, voucher, contact }) {
 }
 
 async function sendActivationSms({ to, voucher }) {
-  const sid = process.env.TWILIO_ACCOUNT_SID || env.WA?.accountSid || '';
-  const token = process.env.TWILIO_AUTH_TOKEN || env.WA?.authToken || '';
-  const from = process.env.SMS_FROM || process.env.TWILIO_SMS_FROM || '';
-  if (!sid || !token || !from) {
-    logger.warn('📱 [Voucher] SMS skipped (missing config)', { hasSid: !!sid, hasToken: !!token, hasFrom: !!from });
-    return { ok: false, reason: 'missing_config' };
-  }
   const dest = String(to || '').trim();
   if (!dest) return { ok: false, reason: 'no_recipient' };
-
-  let twilio;
-  try {
-    twilio = require('twilio')(sid, token);
-  } catch (e) {
-    logger.warn('📱 [Voucher] SMS skipped (twilio not available)', { error: String(e?.message || e) });
-    return { ok: false, reason: 'no_twilio' };
-  }
 
   const valueEUR = (Number(voucher?.value_cents || 0) / 100).toFixed(2);
   const validUntil = voucher?.valid_until ? fmtDateIt(voucher.valid_until) : '';
   const optUrl = buildOptOutUrl({ phone: dest, channel: 'sms' });
   const text = `Buono Regalo attivato. Valore ${valueEUR} EUR${validUntil ? `, valido fino al ${validUntil}` : ''}. Per disiscriverti rispondi STOP.${optUrl ? ` ${optUrl}` : ''}`;
 
-  const msg = await twilio.messages.create({ from, to: dest, body: text });
-  logger.info('📱 [Voucher] SMS sent', { to: dest, sid: msg?.sid });
-  return { ok: true, sid: msg?.sid };
+  const res = await twilioService.sendSms({ to: dest, body: text, meta: { kind: 'voucher_activation' } });
+  if (res.disabled) return { ok: true, disabled: true };
+  if (res.simulated) return { ok: true, simulated: true, sid: null };
+  if (!res.ok) return { ok: false, reason: res.reason || res.lastError || 'twilio_error' };
+  logger.info('📱 [Voucher] SMS sent', { to: dest, sid: res.sid ? res.sid.slice(0, 10) + '…' : '' });
+  return { ok: true, sid: res.sid };
 }
 
 async function sendMarketingConfirmEmail({ to, contact, token }) {
@@ -11564,29 +13609,17 @@ async function sendMarketingConfirmEmail({ to, contact, token }) {
 }
 
 async function sendMarketingConfirmSms({ to, token }) {
-  const sid = process.env.TWILIO_ACCOUNT_SID || env.WA?.accountSid || '';
-  const tokenEnv = process.env.TWILIO_AUTH_TOKEN || env.WA?.authToken || '';
-  const from = process.env.SMS_FROM || process.env.TWILIO_SMS_FROM || '';
-  if (!sid || !tokenEnv || !from) {
-    logger.warn('📱 [Voucher] confirm SMS skipped (missing config)', { hasSid: !!sid, hasToken: !!tokenEnv, hasFrom: !!from });
-    return { ok: false, reason: 'missing_config' };
-  }
   const dest = String(to || '').trim();
   if (!dest) return { ok: false, reason: 'no_recipient' };
 
-  let twilio;
-  try {
-    twilio = require('twilio')(sid, tokenEnv);
-  } catch (e) {
-    logger.warn('📱 [Voucher] confirm SMS skipped (twilio not available)', { error: String(e?.message || e) });
-    return { ok: false, reason: 'no_twilio' };
-  }
-
   const confirmUrl = buildOptInUrl(token);
   const text = `Conferma consenso marketing: ${confirmUrl}`;
-  const msg = await twilio.messages.create({ from, to: dest, body: text });
-  logger.info('📱 [Voucher] confirm SMS sent', { to: dest, sid: msg?.sid });
-  return { ok: true, sid: msg?.sid };
+  const res = await twilioService.sendSms({ to: dest, body: text, meta: { kind: 'voucher_confirm_sms' } });
+  if (res.disabled) return { ok: true, disabled: true };
+  if (res.simulated) return { ok: true, simulated: true, sid: null };
+  if (!res.ok) return { ok: false, reason: res.reason || res.lastError || 'twilio_error' };
+  logger.info('📱 [Voucher] confirm SMS sent', { to: dest, sid: res.sid ? res.sid.slice(0, 10) + '…' : '' });
+  return { ok: true, sid: res.sid };
 }
 
 async function sendMarketingConfirmWhatsapp({ to, token }) {
@@ -11636,29 +13669,17 @@ async function sendMarketingOptInEmail({ to, contact }) {
 }
 
 async function sendMarketingOptInSms({ to }) {
-  const sid = process.env.TWILIO_ACCOUNT_SID || env.WA?.accountSid || '';
-  const token = process.env.TWILIO_AUTH_TOKEN || env.WA?.authToken || '';
-  const from = process.env.SMS_FROM || process.env.TWILIO_SMS_FROM || '';
-  if (!sid || !token || !from) {
-    logger.warn('📱 [Voucher] marketing SMS skipped (missing config)', { hasSid: !!sid, hasToken: !!token, hasFrom: !!from });
-    return { ok: false, reason: 'missing_config' };
-  }
   const dest = String(to || '').trim();
   if (!dest) return { ok: false, reason: 'no_recipient' };
 
-  let twilio;
-  try {
-    twilio = require('twilio')(sid, token);
-  } catch (e) {
-    logger.warn('📱 [Voucher] marketing SMS skipped (twilio not available)', { error: String(e?.message || e) });
-    return { ok: false, reason: 'no_twilio' };
-  }
-
   const optUrl = buildOptOutUrl({ phone: dest, channel: 'sms' });
   const text = `Consenso marketing registrato. Per revocarlo rispondi STOP.${optUrl ? ` ${optUrl}` : ''}`;
-  const msg = await twilio.messages.create({ from, to: dest, body: text });
-  logger.info('📱 [Voucher] marketing SMS sent', { to: dest, sid: msg?.sid });
-  return { ok: true, sid: msg?.sid };
+  const res = await twilioService.sendSms({ to: dest, body: text, meta: { kind: 'voucher_marketing_optin' } });
+  if (res.disabled) return { ok: true, disabled: true };
+  if (res.simulated) return { ok: true, simulated: true, sid: null };
+  if (!res.ok) return { ok: false, reason: res.reason || res.lastError || 'twilio_error' };
+  logger.info('📱 [Voucher] marketing SMS sent', { to: dest, sid: res.sid ? res.sid.slice(0, 10) + '…' : '' });
+  return { ok: true, sid: res.sid };
 }
 
 async function sendMarketingOptInWhatsapp({ to }) {
@@ -11715,6 +13736,7 @@ module.exports = {
 
 const logger = require('../logger');
 const env    = require('../env');
+const twilioService = require('./twilio.service');
 
 // ----------------------------------------------------------------------------
 // DB best-effort (se non c’è, fallback in-memory)
@@ -12050,10 +14072,10 @@ async function sendText(arg1, arg2, arg3) {
     return { ok: false, skipped: true, reason: 'disabled' };
   }
 
-  const client = getClient();
-  if (!client) {
-    logger.warn('📲 WA SKIPPED (client_unavailable)', { to: String(to || '') });
-    return { ok: false, skipped: true, reason: 'client_unavailable' };
+  // Gate Twilio globale: se disattivato via env, rispondiamo ok + disabled (no regressione FE)
+  if (!twilioService.isTwilioEnabled()) {
+    logger.warn('🛑 [TWILIO] disabled — skip sendWhatsApp to=+' + String(to || '').slice(0, 6) + '…');
+    return { ok: true, disabled: true };
   }
 
   const phone = normalizeToE164(to);
@@ -12109,22 +14131,26 @@ async function sendText(arg1, arg2, arg3) {
     body: CFG.logContent ? body : '[hidden]'
   });
 
-  const msg = await client.messages.create(payload);
+  const res = await twilioService.sendWhatsApp(payload, { toMask: phone, kind: 'free_text' });
+  if (res.disabled) return { ok: true, disabled: true };
+  if (res.simulated) return { ok: true, simulated: true };
+  if (!res.ok) return { ok: false, skipped: true, reason: res.reason || res.lastError || 'twilio_error' };
 
-  logger.info('📲 WA sendText OK ✅', { service: 'server', sid: msg.sid, to: phone });
+  const msgSid = res.sid;
+  logger.info('📲 WA sendText OK ✅', { service: 'server', sid: msgSid, to: phone });
 
   await insertWaMessage({
-    sid: msg.sid,
+    sid: msgSid,
     direction: 'out',
     kind: 'free_text',
     to_phone: phone,
     from_phone: fromWhatsAppAddress(waFrom),
     reservation_id: null,
-    status: msg.status || null,
+    status: null,
     payload_json: safeJson({ payload }),
   });
 
-  return { ok: true, sid: msg.sid, skipped: false, reason: null };
+  return { ok: true, sid: msgSid, skipped: false, reason: null };
 }
 
 // Alias compat
@@ -12142,8 +14168,10 @@ async function sendTemplate({ to, contentSid, variables = {}, kind = 'template',
 
   if (!CFG.enabled) return { ok: false, skipped: true, reason: 'disabled' };
 
-  const client = getClient();
-  if (!client) return { ok: false, skipped: true, reason: 'client_unavailable' };
+  if (!twilioService.isTwilioEnabled()) {
+    logger.warn('🛑 [TWILIO] disabled — skip sendTemplate kind=' + kind);
+    return { ok: true, disabled: true };
+  }
 
   const waFrom = _normalizeFrom(CFG.from);
   if (!waFrom) return { ok: false, skipped: true, reason: 'missing_from' };
@@ -12166,29 +14194,35 @@ async function sendTemplate({ to, contentSid, variables = {}, kind = 'template',
     contentSid
   });
 
-  const msg = await client.messages.create(payload);
+  const res = await twilioService.sendWhatsApp(payload, { toMask: phone, kind });
+  if (res.disabled) return { ok: true, disabled: true };
+  if (res.simulated) return { ok: true, simulated: true };
+  if (!res.ok) return { ok: false, skipped: true, reason: res.reason || res.lastError || 'twilio_error' };
 
+  const msgSid = res.sid;
   logger.info('📲 WA template OK ✅', {
     service: 'server',
-    sid: msg.sid,
+    sid: msgSid,
     to: phone,
     kind,
     reservationId: reservationId || null
   });
 
-  // IMPORTANTISSIMO: link SID template -> reservationId
-  await insertWaMessage({
-    sid: msg.sid,
-    direction: 'out',
-    kind,
-    to_phone: phone,
-    from_phone: fromWhatsAppAddress(waFrom),
-    reservation_id: reservationId,
-    status: msg.status || null,
-    payload_json: safeJson({ payload }),
-  });
+  // IMPORTANTISSIMO: link SID template -> reservationId (solo se invio reale)
+  if (msgSid) {
+    await insertWaMessage({
+      sid: msgSid,
+      direction: 'out',
+      kind,
+      to_phone: phone,
+      from_phone: fromWhatsAppAddress(waFrom),
+      reservation_id: reservationId,
+      status: null,
+      payload_json: safeJson({ payload }),
+    });
+  }
 
-  return { ok: true, sid: msg.sid, skipped: false, reason: null };
+  return { ok: true, sid: msgSid, skipped: false, reason: null };
 }
 
 // ----------------------------------------------------------------------------
@@ -12238,6 +14272,11 @@ async function sendStatusChange({ to, reservation, status, reason }) {
   if (!CFG.enabled) {
     logger.warn('📲 WA SKIPPED (disabled)', { id: reservation?.id });
     return { ok: false, skipped: true, reason: 'disabled' };
+  }
+
+  if (!twilioService.isTwilioEnabled()) {
+    logger.warn('🛑 [TWILIO] disabled — skip sendStatusChange id=' + (reservation?.id || ''));
+    return { ok: true, disabled: true };
   }
 
   const phone = normalizeToE164(to || reservation?.contact_phone || reservation?.phone);
@@ -12449,6 +14488,516 @@ module.exports = {
 };
 ```
 
+### ./src/services/whatsapp-webqr.service.js
+```
+// src/services/whatsapp-webqr.service.js
+// [WEBQR] Singleton: state in memoria (booting/pairing/open/disconnected).
+// REGOLA ANTI-FALSO-OK: "pronto per invio" SOLO con status === 'open'.
+// Baileys può risultare attivo ma non realmente open (handshake incompleto / creds stale).
+// Se non open, l'API risponde 409 WA_NOT_READY (no "ok" finto).
+// QR tenuto 90s dopo disconnect per permettere alla UI di mostrarlo.
+'use strict';
+
+const path = require('path');
+const fs = require('fs');
+const provider = require('./provider.baileys');
+const logger = require('../logger');
+const { query } = require('../db');
+const { normalizePhoneIT, toBaileysJid } = require('../utils/normalize-phone-it');
+
+// Log a avvio modulo per verificare che .env sia letto (evita 503 per enabled=false)
+logger.info('[WEBQR] env', { WHATSAPP_WEBQR_ENABLED: process.env.WHATSAPP_WEBQR_ENABLED });
+
+const AUTH_DIR_DEFAULT = path.join(process.cwd(), 'data', 'wa-webqr');
+/** ID runtime del singleton: stesso in tutti i require; se diverso tra route = doppia istanza. */
+const INSTANCE_ID = Math.random().toString(36).slice(2);
+
+const RECENT_MAX = 50;
+/** Coda ultimi 50 messaggi per GET /messages e UI (coerente con MAX_MESSAGES_UI). */
+const MESSAGES_RING_MAX = 50;
+/** Secondi per cui mantenere il QR visibile dopo disconnect (UI può ancora mostrarlo). */
+const QR_RETENTION_AFTER_DISCONNECT_MS = 90_000;
+
+let _started = false;
+let _io = null;
+let _recentMessages = [];
+/** Ring buffer ultimi 20 messaggi (per API /messages e lastMessage). */
+let _messagesRing = [];
+/** Messaggi raw per download media (messageId -> raw msg); max 30. */
+const MEDIA_CACHE_MAX = 30;
+let _mediaMessages = new Map();
+/** Timer per azzerare state.qr dopo disconnect; evita di distruggere subito il QR. */
+let _qrClearTimer = null;
+
+/**
+ * State singleton in memoria: usato da API /status e /qr.
+ * status: 'booting' | 'pairing' | 'open' | 'connected' | 'disconnected' | 'disabled'
+ * INVIO CONSENTITO SOLO SE status === 'open' (source of truth per "pronto").
+ */
+let state = {
+  enabled: false,
+  status: 'disconnected',
+  qr: null,
+  lastError: null,
+  updatedAt: Date.now(),
+  /** Ultimo messaggio ricevuto: { at, from, textSnippet, id } per UI e GET /last-message. */
+  lastMessage: null,
+  /** Info account connesso (quando status=open): jid, numberRaw, numberHuman, pushName. */
+  me: null,
+  /** Incrementato a ogni reset per distinguere sessioni; messaggi portano sessionId. */
+  sessionId: 0,
+  /** Ultimo tentativo di invio (debug + FE badge): { ts, toHuman, jid, ok, reason, msgId }. */
+  lastSendAttempt: null,
+};
+
+function enabled() {
+  return String(process.env.WHATSAPP_WEBQR_ENABLED || '0') === '1';
+}
+
+function _clearQrTimer() {
+  if (_qrClearTimer) {
+    clearTimeout(_qrClearTimer);
+    _qrClearTimer = null;
+  }
+}
+
+function _emitStatus() {
+  if (_io) _io.to('admins').emit('whatsapp-webqr:status', {
+    status: state.status,
+    lastError: state.lastError,
+    updatedAt: state.updatedAt,
+    me: state.me,
+    sessionId: state.sessionId,
+    lastSendAttempt: state.lastSendAttempt,
+  });
+}
+
+/** TASK 2: guard idempotente — start() può essere chiamato più volte, parte una sola volta. */
+function start(ioInstance) {
+  if (!enabled()) {
+    logger.info('[WEBQR] 📲 disabled (WHATSAPP_WEBQR_ENABLED!=1)');
+    return;
+  }
+  if (_started) {
+    logger.warn('[WEBQR] ⚠️ already started', { INSTANCE_ID });
+    return;
+  }
+  logger.info('[WEBQR] 🧩 service instance', { INSTANCE_ID });
+  _io = ioInstance;
+  _started = true;
+  state.enabled = true;
+  state.status = 'booting';
+  state.qr = null;
+  state.lastError = null;
+  state.updatedAt = Date.now();
+  _clearQrTimer();
+
+  provider.registerCallbacks({
+    onStatus: (payload) => {
+      const raw = payload.status;
+      // Mappatura: ready -> open (SOLO open = pronto per invio), qr -> pairing, connecting -> booting
+      if (raw === 'ready') {
+        state.status = 'open';
+        state.qr = null;
+        state.lastError = null;
+        state.updatedAt = Date.now();
+        _clearQrTimer();
+        logger.info('[WEBQR] 🟢 open (pronto per invio)');
+      } else if (raw === 'qr') {
+        state.status = 'pairing';
+        state.updatedAt = payload.updatedAt || Date.now();
+        logger.info('[WEBQR] 🔳 pairing (QR pronto)');
+      } else if (raw === 'connecting') {
+        state.status = 'booting';
+        state.updatedAt = payload.updatedAt || Date.now();
+        logger.info('[WEBQR] 🟡 booting');
+      } else {
+        state.status = 'disconnected';
+        state.lastError = payload.lastError || state.lastError;
+        state.updatedAt = payload.updatedAt || Date.now();
+        _clearQrTimer();
+        _qrClearTimer = setTimeout(() => {
+          state.qr = null;
+          state.updatedAt = Date.now();
+          _qrClearTimer = null;
+          if (_io) _io.to('admins').emit('whatsapp-webqr:status', { status: state.status, lastError: state.lastError, updatedAt: state.updatedAt });
+          logger.info('[WEBQR] 🔳 QR azzerato dopo retention (disconnected)');
+        }, QR_RETENTION_AFTER_DISCONNECT_MS);
+        logger.warn('[WEBQR] 🔴 disconnected', { lastError: state.lastError });
+      }
+      _emitStatus();
+    },
+    onQr: (dataUrl) => {
+      state.status = 'pairing';
+      state.qr = dataUrl;
+      state.lastError = null;
+      state.updatedAt = Date.now();
+      _clearQrTimer();
+      logger.info('[WEBQR] 🔳 QR ricevuto (pairing)');
+      if (_io) {
+        _io.to('admins').emit('whatsapp-webqr:qr', { qr: dataUrl, updatedAt: state.updatedAt });
+        _io.to('admins').emit('whatsapp-webqr:status', { status: state.status, lastError: null, updatedAt: state.updatedAt });
+      }
+    },
+    onError: (msg) => {
+      state.lastError = msg;
+      state.updatedAt = Date.now();
+      if (_io) _io.to('admins').emit('whatsapp-webqr:error', { message: msg });
+    },
+    onMe: (me) => {
+      state.me = me;
+      state.updatedAt = Date.now();
+      logger.info('[WEBQR] 👤 me', { numberHuman: me?.numberHuman });
+      _emitStatus();
+    },
+    onMessage: (message, rawMsg) => {
+      // Se riceviamo messaggi ma lo status era "disconnected", la connessione è attiva — allinea a open (evita badge "disconnected" errato)
+      if (state.status === 'disconnected' && state.me) {
+        state.status = 'open';
+        state.lastError = null;
+        state.updatedAt = Date.now();
+        logger.info('[WEBQR] 🟢 status → open (msg ricevuto)');
+      }
+      if (rawMsg && message.id) {
+        _mediaMessages.set(message.id, rawMsg);
+        if (_mediaMessages.size > MEDIA_CACHE_MAX) {
+          const firstKey = _mediaMessages.keys().next().value;
+          if (firstKey != null) _mediaMessages.delete(firstKey);
+        }
+      }
+      const tagged = { ...message, sessionId: state.sessionId };
+      _recentMessages.push(tagged);
+      if (_recentMessages.length > RECENT_MAX) _recentMessages.shift();
+      insertMessageToDb(tagged).catch(() => {});
+      const snippet = (message.text && message.text.length > 0)
+        ? String(message.text).slice(0, 80).replace(/\n/g, ' ')
+        : (message.rawType && message.rawType !== 'conversation' && message.rawType !== 'extendedTextMessage' ? '[media]' : '[no-text]');
+      state.lastMessage = {
+        at: message.ts || Date.now(),
+        from: message.fromNumber || message.from || '',
+        textSnippet: snippet,
+        id: message.id || '',
+      };
+      _messagesRing.push(tagged);
+      if (_messagesRing.length > MESSAGES_RING_MAX) _messagesRing.shift();
+      logger.info('[WEBQR] ✉️ msg ricevuto', { from: state.lastMessage.from, snippet: state.lastMessage.textSnippet.slice(0, 40), at: state.lastMessage.at });
+      if (_io) {
+        _io.to('admins').emit('whatsapp-webqr:message', { message, lastMessage: state.lastMessage });
+        _io.to('admins').emit('whatsapp-webqr:status', { status: state.status, lastError: state.lastError, updatedAt: state.updatedAt });
+      }
+    },
+  });
+  provider.connect(logger).catch((err) => {
+    logger.error('[WEBQR] ❌ start KO', err);
+  });
+}
+
+/** TASK 2: lazy-start — se enabled e non ancora started, avvia il service (GET /status e /qr lo usano). */
+function ensureStarted(ioInstance) {
+  if (!enabled()) return;
+  if (!_started) {
+    if (ioInstance) {
+      start(ioInstance);
+    } else {
+      logger.warn('[WEBQR] ⚠️ ensureStarted senza io: messaggi in tempo reale via socket non disponibili (usa GET /messages per polling)');
+    }
+  }
+}
+
+function isStarted() {
+  return _started;
+}
+
+function getStatus() {
+  if (!enabled()) {
+    return { status: 'disabled', enabled: false, updatedAt: Date.now(), lastError: null, qr: null, me: null, sessionId: 0, lastSendAttempt: null };
+  }
+  return {
+    enabled: state.enabled,
+    status: state.status,
+    qr: state.qr,
+    lastError: state.lastError,
+    updatedAt: state.updatedAt,
+    me: state.me || null,
+    sessionId: state.sessionId ?? 0,
+    lastSendAttempt: state.lastSendAttempt || null,
+  };
+}
+
+/** Restituisce lo state completo per /qr (qr, status, updatedAt, lastError). */
+function getQr() {
+  if (!enabled()) return null;
+  return state.qr;
+}
+
+/** Ultimi 50 messaggi (dal più recente al più vecchio). Solo in memoria, no DB. */
+function getRecentMessages() {
+  return [..._recentMessages].reverse();
+}
+
+/** Inserisce un messaggio in DB (idempotente: UNIQUE su session_id + message_id). */
+async function insertMessageToDb(message) {
+  const sessionId = state.sessionId ?? 0;
+  const id = message.id || '';
+  const ts = message.ts || Date.now();
+  const from = message.from || '';
+  const fromNumber = message.fromNumber || message.from || '';
+  const pushName = (message.pushName != null && String(message.pushName).trim()) ? String(message.pushName).trim().slice(0, 255) : null;
+  const text = (message.text != null) ? String(message.text).slice(0, 1024) : null;
+  const rawType = (message.rawType != null) ? String(message.rawType).slice(0, 64) : null;
+  const hasMedia = message.hasMedia ? 1 : 0;
+  const mediaType = (message.mediaType != null) ? String(message.mediaType).slice(0, 32) : null;
+  try {
+    await query(
+      `INSERT INTO wa_webqr_messages (session_id, message_id, ts, from_jid, from_number, push_name, text, raw_type, has_media, media_type)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+       ON DUPLICATE KEY UPDATE ts = ts`,
+      [sessionId, id, ts, from.slice(0, 128), fromNumber.slice(0, 32), pushName, text, rawType, hasMedia, mediaType]
+    );
+  } catch (e) {
+    logger.warn('[WEBQR] insertMessageToDb KO', { messageId: id, error: String(e?.message || e) });
+  }
+}
+
+/** Legge ultimi N messaggi della sessione da DB (dal più recente). */
+async function getMessagesFromDb(sessionId, limit = 50) {
+  const rows = await query(
+    `SELECT message_id AS id, ts, from_jid AS \`from\`, from_number AS fromNumber, push_name AS pushName, text, raw_type AS rawType, has_media AS hasMedia, media_type AS mediaType, session_id AS sessionId
+     FROM wa_webqr_messages
+     WHERE session_id = ?
+     ORDER BY ts DESC
+     LIMIT ?`,
+    [sessionId, limit]
+  );
+  return (rows || []).map((r) => ({
+    id: r.id,
+    ts: Number(r.ts),
+    from: r.from || '',
+    fromNumber: r.fromNumber || r.from || '',
+    pushName: r.pushName || undefined,
+    text: r.text || '',
+    rawType: r.rawType || 'unknown',
+    hasMedia: !!r.hasMedia,
+    mediaType: r.mediaType || undefined,
+    sessionId: r.sessionId ?? sessionId,
+  }));
+}
+
+/** Per GET /messages: da DB (ultimi 50 della sessione) con fallback a memoria. Non va mai in 500. */
+async function getMessagesForApi() {
+  const currentSessionId = state.sessionId ?? 0;
+  let lastMessage = state.lastMessage;
+  try {
+    const messages = await getMessagesFromDb(currentSessionId, MESSAGES_RING_MAX);
+    if (messages.length > 0) {
+      if (!lastMessage && messages[0]) {
+        const m = messages[0];
+        lastMessage = { at: m.ts, from: m.fromNumber || m.from, textSnippet: (m.text || '').slice(0, 80), id: m.id };
+      }
+      return { messages, lastMessage };
+    }
+  } catch (e) {
+    logger.warn('[WEBQR] getMessagesFromDb KO, fallback memoria', { error: String(e?.message || e) });
+  }
+  const messages = [..._messagesRing]
+    .filter((m) => (m.sessionId ?? 0) === currentSessionId)
+    .reverse();
+  return { messages, lastMessage: lastMessage || state.lastMessage };
+}
+
+/** Restituisce il raw message per messageId (per download media). */
+function getMediaMessage(messageId) {
+  return _mediaMessages.get(messageId) || null;
+}
+
+/** Scarica il buffer del media e restituisce { buffer, contentType }. Restituisce null se messaggio non presente o download fallisce (es. view-once già visualizzato). */
+async function getMediaBuffer(messageId) {
+  const rawMsg = getMediaMessage(messageId);
+  if (!rawMsg || !rawMsg.message) return null;
+  const m = rawMsg.message || {};
+  const contentTypeKey = Object.keys(m).find((k) => k !== 'messageContextInfo' && /Message$/.test(k));
+  const media = contentTypeKey ? m[contentTypeKey] : null;
+  const mimetype = (media && typeof media.mimetype === 'string') ? media.mimetype : 'application/octet-stream';
+  try {
+    const buffer = await provider.downloadMediaMessage(rawMsg, logger);
+    return buffer ? { buffer, contentType: mimetype } : null;
+  } catch (e) {
+    const msg = e?.message || String(e);
+    if (msg && (msg.includes('No message present') || msg.includes('not a media message'))) {
+      logger.warn('[WEBQR] getMediaBuffer: messaggio non scaricabile', { messageId, reason: msg });
+      return null;
+    }
+    throw e;
+  }
+}
+
+async function send({ to, text }) {
+  if (!enabled()) {
+    logger.warn('[WEBQR] send rifiutato: disabled');
+    throw Object.assign(new Error('whatsapp_webqr_disabled'), { code: 'WA_DISABLED' });
+  }
+  if (state.status !== 'open') {
+    logger.warn('[WEBQR] send rifiutato: WA_NOT_READY', { status: state.status });
+    state.lastSendAttempt = { ts: Date.now(), toHuman: to, jid: null, ok: false, reason: 'WA_NOT_READY', msgId: null };
+    state.updatedAt = Date.now();
+    _emitStatus();
+    throw Object.assign(new Error('WA non pronto (status: ' + state.status + ')'), { code: 'WA_NOT_READY' });
+  }
+  let e164, jid;
+  try {
+    e164 = normalizePhoneIT(to);
+    jid = toBaileysJid(e164);
+  } catch (err) {
+    const code = (err && err.code) ? err.code : 'INVALID_PHONE';
+    logger.warn('[WEBQR] send: numero non valido', { to, code });
+    state.lastSendAttempt = { ts: Date.now(), toHuman: to, jid: null, ok: false, reason: code, msgId: null };
+    state.updatedAt = Date.now();
+    _emitStatus();
+    throw err;
+  }
+  const toHuman = e164.replace(/(\d{2})(\d{3})(\d{3})(\d{4})/, '+$1 $2 $3 $4').trim() || e164;
+  logger.info('[WEBQR] tentativo invio', { toHuman, jid, preview: (text || '').toString().slice(0, 40) });
+  try {
+    const result = await provider.sendMessage(jid, text, logger);
+    const msgId = (result && result.key && result.key.id) ? result.key.id : null;
+    state.lastSendAttempt = { ts: Date.now(), toHuman, jid, ok: true, reason: null, msgId };
+    state.updatedAt = Date.now();
+    _emitStatus();
+    logger.info('[WEBQR] invio ok', { toHuman, msgId });
+    return { msgId };
+  } catch (err) {
+    const msg = (err && err.message) ? String(err.message) : String(err);
+    const reason = msg.indexOf('non connesso') !== -1 ? 'WA_NOT_READY' : 'SEND_FAILED';
+    state.lastSendAttempt = { ts: Date.now(), toHuman, jid, ok: false, reason, msgId: null };
+    state.updatedAt = Date.now();
+    _emitStatus();
+    logger.warn('[WEBQR] invio fallito', { toHuman, reason });
+    throw err;
+  }
+  // Se l’invio va a buon fine ma lo status era "disconnected", la connessione è attiva — allinea lo status
+}
+
+function shutdown() {
+  _clearQrTimer();
+  provider.shutdown();
+  _started = false;
+  _io = null;
+  _recentMessages = [];
+  _mediaMessages.clear();
+  const preservedSessionId = state.sessionId ?? 0;
+  state = {
+    enabled: false,
+    status: 'disconnected',
+    qr: null,
+    lastError: null,
+    updatedAt: Date.now(),
+    lastMessage: null,
+    me: null,
+    sessionId: preservedSessionId,
+    lastSendAttempt: null,
+  };
+}
+
+/** Soft restart: shutdown + start (ricrea socket senza cancellare auth). */
+function restart(ioInstance) {
+  logger.info('[WEBQR] 🔁 restart requested', { statusPre: state.status });
+  shutdown();
+  if (ioInstance && enabled()) {
+    start(ioInstance);
+  }
+  logger.info('[WEBQR] 🔁 restart done', { statusPost: state.status });
+}
+
+/** Ultimo messaggio ricevuto (per GET /last-message debug). */
+function getLastMessage() {
+  return state.lastMessage || null;
+}
+
+/**
+ * Reset: shutdown, cancella cartella auth (sessione corrotta), riavvia il service.
+ * Consentito solo se WA_RESET_ENABLED=1 o NODE_ENV=development.
+ */
+function reset(ioInstance) {
+  const allowReset = String(process.env.WA_RESET_ENABLED || '0') === '1' ||
+    process.env.NODE_ENV === 'development';
+  if (!allowReset) {
+    logger.warn('[WEBQR] ❌ reset rifiutato: WA_RESET_ENABLED non attivo e NODE_ENV!=development');
+    throw Object.assign(new Error('reset non consentito'), { code: 'RESET_DISABLED' });
+  }
+  logger.info('[WEBQR] ♻️ reset requested');
+  // Azzera buffer messaggi, lastMessage, qr, lastError, me; incrementa sessionId per distinguere sessioni
+  state.sessionId = (state.sessionId ?? 0) + 1;
+  _messagesRing = [];
+  _mediaMessages.clear();
+  _recentMessages = [];
+  state.lastMessage = null;
+  state.qr = null;
+  state.lastError = null;
+  state.me = null;
+  state.updatedAt = Date.now();
+  shutdown();
+  const authDir = path.resolve((process.env.WHATSAPP_WEBQR_AUTH_DIR || '').trim() || AUTH_DIR_DEFAULT);
+  try {
+    if (fs.existsSync(authDir)) {
+      fs.rmSync(authDir, { recursive: true });
+      logger.info('[WEBQR] 🗑️ auth dir rimossa', { authDir });
+    }
+  } catch (e) {
+    logger.warn('[WEBQR] ⚠️ rimozione auth dir KO', { authDir, error: String(e) });
+  }
+  if (ioInstance && enabled()) {
+    start(ioInstance);
+  }
+}
+
+/** Per debug: INSTANCE_ID, authDir, retryCount, ecc. */
+function getDebugInfo() {
+  const authDir = (process.env.WHATSAPP_WEBQR_AUTH_DIR || '').trim() || AUTH_DIR_DEFAULT;
+  let authExists = false;
+  let authFilesCount = 0;
+  try {
+    authExists = fs.existsSync(authDir);
+    if (authExists) {
+      const files = fs.readdirSync(authDir);
+      authFilesCount = files.length;
+    }
+  } catch (_) {}
+  return {
+    enabled: enabled(),
+    started: _started,
+    INSTANCE_ID,
+    authDir,
+    authExists,
+    authFilesCount,
+    retryCount: provider.getRetryCount ? provider.getRetryCount() : null,
+    lastError: state.lastError,
+    status: state.status,
+    nodeVersion: process.version,
+    envProxyPresent: !!(process.env.HTTP_PROXY || process.env.HTTPS_PROXY || process.env.NO_PROXY),
+  };
+}
+
+module.exports = {
+  enabled,
+  start,
+  ensureStarted,
+  isStarted,
+  getStatus,
+  getQr,
+  getRecentMessages,
+  getMessagesForApi,
+  getMediaMessage,
+  getMediaBuffer,
+  getLastMessage,
+  send,
+  shutdown,
+  restart,
+  reset,
+  getDebugInfo,
+  INSTANCE_ID,
+};
+```
+
 ### ./src/services/whatsender.service.js
 ```
 'use strict';
@@ -12509,6 +15058,9 @@ function init(ioInstance) {
   ioInstance.on('connection', (socket) => {
     logger.info('🔌 SOCKET connected', { id: socket.id });
 
+    /** Registrazione room admins (usata da whatsapp-webqr e altre pagine admin). */
+    socket.on('register-admin', () => socket.join('admins'));
+
     socket.on('ping', () => {
       logger.info('🏓 ping from', { id: socket.id });
       socket.emit('pong');
@@ -12557,6 +15109,19 @@ function init(ioInstance) {
     }
   } catch (err) {
     logger.warn('📡 SOCKET channel nfc.session non disponibile', {
+      error: String(err),
+    });
+  }
+
+  // [WEBQR] WhatsApp WebQR: emit whatsapp-webqr:status, :qr, :error
+  try {
+    const webqrMod = require('./whatsapp-webqr');
+    if (webqrMod && typeof webqrMod.mount === 'function') {
+      webqrMod.mount(ioInstance);
+      logger.info('📡 SOCKET channel mounted: whatsapp-webqr');
+    }
+  } catch (err) {
+    logger.warn('📡 SOCKET channel whatsapp-webqr non disponibile', {
       error: String(err),
     });
   }
@@ -12862,6 +15427,23 @@ module.exports = (io) => {
 };
 ```
 
+### ./src/sockets/whatsapp-webqr.js
+```
+// src/sockets/whatsapp-webqr.js
+// [WEBQR] Mount: avvia il service con io per emit whatsapp-webqr:status / :qr / :error
+'use strict';
+
+const logger = require('../logger');
+const webqrService = require('../services/whatsapp-webqr.service');
+
+function mount(ioInstance) {
+  webqrService.start(ioInstance);
+  logger.info('📡 SOCKET [WEBQR] service started (emit: whatsapp-webqr:status, :qr, :error)');
+}
+
+module.exports = { mount };
+```
+
 ### ./src/sse.js
 ```
 // src/sse.js
@@ -13037,6 +15619,7 @@ async function resolveCustomerUserId(db, payload = {}) {
   try {
     let first = null;
     let last  = null;
+    let full  = null;
 
     if (displayName) {
       const parts = displayName.split(/\s+/);
@@ -13044,6 +15627,7 @@ async function resolveCustomerUserId(db, payload = {}) {
       if (parts.length > 1) {
         last = parts.slice(1).join(' ') || null;
       }
+      full = displayName;
     }
 
     const now = new Date();
@@ -13069,6 +15653,22 @@ async function resolveCustomerUserId(db, payload = {}) {
 
     const id = result && result.insertId ? result.insertId : null;
 
+    // Best-effort: set full_name + name se disponibili (compat)
+    if (id && full) {
+      try {
+        await runQuery(
+          db,
+          'UPDATE users SET full_name = COALESCE(full_name, ?), name = COALESCE(name, ?) WHERE id = ?',
+          [full, full, id],
+        );
+      } catch (e) {
+        logger.warn('👥 resolveCustomerUserId: update full_name/name KO (continuo)', {
+          id,
+          error: String(e),
+        });
+      }
+    }
+
     logger.info('👥 resolveCustomerUserId: created new customer user', {
       id,
       email,
@@ -13091,6 +15691,99 @@ async function resolveCustomerUserId(db, payload = {}) {
 module.exports = resolveCustomerUserId;
 ```
 
+### ./src/utils/normalize-phone-it.js
+```
+// src/utils/normalize-phone-it.js
+// ============================================================================
+// Normalizzazione numeri di telefono IT → E.164 e JID Baileys.
+// Input sporco: +39..., 39..., 0039..., 333 123 4567, 333-123-4567, 0737 642142, ecc.
+// Output: +393331234567 (E.164) e 393331234567@s.whatsapp.net (JID).
+// Usato dal service WhatsApp WebQR per evitare falsi "invio ok" con numeri malformati.
+// ============================================================================
+
+'use strict';
+
+const MIN_DIGITS = 10; // almeno 10 cifre (es. 3331234567)
+const MAX_DIGITS = 12; // max 12 (39 + 10 cifre IT)
+
+/**
+ * Normalizza una stringa raw in numero E.164 Italia (+39...).
+ * - Rimuove spazi, parentesi, trattini, punti.
+ * - 00... → converti a +
+ * - + ok
+ * - 39... (lunghezza plausibile) → prefix +
+ * - 3... (cellulare IT 10 cifre) → +39
+ * - 0... (fisso 10 cifre) → +39
+ * @param {string} raw - Input grezzo (es. "333 123 4567", "0039 333 1234567")
+ * @returns {string} E.164 es. "+393331234567"
+ * @throws {{ code: 'INVALID_PHONE', message: string }}
+ */
+function normalizePhoneIT(raw) {
+  if (raw == null || typeof raw !== 'string') {
+    throw { code: 'INVALID_PHONE', message: 'Numero mancante o non valido' };
+  }
+  let s = raw.trim().replace(/\s+/g, '').replace(/[()\-.]/g, '');
+  if (!s) throw { code: 'INVALID_PHONE', message: 'Numero vuoto' };
+
+  // 00... → trattare come internazionale (rimuovi 00)
+  if (s.startsWith('00')) s = s.slice(2);
+  if (s.startsWith('+')) s = s.slice(1);
+
+  let digits = s.replace(/\D/g, '');
+  if (!digits) throw { code: 'INVALID_PHONE', message: 'Nessuna cifra nel numero' };
+
+  // Già 39 + 10 cifre
+  if (digits.startsWith('39') && digits.length >= 12) {
+    digits = digits.slice(0, MAX_DIGITS);
+    if (digits.length >= MIN_DIGITS) return '+' + digits;
+  }
+  if (digits.startsWith('39') && digits.length >= MIN_DIGITS) {
+    return '+' + digits.slice(0, MAX_DIGITS);
+  }
+  // Cellulare IT 3xxxxxxxxx (10 cifre)
+  if (digits.startsWith('3') && digits.length === 10) {
+    return '+39' + digits;
+  }
+  // Fisso 0xxxxxxxxx (10 cifre)
+  if (digits.startsWith('0') && digits.length === 10) {
+    return '+39' + digits.slice(1);
+  }
+  // 10 cifre senza prefisso → +39
+  if (digits.length === 10) {
+    return '+39' + digits;
+  }
+  // 11 cifre tipo 39333... → +39
+  if (digits.length === 11 && digits.startsWith('39')) {
+    return '+' + digits;
+  }
+  // Lunghezza plausibile: prendi ultime 10 e prefix 39
+  if (digits.length >= MIN_DIGITS) {
+    const tail = digits.slice(-10);
+    return '+39' + tail;
+  }
+
+  throw { code: 'INVALID_PHONE', message: `Numero non valido (cifre: ${digits.length}, min ${MIN_DIGITS})` };
+}
+
+/**
+ * Da E.164 (+39...) a JID Baileys (39...@s.whatsapp.net).
+ * @param {string} e164 - Es. "+393331234567"
+ * @returns {string} "393331234567@s.whatsapp.net"
+ */
+function toBaileysJid(e164) {
+  if (!e164 || typeof e164 !== 'string') {
+    throw { code: 'INVALID_PHONE', message: 'E.164 mancante' };
+  }
+  const digits = e164.replace(/\D/g, '');
+  if (digits.length < MIN_DIGITS) {
+    throw { code: 'INVALID_PHONE', message: 'JID: cifre insufficienti' };
+  }
+  return digits.slice(-12) + '@s.whatsapp.net';
+}
+
+module.exports = { normalizePhoneIT, toBaileysJid, MIN_DIGITS, MAX_DIGITS };
+```
+
 ### ./src/utils/print-order.js
 ```
 // src/utils/print-order.js
@@ -13103,6 +15796,7 @@ module.exports = resolveCustomerUserId;
 //   + spaziatura maggiore e wrapping note (leggibile per dislessia)
 //   + prezzi per riga (in piccolo) e totale finale (senza simbolo €)
 //   + orario “DOMENICA 10/11/2025  ore 04:42”
+// - layout ASPORTO: caratteri grandi (3x3) pizze+extra, font leggibile, 80mm
 // ============================================================================
 // Nota: manteniamo lo stile verboso con emoji nei log, come da progetto.
 // ============================================================================
@@ -13160,6 +15854,8 @@ function boldOff(sock){ sock.write(esc(0x1B,0x45,0x00)); }             // ESC E 
 function sizeNormal(sock){ sock.write(esc(0x1D,0x21,0x00)); }          // GS ! 0 (1x)
 function sizeTall(sock){ sock.write(esc(0x1D,0x21,0x01)); }            // GS ! 1 (2x altezza)
 function sizeBig(sock){ sock.write(esc(0x1D,0x21,0x11)); }             // GS ! 17 (2x larghezza+altezza)
+// sizeExtraLarge: 3x3 (GS ! n, n=(w-1)<<4|(h-1) = 0x22) — max leggibile 80mm
+function sizeExtraLarge(sock){ sock.write(esc(0x1D,0x21,0x22)); }     // GS ! 34 (3x3)
 function fontA(sock){ sock.write(esc(0x1B,0x4D,0x00)); }               // ESC M 0 → Font A (leggibile)
 function charSpacing(sock, n){ sock.write(esc(0x1B,0x20, Math.max(0,Math.min(255,n)))); } // ESC SP n
 function setLineSpacing(sock, n){ sock.write(esc(0x1B,0x33, Math.max(0,Math.min(255,n)))); } // ESC 3 n
@@ -13192,7 +15888,10 @@ function writeLine(sock, s) {
 
 // --- Layout/Wrap COMANDA -----------------------------------------------------
 const COMANDA_MAX_COLS = 42;        // stima sicura per 80mm con Font A
-const COMANDA_LINE_SP  = 48;        // spaziatura righe “larga” per leggibilità
+const COMANDA_LINE_SP  = 48;
+// Asporto: caratteri grandi 3x3 → ~16 col/riga su 80mm
+const COMANDA_ASPORTO_MAX_COLS = 16;
+const COMANDA_ASPORTO_LINE_SP  = 56;        // spaziatura righe “larga” per leggibilità
 
 function wrapText(s, max = COMANDA_MAX_COLS) {
   const text = sanitizeForEscpos(s);
@@ -13563,9 +16262,117 @@ async function printComandaSlipMcd(title, order, cfg) {
   sock.end();
 }
 
-// --- Facade: layout selezionabile (classic | mcd) ----------------------------
+// --- Stampa COMANDA ASPORTO — layout 80mm, caratteri GRANDI pizze+extra -----
+// Font A leggibile, sizeExtraLarge (3x3) per pizza e extra, spaziatura ampia
+async function printComandaSlipAsporto(title, order, cfg) {
+  const sock = await openSocket(cfg);
+  const maxCols = COMANDA_ASPORTO_MAX_COLS;
+  const lineSp = COMANDA_ASPORTO_LINE_SP;
+
+  init(sock);
+  codepageCP1252(sock);
+  fontA(sock);
+  setLineSpacing(sock, lineSp);
+  charSpacing(sock, 1);
+
+  // Header: ASPORTO enorme
+  alignCenter(sock);
+  sizeExtraLarge(sock); boldOn(sock); writeLine(sock, 'ASPORTO'); boldOff(sock);
+  sizeBig(sock); boldOn(sock); writeLine(sock, title); boldOff(sock);
+
+  const client = (order.customer_name || 'Cliente').toString().trim();
+  sizeBig(sock); boldOn(sock); writeLine(sock, client); boldOff(sock);
+
+  sizeNormal(sock);
+  writeLine(sock, '==============================');
+  alignLeft(sock);
+  writeLine(sock, `Ord. #${order.id}`);
+  if (order.scheduled_at) writeLine(sock, `Ritiro: ${fmtComandaDate(order.scheduled_at)}`);
+  if (order.phone) writeLine(sock, `Tel: ${order.phone}`);
+  if (order.note) {
+    const nlines = wrapText(`Note: ${order.note}`, maxCols);
+    for (const ln of nlines) writeLine(sock, ln);
+  }
+  writeLine(sock, '------------------------------');
+
+  const groups = new Map();
+  for (const it of (order.items || [])) {
+    const cat = (it.category || 'Altro').toString();
+    if (!groups.has(cat)) groups.set(cat, []);
+    groups.get(cat).push(it);
+  }
+  const categories = Array.from(groups.keys()).sort((a, b) => {
+    const ra = categoryRank(a), rb = categoryRank(b);
+    return ra === rb ? a.localeCompare(b, 'it') : ra - rb;
+  });
+
+  let grand = 0;
+  for (const cat of categories) {
+    const list = groups.get(cat) || [];
+    writeLine(sock, '');
+    boldOn(sock); sizeBig(sock); writeLine(sock, cat.toUpperCase()); boldOff(sock); sizeNormal(sock);
+    writeLine(sock, '------------------------------');
+
+    for (const it of list) {
+      const qty = Math.max(1, Number(it.qty) || 1);
+      const qtyTxt = qtyStr(qty);
+      const name = (it.name || '').toString().trim().toUpperCase();
+
+      // PIZZA/Prodotto: GRANDE (3x3) + bold
+      sizeExtraLarge(sock); boldOn(sock);
+      const nameLines = wrapText(`${qtyTxt} x ${name}`, maxCols);
+      for (const ln of nameLines) writeLine(sock, ln);
+      boldOff(sock); sizeNormal(sock);
+
+      // EXTRA: da notes (AGGIUNGI/SENZA) oppure order_item_options — stampa in grande
+      const notesNorm = normalizeNotesForKitchen(it.notes);
+      const optsExtras = (it.options || []).map(o => {
+        const label = o.type === 'add' ? 'AGGIUNGI' : 'SENZA';
+        const n = (o.name || '').toString().trim();
+        return n ? `${label}: ${n}` : null;
+      }).filter(Boolean);
+      const extraLines = notesNorm ? notesNorm.split(/\n+/).map(s => s.trim()).filter(Boolean) : [];
+      optsExtras.forEach(e => { if (e && !extraLines.includes(e)) extraLines.push(e); });
+      if (extraLines.length) {
+        sizeBig(sock); boldOn(sock);
+        for (const ln of extraLines) {
+          const wlines = wrapText(ln, maxCols);
+          for (const wl of wlines) writeLine(sock, '  ' + wl);
+        }
+        boldOff(sock); sizeNormal(sock);
+      }
+
+      const unit = Number(it.price || 0);
+      const rowTot = unit * qty;
+      if (unit > 0) {
+        sizeNormal(sock);
+        writeLine(sock, `  prezzo: ${money(unit)}  riga: ${money(rowTot)}`);
+      }
+      grand += rowTot;
+      feedLines(sock, 1);
+    }
+  }
+
+  alignCenter(sock);
+  writeLine(sock, '==============================');
+  boldOn(sock); sizeBig(sock); writeLine(sock, `TOTALE: ${money(grand)}`); boldOff(sock);
+
+  writeLine(sock, '');
+  writeLine(sock, 'COMANDA ASPORTO');
+  writeLine(sock, '');
+
+  resetLineSpacing(sock);
+  charSpacing(sock, 0);
+  cutIfEnabled(sock, cfg);
+  sock.end();
+}
+
+// --- Facade: layout selezionabile (classic | mcd | asporto) ------------------
 async function printComandaSlip({ title, order, cfg, layoutKey = 'classic' }) {
   const key = String(layoutKey || 'classic').trim().toLowerCase();
+  if (key === 'asporto') {
+    return printComandaSlipAsporto(title, order, cfg);
+  }
   if (key === 'mcd') {
     return printComandaSlipMcd(title, order, cfg);
   }
@@ -13661,4 +16468,394 @@ async function printOrderForCenter(orderFull, center = 'PIZZERIA', options = {})
 }
 
 module.exports = { printOrderDual, printOrderForCenter };
+```
+
+### ./src/utils/whatsapp-templates.js
+```
+'use strict';
+
+/**
+ * src/utils/whatsapp-templates.js
+ * -----------------------------------------------------------------------------
+ * Builder unico per template WhatsApp prenotazione.
+ * Centralizza la costruzione del testo per evitare duplicazioni FE/BE.
+ * Formato WhatsApp-ready: emoji, grassetti (*...*), link Maps cliccabile, footer no-reply.
+ *
+ * ENV: BRAND_NAME, BRAND_CITY, BRAND_PHONE, BRAND_ADDRESS_LINE,
+ *      BRAND_MAPS_QUERY, BRAND_MAPS_URL, WHATSAPP_NOTIFICATIONS_ONLY_TEXT
+ */
+
+const logger = require('../logger');
+const env = require('../env');
+
+// ----------------------------------------------------------------------------
+// Helpers
+// ----------------------------------------------------------------------------
+function str(v, def = '') {
+  if (v === undefined || v === null) return def;
+  return String(v).trim();
+}
+
+function num(v, def = 0) {
+  const n = Number(v);
+  return Number.isFinite(n) ? n : def;
+}
+
+/**
+ * Costruisce l'URL Google Maps cliccabile.
+ * Regola: se BRAND_MAPS_URL è valorizzata ⇒ usare quella.
+ * Altrimenti: https://maps.google.com/?q=${encodeURIComponent(query)}
+ * dove query = BRAND_MAPS_QUERY || (BRAND_NAME + ' ' + BRAND_CITY)
+ */
+function getMapsUrl(envConfig) {
+  const cfg = envConfig || env.WHATSAPP_TEMPLATE || {};
+  const override = str(cfg.brandMapsUrl);
+  if (override) return override;
+
+  const query = str(cfg.brandMapsQuery) || `${str(cfg.brandName)} ${str(cfg.brandCity)}`.trim();
+  if (!query) return 'https://maps.google.com/?q=Pizzeria+La+Lanterna+Castelraimondo';
+  return `https://maps.google.com/?q=${encodeURIComponent(query)}`;
+}
+
+/**
+ * Formatta data in DD/MM da ISO o MySQL datetime.
+ */
+function formatDateDDMM(iso) {
+  if (!iso) return '--/--';
+  try {
+    const d = new Date(iso);
+    return new Intl.DateTimeFormat('it-IT', { day: '2-digit', month: '2-digit' }).format(d);
+  } catch {
+    return '--/--';
+  }
+}
+
+/**
+ * Formatta data completa: Sabato 07/02/2026 (weekday cap + resto lowercase, DD/MM/YYYY).
+ */
+function formatDateFull(iso) {
+  if (!iso) return '--/--/----';
+  try {
+    const d = new Date(iso);
+    const weekday = new Intl.DateTimeFormat('it-IT', { weekday: 'long' }).format(d);
+    const rest = new Intl.DateTimeFormat('it-IT', { day: '2-digit', month: '2-digit', year: 'numeric' }).format(d);
+    const cap = weekday.charAt(0).toUpperCase() + weekday.slice(1).toLowerCase();
+    return `${cap} ${rest}`;
+  } catch {
+    return '--/--/----';
+  }
+}
+
+/**
+ * Estrae DDMM da ISO/MySQL datetime (es. 0702 per 7 feb).
+ */
+function formatDDMM(iso) {
+  if (!iso) return '----';
+  try {
+    const d = new Date(iso);
+    return new Intl.DateTimeFormat('it-IT', { day: '2-digit', month: '2-digit' }).format(d).replace(/\D/g, '');
+  } catch {
+    return '----';
+  }
+}
+
+/**
+ * Estrae HHMM da ISO/MySQL datetime (es. 1930 per 19:30).
+ */
+function formatHHMM(iso) {
+  if (!iso) return '----';
+  try {
+    const d = new Date(iso);
+    return new Intl.DateTimeFormat('it-IT', { hour: '2-digit', minute: '2-digit', hour12: false }).format(d).replace(/\D/g, '');
+  } catch {
+    return '----';
+  }
+}
+
+/**
+ * Ultime 4 cifre del telefono (per codice prenotazione).
+ */
+function getPhoneLast4(phone) {
+  const raw = String(phone ?? '').replace(/\D/g, '');
+  return raw.length >= 4 ? raw.slice(-4) : '----';
+}
+
+/**
+ * Maschera telefono: +39 *******68381 (prefisso + spazio + asterischi per cifre oscurate + ultime 4).
+ * Es: 393899868381 → +39 ********8381 (8 asterischi = 8 cifre nascoste).
+ */
+function maskPhone(phone) {
+  const raw = String(phone ?? '').replace(/\D/g, '');
+  if (!raw || raw.length < 4) return '****';
+  const len = raw.length;
+  const last4 = raw.slice(-4);
+  const hiddenCount = len - 4;
+  const asterisks = '*'.repeat(Math.max(0, hiddenCount));
+  const prefix = raw.startsWith('39') ? '+39 ' : (raw.length > 4 ? '+ ' : '');
+  return `${prefix}${asterisks}${last4}`;
+}
+
+/**
+ * Formatta ora in HH:mm da ISO o MySQL datetime.
+ */
+function formatTimeHHMM(iso) {
+  if (!iso) return '--:--';
+  try {
+    const d = new Date(iso);
+    return new Intl.DateTimeFormat('it-IT', { hour: '2-digit', minute: '2-digit' }).format(d);
+  } catch {
+    return '--:--';
+  }
+}
+
+// ----------------------------------------------------------------------------
+// Builder principale
+// ----------------------------------------------------------------------------
+
+/**
+ * Costruisce il messaggio WhatsApp "Prenotazione ricevuta" (formato pronto per invio).
+ *
+ * @param {Object} payload - Dati prenotazione
+ * @param {string} [payload.customerName] - Nome cliente (override)
+ * @param {string} [payload.customer_first] - Nome
+ * @param {string} [payload.customer_last] - Cognome (se assente: solo nome)
+ * @param {string} [payload.display_name] - Nome completo
+ * @param {string} [payload.phone] - Telefono cliente (mascherado nel messaggio)
+ * @param {string} [payload.dateStr] - Data già formattata (es. SABATO 07/02/2026)
+ * @param {string} [payload.timeStr] - Ora già formattata (es. 20:30)
+ * @param {string} [payload.start_at] - ISO datetime (usato se dateStr/timeStr mancanti)
+ * @param {number} [payload.people] - Numero coperti
+ * @param {number} [payload.party_size] - Alias per people
+ * @param {string} [payload.code] - Codice prenotazione (se esiste)
+ * @param {string} [payload.booking_code] - Alias per code
+ * @param {number} [payload.id] - ID prenotazione (fallback: R-${id})
+ * @param {number} [payload.reservationId] - Alias per id
+ * @param {string} [payload.notes] - Note cliente (da /prenota: es. passeggino, intolleranze)
+ * @param {Object} [envConfig] - Override config (default: env.WHATSAPP_TEMPLATE)
+ * @returns {string} Testo WhatsApp-ready
+ */
+function buildReservationReceivedMessage(payload, envConfig) {
+  const cfg = envConfig || env.WHATSAPP_TEMPLATE || {};
+  const brandName = str(cfg.brandName) || 'Pizzeria La Lanterna';
+  const brandCity = str(cfg.brandCity) || 'Castelraimondo';
+  const brandPhone = str(cfg.brandPhone) || '0737642142';
+  const brandAddress = str(cfg.brandAddressLine) || 'Largo della Libertà, 4';
+  const privacyUrl = str(cfg.privacyPolicyUrl) || 'https://www.iubenda.com/privacy-policy/90366241';
+  const footerText = str(cfg.notificationsOnlyText) ||
+    'WhatsApp usato solo per notifiche di servizio.';
+
+  // Nome: solo nome se non presente cognome (es. Mario oppure Rossi)
+  const first = str(payload?.customer_first);
+  const last = str(payload?.customer_last);
+  const name =
+    str(payload?.customerName) ||
+    str(payload?.display_name) ||
+    (first && last ? first : (first || last)) ||
+    'Cliente';
+
+  const dateStrFull = (payload?.start_at ? formatDateFull(payload.start_at) : null) || str(payload?.dateStr) || '--/--/----';
+  const timeStr = str(payload?.timeStr) || formatTimeHHMM(payload?.start_at);
+  const people = num(payload?.people, num(payload?.party_size, 0)) || 0;
+
+  const mapsUrl = getMapsUrl(cfg);
+
+  // Telefono cliente mascherado: +39 *******8381 (NON modificare maskPhone)
+  const phoneMasked = payload?.phone ? `*${maskPhone(payload.phone)}*` : '';
+
+  // Codice prenotazione: R-{DDMM}-{HHMM}-{ultime4} da start_at + phone (o code/booking_code/id se fornit esternamente)
+  const ddmm = payload?.start_at ? formatDDMM(payload.start_at) : '----';
+  const hhmm = payload?.start_at ? formatHHMM(payload.start_at) : '----';
+  const last4 = payload?.phone ? getPhoneLast4(payload.phone) : '----';
+  const bookingCode =
+    str(payload?.code) || str(payload?.booking_code) ||
+    (ddmm !== '----' && hhmm !== '----' && last4 !== '----' ? `R-${ddmm}-${hhmm}-${last4}` : null) ||
+    (payload?.id != null ? `R-${payload.id}` : (payload?.reservationId != null ? `R-${payload.reservationId}` : 'R--'));
+
+  // Formato telefono ristorante + indirizzo (es. 0737 642142 — Largo della Libertà 4, Castelraimondo (MC))
+  const phoneFormatted = brandPhone.length >= 6
+    ? `${brandPhone.slice(0, 4)} ${brandPhone.slice(4)}`
+    : brandPhone;
+  const addressLine = `${phoneFormatted} — ${brandAddress}, ${brandCity} (MC)`;
+
+  const lines = [
+    '📅 *PRENOTAZIONE RICEVUTA* 🍕',
+    '',
+    `👋 Ciao *${name}*!`,
+    '',
+  ];
+  if (phoneMasked) {
+    lines.push(`📲 Telefono: ${phoneMasked}`);
+    lines.push('');
+  }
+  lines.push(`🧾 *Codice Prenotazione:* *${bookingCode}*`);
+  lines.push('');
+  lines.push(
+    `📅 *Data:* ${dateStrFull}`,
+    `🕒 *Orario:* ${timeStr} (ora locale)`,
+    `👥 *Persone:* ${people} coperti`,
+  );
+  // Note cliente (da /prenota): solo se presenti, stile coerente con emoji
+  const notes = (str(payload?.notes) || '').replace(/\n/g, ' ').trim();
+  if (notes) {
+    lines.push('');
+    lines.push(`📝 *Note:* ${notes}`);
+  }
+  lines.push(
+    '',
+    '❓ *Confermi la prenotazione?*',
+    'Rispondi: Sì ✅ oppure No ❌',
+    '(Se puoi, rispondi entro 30 min)',
+    '',
+    '✏️ MODIFICA = cambia orario/persone',
+    '🗑️ ANNULLA = cancella prenotazione',
+    '',
+    `📍 ${mapsUrl}`,
+    '',
+    `📲 ${addressLine}`,
+    '',
+    `ℹ️ ${footerText}`,
+    '',
+    `🔒 Privacy: ${privacyUrl}`,
+  );
+
+  return lines.join('\n');
+}
+
+/**
+ * Esegue buildReservationReceivedMessage e logga (senza testo completo se troppo lungo).
+ * @param {Object} payload - come buildReservationReceivedMessage
+ * @param {Object} [envConfig] - override config
+ * @param {string} [logTo] - destinatario (per log, non sensibile)
+ * @param {string} [logName] - nome cliente (per log)
+ * @returns {string} Testo WhatsApp-ready
+ */
+function buildReservationReceivedMessageWithLog(payload, envConfig, logTo = '', logName = '') {
+  const text = buildReservationReceivedMessage(payload, envConfig);
+  const preview = text.length > 80 ? `${text.slice(0, 80)}…` : text;
+  logger.info('🧩 [WA-TPL] reservation-received built', {
+    to: logTo ? `${String(logTo).slice(0, 6)}…` : '(no-to)',
+    name: logName || '(no-name)',
+    preview,
+  });
+  return text;
+}
+
+module.exports = {
+  buildReservationReceivedMessage,
+  buildReservationReceivedMessageWithLog,
+  getMapsUrl,
+  formatDateDDMM,
+  formatTimeHHMM,
+};
+```
+
+### ./WEBQR-AUDIT-PATCH-RUN-TEST.md
+```
+# WhatsApp WebQR — AUDIT + PATCH MINIME + RUN+TEST
+
+## (1) AUDIT
+
+1. **Mount router /api/whatsapp-webqr:**  
+   `be/src/server.js` (righe ~97-99):  
+   `if (ensureExists('api/whatsapp-webqr', ...)) app.use('/api/whatsapp-webqr', require('./api/whatsapp-webqr'));`  
+   Il router è montato **prima** di Gift Vouchers e Health.
+
+2. **File esistenti WebQR:**  
+   - **api:** `be/src/api/whatsapp-webqr.js` — stub con GET /status, /qr, POST /send (enabled() da env, nessun provider).  
+   - **service/provider/socket:** Non esistevano; ora aggiunti:  
+     - `be/src/services/provider.baileys.js` — Baileys, auth dir, QR dataUrl, stati, retry.  
+     - `be/src/services/whatsapp-webqr.service.js` — singleton, start/getStatus/getQr/send.  
+     - `be/src/sockets/whatsapp-webqr.js` — mount(io) che avvia il service con io per emit.
+
+3. **Inizializzazione socket:**  
+   `be/src/sockets/index.js`:  
+   - `init(ioInstance)` riceve l’istanza Socket.IO dal server.  
+   - Monta canali: `orders`, `nfc.session`, e (dopo patch) `whatsapp-webqr`.  
+   - `module.exports.io = getIo` espone il singleton per i router/service.  
+   Il server in `server.js` crea `io` e chiama `require('./sockets/index')(io)`; non c’è room "admins", si usa broadcast `io.emit` per gli eventi WebQR.
+
+---
+
+## (2) PATCH MINIME
+
+### A) Dipendenze
+- **package.json:** aggiunta `"@whiskeysockets/baileys": "^6.7.9"`.  
+- `qrcode` era già presente.
+
+### B) provider.baileys.js (nuovo)
+- Sessione in `WHATSAPP_WEBQR_AUTH_DIR` (default `./data/wa-webqr`).  
+- Stati: `disconnected` | `qr` | `connecting` | `ready` | `error`.  
+- QR: da evento Baileys → `QRCode.toDataURL(qr)` → `lastQrDataUrl` + callback `onQr`.  
+- Callback: `onStatus`, `onQr`, `onError`.  
+- Retry: 5s, 15s, 60s (max), senza loop aggressivo.  
+- Log: prefisso `[WEBQR]` + emoji (📲 init, 🧾 qr, ✅ ready, ⚠️ warn, ❌ error, 🔁 retry).
+
+### C) whatsapp-webqr.service.js (nuovo)
+- `start(io)` solo se `WHATSAPP_WEBQR_ENABLED=1`; registra callbacks provider → `io.emit('whatsapp-webqr:status'|':qr'|':error')`.  
+- `getStatus()` → `{ status, enabled, updatedAt, lastError }`.  
+- `getQr()` → dataUrl se status=qr.  
+- `send({ to, text })` solo se ready.
+
+### D) Socket
+- **sockets/whatsapp-webqr.js:** `mount(io)` → `webqrService.start(io)`.  
+- **sockets/index.js:** dopo nfc.session, `require('./whatsapp-webqr').mount(ioInstance)`.
+
+### E) REST (api/whatsapp-webqr.js riscritto)
+- `requireAuth` su GET /status, GET /qr, POST /send.  
+- GET /status: risposta da `webqrService.getStatus()`.  
+- GET /qr: 503 se disabled; altrimenti `{ ok, qr, status }`.  
+- POST /send: body `{ to, text }`; rate limit in-memory (20 req/min); 503 se disabled o non ready; 429 se rate limit.
+
+### F) Bootstrap
+- Nessun hook aggiuntivo in server.js: l’avvio WebQR avviene quando viene eseguito `sockets/index.js` init(io), che monta whatsapp-webqr e chiama `webqrService.start(io)`.
+
+---
+
+## (3) RUN+TEST
+
+### Comandi
+```bash
+cd be
+npm install
+export WHATSAPP_WEBQR_ENABLED=1
+# opzionale: export WHATSAPP_WEBQR_AUTH_DIR=/path/to/auth
+npm run dev
+# oppure: node src/server.js
+```
+
+### Env
+- `WHATSAPP_WEBQR_ENABLED=1` — abilita WebQR e avvio Baileys.  
+- `WHATSAPP_WEBQR_AUTH_DIR` — (opzionale) directory auth, default `./data/wa-webqr`.  
+- Per REST: `Authorization: Bearer <JWT_ADMIN>` (stesso JWT degli altri endpoint protetti).
+
+### Test
+
+1. **GET /status (enabled=1)**  
+   `curl -s -H "Authorization: Bearer <JWT_ADMIN>" http://localhost:3000/api/whatsapp-webqr/status`  
+   - Atteso: `connecting` o `qr` o `ready`; `enabled: true`; eventuale `lastError`.
+
+2. **GET /qr**  
+   `curl -s -H "Authorization: Bearer <JWT_ADMIN>" http://localhost:3000/api/whatsapp-webqr/qr`  
+   - Se status=qr: JSON con `qr` (data URL PNG).  
+   - Se disabled: 503.
+
+3. **Socket realtime**  
+   - FE (o client Socket.IO) connesso al default namespace:  
+   - Eventi: `whatsapp-webqr:status`, `whatsapp-webqr:qr`, `whatsapp-webqr:error`.  
+   - Dopo avvio, con status=qr si riceve `whatsapp-webqr:qr` con payload `{ qr: "data:image/png;base64,..." }`.
+
+4. **Dopo scan QR**  
+   - GET /status → `status: "ready"`.  
+   - GET /qr → `qr: null` (o comunque status non più qr).
+
+5. **POST /send**  
+   `curl -s -X POST -H "Authorization: Bearer <JWT_ADMIN>" -H "Content-Type: application/json" -d '{"to":"393331234567","text":"Test WebQR"}' http://localhost:3000/api/whatsapp-webqr/send`  
+   - Con status=ready: 200, messaggio inviato.  
+   - Se non ready: 503.  
+   - Oltre 20 req/min: 429.
+
+6. **enabled=0**  
+   - `WHATSAPP_WEBQR_ENABLED=0` (o non impostato):  
+   - GET /status → `status: "disabled", enabled: false`.  
+   - GET /qr e POST /send → 503.
 ```

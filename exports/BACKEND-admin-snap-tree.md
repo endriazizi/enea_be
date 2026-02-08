@@ -1,18 +1,23 @@
 # 📁 Project tree (.)
 
-_Generato: Tue, Feb  3, 2026  2:22:05 AM_
+_Generato: Sun, Feb  8, 2026  2:26:59 AM_
 
 ```text
 .
 .env
-.env.production
+.env.example
 .git
 .gitignore
 assets
+AUDIT_RESERVATIONS_NOTIFICATIONS.md
+data
+data/wa-webqr
 docs
 docs/canvas-backend.md
+ENV_SNAPSHOT_20260206_%d%e%f.txt
 exports
 logs
+nodemon.json
 node_modules
 npm
 package.json
@@ -42,7 +47,10 @@ src/api/rooms.js
 src/api/support
 src/api/support/support
 src/api/support/support/db-debug.js
+src/api/support.dev.js
 src/api/tables.js
+src/api/whatsapp-templates.js
+src/api/whatsapp-webqr.js
 src/config.js
 src/controllers
 src/controllers/productsContreller.js
@@ -73,11 +81,14 @@ src/services/orders.sse.js
 src/services/print-jobs.service.js
 src/services/print-settings.service.js
 src/services/product.service.js
+src/services/provider.baileys.js
 src/services/reservations-status.service.js
 src/services/reservations.service.js
 src/services/thermal-printer.service.js
+src/services/twilio.service.js
 src/services/voucher-notify.service.js
 src/services/whatsapp-twilio.service.js
+src/services/whatsapp-webqr.service.js
 src/services/whatsapp.service.js
 src/services/whatsapp.twilio.service.jS
 src/services/whatsender.service.js
@@ -87,8 +98,13 @@ src/sockets/nfc.session.js
 src/sockets/orders.channel.js
 src/sockets/orders.js
 src/sockets/reservations.js
+src/sockets/whatsapp-webqr.js
 src/sse.js
 src/utils
 src/utils/customers.resolve.js
+src/utils/normalize-phone-it.js
 src/utils/print-order.js
+src/utils/whatsapp-templates.js
+versione.cmd
+WEBQR-AUDIT-PATCH-RUN-TEST.md
 ```
