@@ -40,13 +40,13 @@ function format(order, cfg) {
 
   (order.items || []).forEach(it => {
     const left = `${it.qty || 1}x ${it.product_name || it.name || 'Item'}`;
-    const right = `€ ${(Number(it.price || 0) * (it.qty || 1)).toFixed(2)}`;
+    const right = `EUR ${(Number(it.price || 0) * (it.qty || 1)).toFixed(2)}`;
     L.push(pad(left, right));
     if (it.notes) L.push('  Note: ' + it.notes);
   });
 
   L.push('-'.repeat(42));
-  L.push(pad('TOTALE', `€ ${Number(order.total || 0).toFixed(2)}`));
+  L.push(pad('TOTALE', `EUR ${Number(order.total || 0).toFixed(2)}`));
   if (cfg.footer) { L.push(''); L.push(cfg.footer); }
   L.push(''); L.push('');
 

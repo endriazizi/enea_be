@@ -277,14 +277,19 @@ function resolveComandaCenter(raw, settings, order = null) {
 }
 
 function resolveComandaLayout(raw, settings, order = null) {
+  const fulfillment = String(order?.fulfillment || '').toLowerCase();
+  // Ordini asporto: layout dedicato con caratteri grandi 3x3 (80mm)
+  // — override su "classic" quando takeaway (pizze in GRANDE)
+  if (fulfillment === 'takeaway') {
+    const v = String(raw ?? '').trim().toLowerCase();
+    if (v === 'mcd') return 'mcd'; // mcd esplicito: rispettato
+    return 'asporto'; // classic/null → asporto per takeaway
+  }
   if (raw != null && raw !== '') {
     const v = String(raw).trim().toLowerCase();
     if (v === 'asporto' || v === 'mcd' || v === 'classic') return v;
     return v === 'mcd' ? 'mcd' : 'classic';
   }
-  // Ordini asporto: layout dedicato con caratteri grandi 80mm
-  const fulfillment = String(order?.fulfillment || '').toLowerCase();
-  if (fulfillment === 'takeaway') return 'asporto';
   const st = String(settings?.comanda_layout || 'classic').trim().toLowerCase();
   return st === 'mcd' ? 'mcd' : 'classic';
 }
@@ -316,6 +321,7 @@ const PUBLIC_ASPORTO_DEFAULTS = {
   public_asporto_allow_takeaway: true,
   public_asporto_allow_delivery: false,
   prenota_online_enabled     : true,
+  fry_skip_tables_section    : false,
 };
 
 function normalizePublicAsportoSettings(raw) {
@@ -379,6 +385,10 @@ function normalizePublicAsportoSettings(raw) {
     typeof src.prenota_online_enabled === 'boolean'
       ? src.prenota_online_enabled
       : !!Number(src.prenota_online_enabled ?? PUBLIC_ASPORTO_DEFAULTS.prenota_online_enabled ?? 1);
+  const frySkipTables =
+    typeof src.fry_skip_tables_section === 'boolean'
+      ? src.fry_skip_tables_section
+      : !!Number(src.fry_skip_tables_section ?? PUBLIC_ASPORTO_DEFAULTS.fry_skip_tables_section ?? 0);
 
   return {
     enable_public_asporto: enable,
@@ -393,6 +403,7 @@ function normalizePublicAsportoSettings(raw) {
     order_include_extras_in_total_default: includeExtras,
     order_extra_show_toggle: showToggle,
     prenota_online_enabled: prenotaOnlineEnabled,
+    fry_skip_tables_section: frySkipTables,
   };
 }
 
@@ -409,7 +420,8 @@ async function getPublicAsportoSettings() {
          whatsapp_show_prices,
          public_asporto_allow_takeaway,
          public_asporto_allow_delivery,
-         prenota_online_enabled
+         prenota_online_enabled,
+         fry_skip_tables_section
        FROM public_asporto_settings
        ORDER BY id ASC
        LIMIT 1`,
@@ -436,9 +448,10 @@ async function savePublicAsportoSettings(next) {
        whatsapp_show_prices,
        public_asporto_allow_takeaway,
        public_asporto_allow_delivery,
-       prenota_online_enabled
+       prenota_online_enabled,
+       fry_skip_tables_section
      ) VALUES (
-       1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+       1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
      )
      ON DUPLICATE KEY UPDATE
        enable_public_asporto = VALUES(enable_public_asporto),
@@ -450,7 +463,8 @@ async function savePublicAsportoSettings(next) {
        whatsapp_show_prices = VALUES(whatsapp_show_prices),
        public_asporto_allow_takeaway = VALUES(public_asporto_allow_takeaway),
        public_asporto_allow_delivery = VALUES(public_asporto_allow_delivery),
-       prenota_online_enabled = VALUES(prenota_online_enabled)`,
+       prenota_online_enabled = VALUES(prenota_online_enabled),
+       fry_skip_tables_section = VALUES(fry_skip_tables_section)`,
     [
       p.enable_public_asporto ? 1 : 0,
       p.public_whatsapp_to,
@@ -462,6 +476,7 @@ async function savePublicAsportoSettings(next) {
       p.public_asporto_allow_takeaway ? 1 : 0,
       p.public_asporto_allow_delivery ? 1 : 0,
       p.prenota_online_enabled ? 1 : 0,
+      p.fry_skip_tables_section ? 1 : 0,
     ],
   );
   return p;

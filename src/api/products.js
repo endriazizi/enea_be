@@ -6,12 +6,14 @@ const router  = express.Router();
 const logger  = require('../logger');
 const svc     = require('../services/product.service');
 
-// GET /api/products?active=1
+// GET /api/products?active=1&category=antipasti
+// category: filtra per nome categoria (es. antipasti) — non rompe output esistente
 router.get('/', async (req, res) => {
   try {
     const activeParam = String(req.query.active ?? '').trim().toLowerCase();
     const onlyActive = activeParam === '1' || activeParam === 'true' || activeParam === 'yes';
-    const rows = await svc.getAll({ active: onlyActive });
+    const categoryParam = String(req.query.category ?? '').trim() || null;
+    const rows = await svc.getAll({ active: onlyActive, category: categoryParam });
     res.json(rows);
   } catch (err) {
     logger.error('❌ [GET] /api/products', { error: String(err) });

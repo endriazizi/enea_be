@@ -285,6 +285,12 @@ async function processPrintQueueOnce({ limit } = {}) {
         throw new Error('printer_disabled');
       }
       if (String(job.kind) === 'order_comanda') {
+        const orderId = Number(job.order_id || 0);
+        const full = await loadOrderForPrint(orderId);
+        if (!full) {
+          throw new Error('order_not_found');
+        }
+
         const payload = job.payload_json
           ? JSON.parse(String(job.payload_json))
           : {};
@@ -294,14 +300,8 @@ async function processPrintQueueOnce({ limit } = {}) {
           .trim()
           .toLowerCase();
         // Fallback: ordine asporto → layout dedicato (caratteri grandi 80mm)
-        if (layoutKey === 'classic' && full && String(full.fulfillment || '').toLowerCase() === 'takeaway') {
+        if (layoutKey === 'classic' && String(full.fulfillment || '').toLowerCase() === 'takeaway') {
           layoutKey = 'asporto';
-        }
-
-        const orderId = Number(job.order_id || 0);
-        const full = await loadOrderForPrint(orderId);
-        if (!full) {
-          throw new Error('order_not_found');
         }
 
         for (let i = 0; i < copies; i += 1) {

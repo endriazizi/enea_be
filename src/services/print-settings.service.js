@@ -157,15 +157,40 @@ async function getPrintSettings() {
     }
   } catch (e) {
     logger.warn('⚠️ print_settings load KO', { error: String(e) });
+    // Fallback ENV: merge defaults con variabili ambiente quando DB non disponibile
+    const envOverrides = {
+      printer_enabled: String(process.env.PRINTER_ENABLED || 'true').toLowerCase() === 'true',
+      printer_ip: process.env.PRINTER_IP || process.env.PRINTER_HOST || '127.0.0.1',
+      printer_port: Number(process.env.PRINTER_PORT || 9100),
+    };
     return {
-      ...normalizePrintSettings(PRINT_SETTINGS_DEFAULTS),
+      ...normalizePrintSettings({ ...PRINT_SETTINGS_DEFAULTS, ...envOverrides }),
       _source: 'env',
     };
   }
 }
 
 async function savePrintSettings(next) {
-  const p = normalizePrintSettings(next);
+  // Merge con stato attuale dal DB: evita sovrascritture quando il payload è parziale
+  let current = {};
+  try {
+    current = await getPrintSettings();
+  } catch (_) { /* ignore */ }
+  const incoming = next || {};
+  const merged = { ...current };
+  for (const k of Object.keys(incoming)) {
+    if (incoming[k] !== undefined && incoming[k] !== null) {
+      merged[k] = incoming[k];
+    }
+  }
+  const p = normalizePrintSettings(merged);
+  logger.info('🧾⚙️ [PrintSettings] save payload', {
+    comanda_layout: p.comanda_layout,
+    takeaway_center: p.takeaway_center,
+    takeaway_copies: p.takeaway_copies,
+    takeaway_auto_print: p.takeaway_auto_print,
+    takeaway_comanda_center: p.takeaway_comanda_center,
+  });
   try {
     await query(
       `INSERT INTO print_settings (
@@ -209,6 +234,24 @@ async function savePrintSettings(next) {
         p.takeaway_comanda_center,
       ],
     );
+    // UPDATE esplicito sezione comanda: garantisce persistenza anche con schemi DB diversamente ordinati
+    await query(
+      `UPDATE print_settings SET
+         comanda_layout = ?,
+         takeaway_center = ?,
+         takeaway_copies = ?,
+         takeaway_auto_print = ?,
+         takeaway_comanda_center = ?,
+         updated_at = UTC_TIMESTAMP()
+       WHERE id = 1`,
+      [
+        p.comanda_layout,
+        p.takeaway_center,
+        p.takeaway_copies,
+        p.takeaway_auto_print ? 1 : 0,
+        p.takeaway_comanda_center,
+      ],
+    );
   } catch (e) {
     logger.warn('⚠️ print_settings save (legacy cols) KO', { error: String(e) });
     await query(
@@ -240,6 +283,24 @@ async function savePrintSettings(next) {
         p.printer_enabled ? 1 : 0,
         p.printer_ip,
         p.printer_port,
+        p.comanda_layout,
+        p.takeaway_center,
+        p.takeaway_copies,
+        p.takeaway_auto_print ? 1 : 0,
+        p.takeaway_comanda_center,
+      ],
+    );
+    // UPDATE esplicito sezione comanda (legacy)
+    await query(
+      `UPDATE print_settings SET
+         comanda_layout = ?,
+         takeaway_center = ?,
+         takeaway_copies = ?,
+         takeaway_auto_print = ?,
+         takeaway_comanda_center = ?,
+         updated_at = UTC_TIMESTAMP()
+       WHERE id = 1`,
+      [
         p.comanda_layout,
         p.takeaway_center,
         p.takeaway_copies,

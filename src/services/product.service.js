@@ -23,9 +23,22 @@ module.exports = {
   remove,
 };
 
-// GET all (opz. solo attivi)
-async function getAll({ active = false } = {}) {
-  logger.debug('🧾 products.getAll', { active });
+// GET all (opz. solo attivi, opz. filtro per categoria)
+// category: nome categoria (es. 'antipasti') — filtra per c.name COLLATE case-insensitive
+async function getAll({ active = false, category = null } = {}) {
+  logger.debug('🧾 products.getAll', { active, category });
+
+  const conds = [];
+  const params = [];
+  if (active) {
+    conds.push('p.is_active = 1');
+  }
+  if (category && String(category).trim()) {
+    conds.push('UPPER(TRIM(c.name)) = UPPER(TRIM(?))');
+    params.push(String(category).trim());
+  }
+
+  const where = conds.length ? 'WHERE ' + conds.join(' AND ') : '';
 
   const sql = `
     SELECT
@@ -33,11 +46,10 @@ async function getAll({ active = false } = {}) {
       p.category_id, c.name AS category
     FROM products p
     LEFT JOIN categories c ON c.id = p.category_id
-    ${active ? 'WHERE p.is_active = 1' : ''}
+    ${where}
     ORDER BY c.name, p.sort_order, p.id
   `;
-  // il nostro wrapper ritorna direttamente `rows`
-  const rows = await query(sql, []);
+  const rows = await query(sql, params);
   return rows || [];
 }
 

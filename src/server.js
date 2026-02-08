@@ -117,6 +117,10 @@ if (ensureExists('api/whatsapp-templates', 'API /api/whatsapp'))
 if (ensureExists('api/gift-vouchers', 'API /api/gift-vouchers'))
   app.use('/api/gift-vouchers', require('./api/gift-vouchers')(app));
 
+// 🍟 FRY: ordine al volo antipasti + cucina live (pubblico, x-fry-key se FRY_PUBLIC_KEY)
+if (ensureExists('api/fry', 'API /api/fry'))
+  app.use('/api/fry', require('./api/fry'));
+
 // 🆕 Public voucher activation (no-auth)
 if (ensureExists('api/public-voucher', 'API /api/public/voucher'))
   app.use('/api/public', require('./api/public-voucher')(app));
@@ -124,6 +128,10 @@ if (ensureExists('api/public-voucher', 'API /api/public/voucher'))
 // Health
 if (ensureExists('api/health', 'API /api/health'))
   app.use('/api/health', require('./api/health'));
+
+// 📊 Reports (dashboard aggregati)
+if (ensureExists('api/reports', 'API /api/reports'))
+  app.use('/api/reports', require('./api/reports'));
 
 // [DEV] Support dev: POST /api/support/dev/restart (solo NODE_ENV!==production + DEV_ALLOW_RESTART=1)
 if (ensureExists('api/support.dev', 'API /api/support/dev'))

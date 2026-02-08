@@ -56,18 +56,21 @@ function broadcastOrderCreated(order) {
 function broadcastOrderUpdated(order) {
   try {
     const io = sockets.io();
-    io.of('/').emit('order-updated', {
+    const payload = {
       id         : order && order.id,
       status     : order && order.status,
       table_id   : order && order.table_id,
       fulfillment: order && order.fulfillment,
-    });
+    };
+    if (order && order.order_type) payload.order_type = order.order_type;
+
+    io.of('/').emit('order-updated', payload);
 
     logger.info('📡 order-updated ▶️ broadcast', {
       id         : order && order.id,
       status     : order && order.status,
       table_id   : order && order.table_id,
-      fulfillment: order && order.fulfillment,
+      order_type : order && order.order_type,
     });
   } catch (err) {
     logger.warn('📡 order-updated broadcast KO', { error: String(err) });
